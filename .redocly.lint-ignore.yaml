@@ -1,0 +1,19 @@
+# 本文件指示 Redocly linter 忽略 API 契约中特定位置的指定规则。
+# 参见 https://redocly.com/docs/cli/ 获取更多信息。
+#
+# 以下豁免均为有意为之，理由：
+# - info-license（#/info）：内部项目尚未确定 LICENSE 声明，不捏造许可证名称，
+#   待确定后在 info.license 声明并移除本条目。
+# - operation-4xx-response（#/paths/~1healthz/get/responses）：探活端点按设计
+#   无 4XX 响应（仅 200 正常 / 503 degraded），与 api/handlers/health.go 一致。
+# - no-unused-components（#/components/responses/MethodNotAllowed）：MethodNotAllowed
+#   是全局 405 兜底契约的机器可读文档（api/router.go registerErrorRoutes 与
+#   docs/api-errors.md 中 method_not_allowed 表项），不挂载在任何具体路径下，
+#   故无引用，属设计使然而非冗余组件。
+docs/openapi.yaml:
+  info-license:
+    - '#/info'
+  operation-4xx-response:
+    - '#/paths/~1healthz/get/responses'
+  no-unused-components:
+    - '#/components/responses/MethodNotAllowed'

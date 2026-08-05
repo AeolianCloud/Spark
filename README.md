@@ -90,6 +90,8 @@ go run ./cmd/server                      # 直接运行
 | 方法 | 路径 | 说明 | 主要参数 |
 | --- | --- | --- | --- |
 | GET | `/healthz` | 健康检查（含 DB 连通性） | — |
+| GET | `/docs` | Swagger UI 在线文档（swagger-ui 静态资源按 `/docs/*` 提供） | — |
+| GET | `/openapi.yaml` | OpenAPI 契约原文（`application/yaml`） | — |
 | POST | `/zones` | 创建区域 | `name` |
 | GET | `/zones` | 区域列表（含节点；分页 + `X-Total-Count`） | `limit?`、`offset?` |
 | POST | `/zones/:zone_id/nodes` | 登记 PVE 节点 | `name`、`host`、`api_user`、`api_token`、`enabled?` |
@@ -119,6 +121,29 @@ go run ./cmd/server                      # 直接运行
 - **存储抽象（storage_types）**：`name/display_name` 对外，`pve_storage` 映射真实 PVE 存储。
 - **镜像目录（images）**：`node_images` 记录镜像在各节点的路径；区域可用镜像 = 各节点交集。
 - **VM 状态语义**：DB 不存状态镜像（穿透式）。创建返回 `creating`；异步供给链失败后详情/列表返回 `failed`（`provision_error` 携带原因）；供给成功后的状态实时读取自 PVE（`running`/`stopped` 等）。
+
+## 契约与工具链
+
+API 契约以 [docs/openapi.yaml](docs/openapi.yaml)（OpenAPI 3.0）为唯一源，错误码全量清单见 [docs/api-errors.md](docs/api-errors.md)。
+
+- **在线浏览**：服务启动后访问 `GET /docs`（Swagger UI 页面，swagger-ui 静态资源按 `/docs/*` 提供）；`GET /openapi.yaml` 直接输出契约原文。两条路由刻意不写入契约本身的 `paths`，避免契约自指。
+- **契约校验**（redocly，豁免规则见 `.redocly.lint-ignore.yaml`）：
+
+  ```bash
+  npx --yes @redocly/cli lint docs/openapi.yaml
+  ```
+
+- **类型生成**（openapi-typescript，生成物不落仓库）：
+
+  ```bash
+  npx --yes openapi-typescript docs/openapi.yaml -o /tmp/spark-openapi-types.ts
+  ```
+
+- **Embed 副本同步**：`GET /openapi.yaml` 输出的是 `api/swagger/openapi.yaml`（go:embed 内嵌副本，与 docs/openapi.yaml 字节一致；`go:embed` 无法跨包读取 `docs/`）。修改契约后需同步复制，保证两份一致：
+
+  ```bash
+  cp docs/openapi.yaml api/swagger/openapi.yaml
+  ```
 
 ## 测试
 

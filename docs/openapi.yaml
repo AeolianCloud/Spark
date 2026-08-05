@@ -15,6 +15,8 @@
 # - 生命周期操作（start/stop/restart）202 响应携带 Location 指向状态终结点
 #   GET /vms/{id}。
 openapi: 3.0.3
+# 许可证说明：内部项目尚未确定 LICENSE 声明，暂不声明 license 字段
+#（info-license 豁免记录于 .redocly.lint-ignore.yaml）。
 info:
   title: Spark PVE Management API
   version: 1.0.0
@@ -49,14 +51,23 @@ tags:
   - name: system
     description: 健康检查
 
+# 当前 API 未接入认证：空 security 数组声明所有操作无安全要求
+#（OpenAPI 3.0 语义，根级空数组 = 无需任何认证/授权）；
+# 未来引入认证后在此声明 securitySchemes 并替换为具体方案。
+security: []
+
 paths:
   /healthz:
     get:
       tags: [system]
       summary: 健康检查（含数据库连通性）
+      operationId: healthz
       description: |
         探活端点，不属于业务 API：200 正常响应不携带 x-ms-error-code 头；
         503 degraded 响应携带 x-ms-error-code: service_unavailable。
+      # 探活端点按设计无 4XX 响应（仅 200 正常 / 503 degraded，与
+      # api/handlers/health.go 一致），operation-4xx-response 豁免记录于
+      # .redocly.lint-ignore.yaml。
       responses:
         "200":
           description: 服务与数据库均正常
@@ -828,6 +839,10 @@ components:
             error:
               code: internal_error
               message: internal server error
+    # MethodNotAllowed 是全局 405 兜底契约的机器可读文档
+    #（api/router.go registerErrorRoutes 与 docs/api-errors.md 中
+    # method_not_allowed 表项），不挂载在任何具体路径下，故无引用
+    #（no-unused-components 豁免记录于 .redocly.lint-ignore.yaml）。
     MethodNotAllowed:
       description: 路径存在但方法未注册（method_not_allowed，全局兜底，带 Allow 头）
       headers:
@@ -1162,7 +1177,7 @@ components:
         status:
           type: string
           description: creating/failed 为本地过渡状态；ready 及以后为 PVE 穿透状态
-          examples: [creating, ready, running, stopped, failed]
+          example: creating
         provision_error:
           type: string
           description: 异步供给链失败原因（仅失败时出现）
