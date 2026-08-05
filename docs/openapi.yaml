@@ -1,0 +1,1257 @@
+# Spark PVE Management API — OpenAPI 3.0 契约
+#
+# 本文件是 API 契约的机器可读形态，与 api/router.go、api/handlers/*.go、
+# docs/api-errors.md 保持一致。修改任何端点/字段必须同步更新本文件。
+#
+# 契约要点：
+# - 列表端点统一分页：limit（默认 25，上限 100，超出截断）、offset（默认 0），
+#   非法值（负数/非数字）返回 400 bad_request；响应头 X-Total-Count 携带过滤
+#   前的总条数。
+# - 所有错误响应统一 {"error": {"code", "message"}} 结构，并携带
+#   x-ms-error-code 响应头（值与 code 一致）。错误码清单见
+#   components.schemas.ErrorDetail.code 枚举与 docs/api-errors.md。
+# - 未匹配路由的 404（not_found）与 405（method_not_allowed，带 Allow 头）
+#   为全局兜底，覆盖全部路径。
+# - 生命周期操作（start/stop/restart）202 响应携带 Location 指向状态终结点
+#   GET /vms/{id}。
+openapi: 3.0.3
+info:
+  title: Spark PVE Management API
+  version: 1.0.0
+  description: |
+    基于 Proxmox VE 的虚拟化管理后端 REST 接口：VM 全生命周期管理（创建/列表/
+    详情/启停/重启/升降配/销毁）、区域与 PVE 节点管理、IP 池管理、存储抽象与
+    cloud 镜像目录管理。状态穿透式：VM 实时状态每次查询时读取自 PVE 节点。
+
+    错误契约：所有错误响应统一为 {"error": {"code", "message"}} 结构，并携带
+    x-ms-error-code 响应头（值与 code 一致）。code 是唯一可依赖的机器可读标识，
+    message 仅供人阅读。未匹配路由的 404 与 405（带 Allow 头）也是契约一部分。
+
+    分页约定：列表端点支持 limit/offset 查询参数，limit 默认 25、上限 100
+    （超出截断）、offset 默认 0；非法值返回 400。分页响应头 X-Total-Count
+    为过滤后（分页前）的总条数。
+servers:
+  # 相对路径：当前按同一来源部署（前端与 API 同源）；生产部署后调整为
+  # 实际前缀，如 https://api.example.com（v1 无版本前缀，见 design.md）。
+  - url: /
+
+tags:
+  - name: zones
+    description: 区域（zone）与 PVE 节点管理
+  - name: ip-pools
+    description: IP 池管理
+  - name: storage-types
+    description: 存储抽象管理
+  - name: images
+    description: cloud 镜像目录管理
+  - name: vms
+    description: 云主机（VM）生命周期管理
+  - name: system
+    description: 健康检查
+
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      summary: 健康检查（含数据库连通性）
+      description: |
+        探活端点，不属于业务 API：200 正常响应不携带 x-ms-error-code 头；
+        503 degraded 响应携带 x-ms-error-code: service_unavailable。
+      responses:
+        "200":
+          description: 服务与数据库均正常
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: 数据库探活失败（degraded）
+          headers:
+            x-ms-error-code:
+              $ref: "#/components/headers/XMSErrorCode"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /zones:
+    post:
+      tags: [zones]
+      summary: 创建区域
+      operationId: createZone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ZoneCreateRequest"
+      responses:
+        "201":
+          description: 创建成功
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ZoneResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [zones]
+      summary: 区域列表（含各区域完整节点列表）
+      operationId: listZones
+      parameters:
+        - $ref: "#/components/parameters/QueryLimit"
+        - $ref: "#/components/parameters/QueryOffset"
+      responses:
+        "200":
+          description: 分页后的区域列表
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/XTotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ZoneResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /zones/{zone_id}/nodes:
+    post:
+      tags: [zones]
+      summary: 登记 PVE 节点
+      operationId: createNode
+      parameters:
+        - $ref: "#/components/parameters/PathZoneID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeRequest"
+      responses:
+        "201":
+          description: 登记成功
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [zones]
+      summary: 区域节点列表
+      operationId: listNodesByZone
+      parameters:
+        - $ref: "#/components/parameters/PathZoneID"
+      responses:
+        "200":
+          description: 该区域的节点列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NodeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /nodes/{id}:
+    put:
+      tags: [zones]
+      summary: 更新节点
+      description: 空 api_token 保留原密钥；enabled 缺省时保留现值。
+      operationId: updateNode
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeRequest"
+      responses:
+        "200":
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /ip-pools:
+    post:
+      tags: [ip-pools]
+      summary: 创建 IP 池（自动展开为逐地址记录）
+      operationId: createPool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePoolRequest"
+      responses:
+        "201":
+          description: 创建成功
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pool"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [ip-pools]
+      summary: IP 池列表（可按区域过滤）
+      operationId: listPools
+      parameters:
+        - $ref: "#/components/parameters/QueryZoneID"
+        - $ref: "#/components/parameters/QueryLimit"
+        - $ref: "#/components/parameters/QueryOffset"
+      responses:
+        "200":
+          description: 分页后的 IP 池列表
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/XTotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Pool"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /ip-pools/{id}/nodes:
+    put:
+      tags: [ip-pools]
+      summary: 设置 IP 池的节点白名单（整体替换）
+      operationId: setPoolNodes
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetPoolNodesRequest"
+      responses:
+        "200":
+          description: 替换成功，返回替换后的白名单
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NodeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [ip-pools]
+      summary: 获取 IP 池的节点白名单
+      operationId: getPoolNodes
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: 白名单节点列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NodeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /storage-types:
+    post:
+      tags: [storage-types]
+      summary: 登记存储类型
+      operationId: createStorageType
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StorageTypeRequest"
+      responses:
+        "201":
+          description: 登记成功
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageType"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [storage-types]
+      summary: 存储类型列表
+      operationId: listStorageTypes
+      parameters:
+        - $ref: "#/components/parameters/QueryLimit"
+        - $ref: "#/components/parameters/QueryOffset"
+      responses:
+        "200":
+          description: 分页后的存储类型列表
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/XTotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StorageType"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /storage-types/{id}:
+    get:
+      tags: [storage-types]
+      summary: 存储类型详情
+      operationId: getStorageType
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: 存储类型详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageType"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [storage-types]
+      summary: 更新存储类型
+      operationId: updateStorageType
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StorageTypeRequest"
+      responses:
+        "200":
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageType"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    delete:
+      tags: [storage-types]
+      summary: 删除存储类型
+      operationId: deleteStorageType
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "204":
+          description: 删除成功，无响应体
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /images:
+    post:
+      tags: [images]
+      summary: 登记 cloud 镜像
+      operationId: createImage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageRequest"
+      responses:
+        "201":
+          description: 登记成功
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Image"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [images]
+      summary: 镜像列表
+      description: |
+        带 ?zone_id= 时返回该区域各启用节点镜像的交集（不含完整 node_images）；
+        不带时返回全部镜像（含完整 node_images）。两种分支都分页并设置
+        X-Total-Count。
+      operationId: listImages
+      parameters:
+        - $ref: "#/components/parameters/QueryZoneID"
+        - $ref: "#/components/parameters/QueryLimit"
+        - $ref: "#/components/parameters/QueryOffset"
+      responses:
+        "200":
+          description: 分页后的镜像列表
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/XTotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Image"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /vms:
+    post:
+      tags: [vms]
+      summary: 创建 VM
+      description: |
+        分配 IP → 落库 → 异步 PVE 创建链，立即返回 201（status 为 creating）。
+        密码仅用于 cloud-init 一次性注入，不随响应返回。
+
+        错误场景：400 请求体非法，或镜像在该区域不可用（image_not_available_in_zone）；
+        404 区域/镜像/存储类型不存在（not_found）；409 IP 池地址耗尽（ip_exhausted）；
+        503 所有候选节点不可达或被禁用（node_unavailable）。
+      operationId: createVM
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVMRequest"
+      responses:
+        "201":
+          description: 创建请求已受理（PVE 侧异步创建中）
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VMResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      tags: [vms]
+      summary: VM 列表（穿透式合并各节点实时状态）
+      description: |
+        每个启用节点一次 PVE 调用，合并本地元数据后返回；查询失败的节点不出现在
+        vms 中，而是记录在 warnings。X-Total-Count 为本地 VM 总行数（分页前）。
+      operationId: listVMs
+      parameters:
+        - $ref: "#/components/parameters/QueryLimit"
+        - $ref: "#/components/parameters/QueryOffset"
+      responses:
+        "200":
+          description: 分页后的 VM 列表（warnings 恒为数组）
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/XTotalCount"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VMListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /vms/{id}:
+    get:
+      tags: [vms]
+      summary: VM 详情（穿透实时状态）
+      description: |
+        PVE 节点查询失败（节点不可达、被禁用或已被移除）返回 503 node_unavailable，
+        不会伪装成 creating。
+      operationId: getVM
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: 本地元数据 + PVE 实时状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VMListItem"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    patch:
+      tags: [vms]
+      summary: 升降配（部分更新）
+      description: |
+        JSON Merge Patch 语义：仅应用请求体出现的字段，缺失或 null 的字段保留
+        现值（先改 PVE 再改本地行）。磁盘只增，缩小返回 422 disk_shrink_not_allowed。
+        响应为完整 VM（穿透实时状态），与 GET /vms/:id 同形。
+
+        错误场景：409 VM 尚不可操作（vm_not_ready），并发规格修改
+        （乐观锁冲突，repository.ErrSpecConflict）同样返回 409 conflict；
+        422 磁盘缩小（disk_shrink_not_allowed）；503 节点查询失败（node_unavailable）。
+      operationId: resizeVM
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResizeRequest"
+      responses:
+        "200":
+          description: 变更后的完整 VM（穿透状态）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VMListItem"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      tags: [vms]
+      summary: 销毁 VM（同步，幂等）
+      description: |
+        PVE 侧删除（含 purge）→ 释放 IP → 删本地记录，同步完成后返回 204。
+        重复销毁：本地行已不存在返回 404 not_found；PVE 侧 VM 已不存在视为
+        已销毁，仅执行本地清理。
+      operationId: destroyVM
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "204":
+          description: 销毁成功，无响应体
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /vms/{id}/start:
+    post:
+      tags: [vms]
+      summary: 启动 VM（异步派发）
+      description: |
+        VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
+        节点/PVE 调用失败按全局兜底返回 500 internal_error。
+      operationId: startVM
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "202":
+          description: 已受理；Location 指向状态终结点 GET /vms/{id}
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /vms/{id}/stop:
+    post:
+      tags: [vms]
+      summary: 关闭 VM（ACPI 优雅关机，异步派发）
+      description: |
+        VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
+        节点/PVE 调用失败按全局兜底返回 500 internal_error。
+      operationId: stopVM
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "202":
+          description: 已受理；Location 指向状态终结点 GET /vms/{id}
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /vms/{id}/restart:
+    post:
+      tags: [vms]
+      summary: 重启 VM（异步派发）
+      description: |
+        VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
+        节点/PVE 调用失败按全局兜底返回 500 internal_error。
+      operationId: restartVM
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "202":
+          description: 已受理；Location 指向状态终结点 GET /vms/{id}
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  parameters:
+    PathID:
+      name: id
+      in: path
+      required: true
+      description: 资源 ID（正整数）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    PathZoneID:
+      name: zone_id
+      in: path
+      required: true
+      description: 区域 ID（正整数）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    QueryLimit:
+      name: limit
+      in: query
+      description: 每页条数；默认 25，上限 100，超出会被服务端截断，负数/非数字返回 400
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+        default: 25
+    QueryOffset:
+      name: offset
+      in: query
+      description: 跳过条数；默认 0，负数/非数字返回 400
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+        default: 0
+    QueryZoneID:
+      name: zone_id
+      in: query
+      description: 按区域过滤（正整数；格式非法返回 400）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+
+  headers:
+    XTotalCount:
+      description: 过滤后（分页前）的总条数
+      schema:
+        type: integer
+        format: int64
+    XMSErrorCode:
+      description: 错误码镜像（与响应体 code 一致，客户端可只读该头判断错误类型）
+      schema:
+        type: string
+    Location:
+      description: 新资源或状态终结点的路径（相对路径）
+      schema:
+        type: string
+        format: uri-reference
+    Allow:
+      description: 405 响应中该路径允许的 HTTP 方法列表
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: 请求参数非法（bad_request；也用于 image_not_available_in_zone）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: bad_request
+              message: invalid limit query parameter
+    NotFound:
+      description: 资源不存在，或路径未匹配任何路由的全局 404 兜底（not_found）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: not_found
+              message: vm 42 not found
+    Conflict:
+      description: 与现有状态冲突（conflict / ip_exhausted / vm_not_ready）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: conflict
+              message: ip pool network overlaps an existing pool
+    Unprocessable:
+      description: 语义正确但被业务规则拒绝（unprocessable_entity / disk_shrink_not_allowed）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: disk_shrink_not_allowed
+              message: disk size cannot be reduced
+    ServiceUnavailable:
+      description: 服务或依赖不可用（service_unavailable / node_unavailable）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: node_unavailable
+              message: no available node
+    InternalError:
+      description: 服务器内部错误（internal_error，统一兜底，不暴露内部细节）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: internal_error
+              message: internal server error
+    MethodNotAllowed:
+      description: 路径存在但方法未注册（method_not_allowed，全局兜底，带 Allow 头）
+      headers:
+        Allow:
+          $ref: "#/components/headers/Allow"
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: method_not_allowed
+              message: method not allowed
+
+  schemas:
+    ErrorDetail:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: 稳定的机器可读错误码（客户端只可依赖 code）
+          enum:
+            - bad_request
+            - not_found
+            - method_not_allowed
+            - conflict
+            - unprocessable_entity
+            - internal_error
+            - service_unavailable
+            - dependency_failed
+            - node_unavailable
+            - ip_exhausted
+            - vm_not_ready
+            - disk_shrink_not_allowed
+            - image_not_available_in_zone
+        message:
+          type: string
+          description: 仅供人阅读，不可被程序解析
+    ErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorDetail"
+
+    HealthResponse:
+      type: object
+      required: [status, database]
+      properties:
+        status:
+          type: string
+          description: ok（正常）或 degraded（503）
+          enum: [ok, degraded]
+        database:
+          type: string
+          description: up 或 down
+          enum: [up, down]
+
+    ZoneCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: 区域名称（唯一）
+          example: cn-north-1
+
+    ZoneResponse:
+      type: object
+      required: [id, name, created_at, nodes]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        nodes:
+          type: array
+          description: 该区域全部节点（恒为数组，创建时为空数组）
+          items:
+            $ref: "#/components/schemas/NodeResponse"
+
+    NodeRequest:
+      type: object
+      required: [name, host, api_user, api_token]
+      properties:
+        name:
+          type: string
+          description: 节点名（区域内唯一）
+        host:
+          type: string
+          description: 节点 IP 或主机名
+        api_user:
+          type: string
+          description: PVE API 用户，如 spark@pve
+        api_token:
+          type: string
+          description: PVE API token 完整 secret；更新时为空字符串表示保留原密钥
+        enabled:
+          type: boolean
+          description: 是否启用；缺省为 true
+
+    NodeResponse:
+      type: object
+      required: [id, zone_id, name, host, api_user, api_token_set, enabled, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        zone_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        host:
+          type: string
+        api_user:
+          type: string
+        api_token_set:
+          type: boolean
+          description: 是否已存储 API token（token 本身永不返回）
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    CreatePoolRequest:
+      type: object
+      required: [zone_id, name, network_cidr, gateway, dns]
+      properties:
+        zone_id:
+          type: integer
+          format: int64
+          description: 所属区域（handler 校验必填，<=0 返回 400）
+        name:
+          type: string
+        network_cidr:
+          type: string
+          format: ipv4-cidr
+          description: 网段，如 10.9.0.0/24（自动展开为逐地址记录）
+        gateway:
+          type: string
+          format: ipv4
+        dns:
+          type: string
+          description: DNS 服务器，如 1.1.1.1
+
+    Pool:
+      type: object
+      required: [id, zone_id, name, network_cidr, gateway, dns, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        zone_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        network_cidr:
+          type: string
+          format: ipv4-cidr
+        gateway:
+          type: string
+          format: ipv4
+        dns:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    SetPoolNodesRequest:
+      type: object
+      required: [node_ids]
+      properties:
+        node_ids:
+          type: array
+          description: 白名单节点 ID 列表（整体替换）
+          items:
+            type: integer
+            format: int64
+
+    StorageTypeRequest:
+      type: object
+      required: [name, display_name, pve_storage]
+      properties:
+        name:
+          type: string
+          description: 对外抽象名（唯一），如 ssd
+        display_name:
+          type: string
+          description: 展示名
+        pve_storage:
+          type: string
+          description: 真实 PVE 存储名，如 local-ssd
+
+    StorageType:
+      type: object
+      required: [id, name, display_name, pve_storage, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        display_name:
+          type: string
+        pve_storage:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    ImageRequest:
+      type: object
+      required: [name, default_user, node_images]
+      properties:
+        name:
+          type: string
+          description: 镜像名（唯一），如 debian-12-cloud
+        default_user:
+          type: string
+          description: 默认登录用户，如 debian
+        node_images:
+          type: object
+          description: 节点名 → 节点上镜像路径
+          additionalProperties:
+            type: string
+
+    Image:
+      type: object
+      required: [id, name, default_user, node_images, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        default_user:
+          type: string
+        node_images:
+          type: object
+          additionalProperties:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+
+    CreateVMRequest:
+      type: object
+      required: [name, cpu, mem_mb, disk_gb, image_id, storage_type_id, zone_id, password]
+      properties:
+        name:
+          type: string
+          description: VM 名称
+        cpu:
+          type: integer
+          format: int32
+          minimum: 1
+          description: vCPU 数
+        mem_mb:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 内存（MB）
+        disk_gb:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 磁盘（GB）
+        image_id:
+          type: integer
+          format: int64
+        storage_type_id:
+          type: integer
+          format: int64
+        zone_id:
+          type: integer
+          format: int64
+        password:
+          type: string
+          description: cloud-init 注入密码（仅创建时使用，不随响应返回）
+
+    VMResponse:
+      type: object
+      required: [id, uuid, name, cpu, mem_mb, disk_gb, image_id, storage_type_id, zone_id, node_id, status, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        uuid:
+          type: string
+          format: uuid
+        name:
+          type: string
+        cpu:
+          type: integer
+          format: int32
+        mem_mb:
+          type: integer
+          format: int64
+        disk_gb:
+          type: integer
+          format: int64
+        image_id:
+          type: integer
+          format: int64
+        storage_type_id:
+          type: integer
+          format: int64
+        zone_id:
+          type: integer
+          format: int64
+        node_id:
+          type: integer
+          format: int64
+        pve_vmid:
+          type: integer
+          format: int64
+          description: PVE 侧 VMID；PVE 侧尚未创建时省略
+        ip:
+          type: string
+          format: ipv4
+          description: 分配的 IP；尚未分配时省略
+        status:
+          type: string
+          description: creating/failed 为本地过渡状态；ready 及以后为 PVE 穿透状态
+          examples: [creating, ready, running, stopped, failed]
+        provision_error:
+          type: string
+          description: 异步供给链失败原因（仅失败时出现）
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    VMListItem:
+      allOf:
+        - $ref: "#/components/schemas/VMResponse"
+        - type: object
+          properties:
+            cpu_usage:
+              type: number
+              format: float
+              description: PVE 实时 CPU 使用率；无 PVE 对端或停机时省略
+            mem:
+              type: integer
+              format: int64
+              description: 实时内存（字节）；同上省略
+            maxmem:
+              type: integer
+              format: int64
+              description: 最大内存（字节）；同上省略
+            disk:
+              type: integer
+              format: int64
+              description: 实时磁盘用量（字节）；同上省略
+            maxdisk:
+              type: integer
+              format: int64
+              description: 最大磁盘（字节）；同上省略
+            uptime:
+              type: integer
+              format: int64
+              description: 运行时长（秒）；同上省略
+
+    NodeWarning:
+      type: object
+      required: [node, error]
+      properties:
+        node:
+          type: string
+          description: 查询失败的 PVE 节点名
+        error:
+          type: string
+          description: 失败原因
+
+    VMListResponse:
+      type: object
+      required: [vms, warnings]
+      properties:
+        vms:
+          type: array
+          items:
+            $ref: "#/components/schemas/VMListItem"
+        warnings:
+          type: array
+          description: 节点查询失败告警（恒为数组，无失败时为空数组）
+          items:
+            $ref: "#/components/schemas/NodeWarning"
+
+    ResizeRequest:
+      type: object
+      description: 至少一个字段必须出现；缺失或 null 的字段保留现值
+      minProperties: 1
+      properties:
+        cpu:
+          type: integer
+          format: int32
+          minimum: 1
+        mem_mb:
+          type: integer
+          format: int64
+          minimum: 1
+        disk_gb:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 只增不减；小于当前值返回 422 disk_shrink_not_allowed
+
+    AcceptedResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+          description: 恒为 true；实际结果通过 Location 指向的 GET /vms/{id} 观察
+          example: true

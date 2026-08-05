@@ -83,31 +83,33 @@ go run ./cmd/server                      # 直接运行
 
 ## API 概览
 
-错误统一返回 `{"error": {"code", "message"}}`；`code` 取值：`bad_request` / `not_found` / `conflict` / `unprocessable_entity` / `node_unavailable` / `ip_exhausted` / `vm_not_ready` / `disk_shrink_not_allowed` / `image_not_available_in_zone` / `internal_error`。
+错误统一返回 `{"error": {"code", "message"}}` 并携带 `x-ms-error-code` 响应头；`code` 取值：`bad_request` / `not_found` / `method_not_allowed` / `conflict` / `unprocessable_entity` / `node_unavailable` / `ip_exhausted` / `vm_not_ready` / `disk_shrink_not_allowed` / `image_not_available_in_zone` / `internal_error`（全量清单与触发场景见 [docs/api-errors.md](docs/api-errors.md)）。完整机器可读契约（OpenAPI 3.0）见 [docs/openapi.yaml](docs/openapi.yaml)。
+
+列表端点统一分页：`limit` 默认 25、上限 100（超出截断）、`offset` 默认 0，非法值返回 400；响应头 `X-Total-Count` 携带过滤后（分页前）的总条数。
 
 | 方法 | 路径 | 说明 | 主要参数 |
 | --- | --- | --- | --- |
 | GET | `/healthz` | 健康检查（含 DB 连通性） | — |
 | POST | `/zones` | 创建区域 | `name` |
-| GET | `/zones` | 区域列表（含节点） | — |
+| GET | `/zones` | 区域列表（含节点；分页 + `X-Total-Count`） | `limit?`、`offset?` |
 | POST | `/zones/:zone_id/nodes` | 登记 PVE 节点 | `name`、`host`、`api_user`、`api_token`、`enabled?` |
 | GET | `/zones/:zone_id/nodes` | 区域节点列表 | — |
 | PUT | `/nodes/:id` | 更新节点（空 `api_token` 保留原密钥） | 同上 |
 | POST | `/ip-pools` | 创建 IP 池（自动展开为逐地址记录） | `zone_id`、`name`、`network_cidr`、`gateway`、`dns` |
-| GET | `/ip-pools` | IP 池列表（可按 `zone_id` 过滤） | `zone_id?` |
+| GET | `/ip-pools` | IP 池列表（可按 `zone_id` 过滤；分页） | `zone_id?`、`limit?`、`offset?` |
 | PUT | `/ip-pools/:id/nodes` | 勾选该池可用的节点白名单 | `node_ids` |
 | GET | `/ip-pools/:id/nodes` | 池的节点白名单 | — |
 | POST | `/storage-types` | 登记存储类型 | `name`、`display_name`、`pve_storage` |
-| GET | `/storage-types` | 存储类型列表 | — |
-| GET/PUT/DELETE | `/storage-types/:id` | 存储类型查/改/删 | — |
+| GET | `/storage-types` | 存储类型列表（分页） | `limit?`、`offset?` |
+| GET/PUT/DELETE | `/storage-types/:id` | 存储类型查/改/删（DELETE → 204） | — |
 | POST | `/images` | 登记 cloud 镜像 | `name`、`default_user`、`node_images{节点名→路径}` |
-| GET | `/images` | 镜像列表；`?zone_id=` 返回该区域各节点镜像交集 | `zone_id?` |
+| GET | `/images` | 镜像列表；`?zone_id=` 返回该区域各节点镜像交集（分页） | `zone_id?`、`limit?`、`offset?` |
 | POST | `/vms` | 创建 VM：分配 IP → 落库 → 异步 PVE 创建链，立即返回 201 | `name`、`cpu`、`mem_mb`、`disk_gb`、`image_id`、`storage_type_id`、`zone_id`、`password` |
-| GET | `/vms` | 列表（穿透式合并各节点实时状态，节点故障出现在 `warnings`） | — |
+| GET | `/vms` | 列表（穿透式合并各节点实时状态，节点故障出现在 `warnings`；分页） | `limit?`、`offset?` |
 | GET | `/vms/:id` | 详情（穿透实时状态） | — |
-| POST | `/vms/:id/start\|stop\|restart` | 生命周期操作（202 异步派发） | — |
-| POST | `/vms/:id/resize` | 升降配；磁盘只增，缩小返回 422 | `cpu?`、`mem_mb?`、`disk_gb?` |
-| POST | `/vms/:id/destroy` | 销毁：PVE 侧删除（含 purge）→ 释放 IP → 删本地记录 | — |
+| POST | `/vms/:id/start\|stop\|restart` | 生命周期操作（202 异步派发，`Location` 指向 `GET /vms/:id`） | — |
+| PATCH | `/vms/:id` | 升降配；缺失/null 字段保留现值，磁盘只增、缩小返回 422；返回完整 VM 穿透状态 | `cpu?`、`mem_mb?`、`disk_gb?` |
+| DELETE | `/vms/:id` | 销毁：PVE 侧删除（含 purge）→ 释放 IP → 删本地记录；204 同步返回，重复销毁幂等（404） | — |
 
 ## 业务模型
 

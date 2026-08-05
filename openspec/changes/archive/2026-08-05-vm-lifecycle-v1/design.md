@@ -80,19 +80,48 @@ PVE 创建链（按序）：
 ### D6: 对外 API 形态
 
 ```
-POST   /zones                    创建区域
-GET    /zones                    区域列表
-POST   /vms                      {name, cpu, mem_mb, disk_gb, image_id, storage_type_id, zone_id, password}
-GET    /vms                      列表 (穿透合并)
-GET    /vms/:id                  详情 (穿透)
-POST   /vms/:id/start|stop|restart
-POST   /vms/:id/resize            {cpu?, mem_mb?, disk_gb?} 磁盘只增, 校验不得小于现值
-POST   /vms/:id/destroy          销毁 + 释放 IP
-GET    /images?zone_id=         区域镜像交集 + default_user
-POST   /storage-types            存储类型 CRUD (配置用)
+POST   /zones                     创建区域 {name} → 201 + Location: /zones/{id}
+GET    /zones                     区域列表（含节点；分页）
+POST   /zones/:zone_id/nodes      登记 PVE 节点 → 201 + Location
+GET    /zones/:zone_id/nodes      区域节点列表
+PUT    /nodes/:id                 更新节点（空 api_token 保留原密钥）
+POST   /ip-pools                  {zone_id, name, network_cidr, gateway, dns} → 201
+GET    /ip-pools                  列表（可按 zone_id 过滤；分页）
+PUT    /ip-pools/:id/nodes        设置节点白名单 {node_ids}
+GET    /ip-pools/:id/nodes        白名单查询
+POST   /storage-types             登记存储类型 → 201
+GET    /storage-types             列表（分页）
+GET/PUT/DELETE /storage-types/:id 查询/更新/删除（DELETE → 204）
+POST   /images                    {name, default_user, node_images} → 201
+GET    /images?zone_id=           列表（区域镜像交集；分页）
+POST   /vms                       {name, cpu, mem_mb, disk_gb, image_id, storage_type_id, zone_id, password} → 201 + Location: /vms/{id}
+GET    /vms                       列表（穿透合并 + warnings；分页）
+GET    /vms/:id                   详情（穿透）
+POST   /vms/:id/start|stop|restart → 202 {accepted: true} + Location: /vms/{id}（指向状态终结点）
+PATCH  /vms/:id                   {cpu?, mem_mb?, disk_gb?} 部分更新语义：缺失或 null 保留现值；
+                                  磁盘只增，缩小返回 422；→ 200 返回完整 VM（穿透实时状态）
+DELETE /vms/:id                   销毁 + 释放 IP；同步执行，→ 204 无响应体；
+                                  重复销毁：本地行不存在返回 404，PVE 侧已不存在视为已销毁（幂等）
+GET    /healthz                   健康检查（DB 探活）
 ```
 
-gin 路由 + 标准 REST 语义；错误统一返回 `{error: {code, message}}` 结构。
+gin 路由 + 标准 REST 语义；错误统一返回 `{error: {code, message}}` 结构，并携带 `x-ms-error-code` 响应头（含未匹配路由的 404/405 兜底，405 带 Allow 头）。
+
+**分页约定**：所有列表端点（/zones、/ip-pools、/storage-types、/images、/vms）支持 `limit`/`offset` 查询参数：`limit` 默认 25、上限 100（超出截断）、`offset` 默认 0，非法值（负数/非数字）返回 400；响应头 `X-Total-Count` 携带过滤后（分页前）的总条数。
+
+### D6.1: API 契约修订记录（2026-08-05）
+
+本次修订为**破坏性契约变更**（前端需同步），具体如下：
+
+| 变更 | 修订前 | 修订后 |
+| --- | --- | --- |
+| 销毁 | `POST /vms/:id/destroy`（200） | `DELETE /vms/:id`（204，幂等） |
+| 升降配 | `POST /vms/:id/resize` | `PATCH /vms/:id`（部分更新语义：缺失/null 字段保留现值，200 返回完整 VM 穿透状态） |
+| 列表端点 | 无分页 | `limit`/`offset` 分页 + `X-Total-Count` 响应头（limit 默认 25/上限 100/非法 400） |
+| 生命周期 | 202 无 Location | `POST /vms/:id/start\|stop\|restart` 202 + `Location: /vms/{id}` 指向状态终结点 |
+| 错误响应 | 无统一头 | 统一 `x-ms-error-code` 响应头（含未匹配路由的 404/405 兜底 + 405 的 Allow 头） |
+
+**版本策略**：v1 无版本前缀（`servers` 相对路径 `/`）；破坏性变更通过本文档与 docs/api-errors.md、docs/openapi.yaml 记录，并与前端同步推进；未来如需引入独立版本可启用 `/api/v2`。
 
 ### D7: PVE 客户端
 
