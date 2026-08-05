@@ -14,7 +14,7 @@ import (
 	"spark/pve"
 )
 
-// ZoneRepository is the zone data access the ZoneService depends on.
+// ZoneRepository 是 ZoneService 依赖的区域数据访问层。
 type ZoneRepository interface {
 	CreateZone(ctx context.Context, name string) (*model.Zone, error)
 	GetZone(ctx context.Context, id int64) (*model.Zone, error)
@@ -23,7 +23,7 @@ type ZoneRepository interface {
 	CountZones(ctx context.Context) (int, error)
 }
 
-// NodeRepository is the node data access the ZoneService depends on.
+// NodeRepository 是 ZoneService 依赖的节点数据访问层。
 type NodeRepository interface {
 	CreateNode(ctx context.Context, node model.PVENode) (*model.PVENode, error)
 	GetNode(ctx context.Context, id int64) (*model.PVENode, error)
@@ -32,38 +32,36 @@ type NodeRepository interface {
 	UpdateNode(ctx context.Context, node model.PVENode) (*model.PVENode, error)
 }
 
-// ZoneService implements the business rules for zones and their PVE nodes.
+// ZoneService 实现区域及其 PVE 节点的业务规则。
 type ZoneService struct {
 	zoneRepo ZoneRepository
 	nodeRepo NodeRepository
 }
 
-// NewZoneService creates a ZoneService backed by the given repositories.
+// NewZoneService 使用给定的仓库创建一个 ZoneService。
 func NewZoneService(zoneRepo ZoneRepository, nodeRepo NodeRepository) *ZoneService {
 	return &ZoneService{zoneRepo: zoneRepo, nodeRepo: nodeRepo}
 }
 
-// KindNodeUnavailable marks "no candidate node is reachable". The value sits
-// outside the iota range of the shared kinds in errors.go (owned by other
-// batches) to avoid coupling this file to their edits.
+// KindNodeUnavailable 表示"没有可达的候选节点"。该值位于 errors.go 中共享
+// kind 的 iota 范围之外（该范围归其他批次所有），以避免本文件与它们的改动
+// 产生耦合。
 const KindNodeUnavailable ErrorKind = 100
 
-// nodeUnavailablef builds a KindNodeUnavailable service error.
+// nodeUnavailablef 构造一个 KindNodeUnavailable 服务错误。
 func nodeUnavailablef(format string, args ...any) *Error {
 	return &Error{Kind: KindNodeUnavailable, Message: fmt.Sprintf(format, args...)}
 }
 
-// nodeProbeTimeout bounds a single reachability probe against a candidate
-// node.
+// nodeProbeTimeout 限制对单个候选节点的一次可达性探测时长。
 const nodeProbeTimeout = 5 * time.Second
 
-// nodeProbeBudget bounds the whole reachability sweep across all candidate
-// nodes, so N probes never accumulate into N x nodeProbeTimeout.
+// nodeProbeBudget 限制对所有候选节点的整轮可达性扫描时长，避免 N 次探测
+// 累加为 N x nodeProbeTimeout。
 const nodeProbeBudget = 15 * time.Second
 
-// CreateZone creates a zone. The name is required and must be unique; the
-// check is a best-effort scan (the zones table has no unique constraint) and
-// two racing creates could still slip through, which is accepted for v1.
+// CreateZone 创建一个区域。名称必填且必须唯一；该检查是尽力而为的扫描
+// （zones 表没有唯一约束），两个并发创建仍可能同时通过，v1 接受这一情况。
 func (s *ZoneService) CreateZone(ctx context.Context, name string) (*model.Zone, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -85,18 +83,16 @@ func (s *ZoneService) CreateZone(ctx context.Context, name string) (*model.Zone,
 	return zone, nil
 }
 
-// ZoneWithNodes pairs a zone with its nodes for list responses.
+// ZoneWithNodes 将区域与其节点配对，用于列表响应。
 type ZoneWithNodes struct {
 	Zone  model.Zone
 	Nodes []model.PVENode
 }
 
-// ListZones returns one page of zones together with their nodes, satisfying
-// the zones spec's "return all zones and their node information". The
-// pagination unit is the zone: the page holds limit zones (offset skips the
-// first offset zones in id order), each with its full, unpaginated node
-// list — a zone embeds few nodes, so only the zone rows are paged. total is
-// the total number of zones, independent of the page.
+// ListZones 返回一页区域及其节点，满足 zones 规范中"返回所有区域及其节点
+// 信息"的要求。分页单位为区域：每页容纳 limit 个区域（offset 按 id 顺序跳过
+// 前 offset 个区域），每个区域都带完整的、不分页的节点列表——一个区域包含的
+// 节点很少，因此仅对区域行分页。total 是区域总数，与分页无关。
 func (s *ZoneService) ListZones(ctx context.Context, limit, offset int) ([]ZoneWithNodes, int, error) {
 	zones, err := s.zoneRepo.ListZonesPage(ctx, limit, offset)
 	if err != nil {
@@ -117,9 +113,8 @@ func (s *ZoneService) ListZones(ctx context.Context, limit, offset int) ([]ZoneW
 	return out, total, nil
 }
 
-// CreateNode registers a node in a zone. The zone must exist, the name must
-// be unique within the zone, and host/api_user/api_token are required. The
-// API token is stored in plain text by design.
+// CreateNode 在区域中注册一个节点。区域必须存在，名称在区域内必须唯一，
+// 且 host/api_user/api_token 均为必填。按设计，API token 以明文存储。
 func (s *ZoneService) CreateNode(ctx context.Context, zoneID int64, name, host, apiUser, apiToken string, enabled *bool) (*model.PVENode, error) {
 	name = strings.TrimSpace(name)
 	host = strings.TrimSpace(host)
@@ -166,10 +161,9 @@ func (s *ZoneService) CreateNode(ctx context.Context, zoneID int64, name, host, 
 	return created, nil
 }
 
-// UpdateNode replaces the editable fields of the node (name/host/api_user/
-// enabled). api_token is optional: an empty value keeps the stored secret.
-// The second return value reports whether the token was replaced, so handlers
-// can answer api_token_set without ever echoing the secret.
+// UpdateNode 替换节点的可编辑字段（name/host/api_user/enabled）。
+// api_token 可选：空值表示保留已存储的密钥。第二个返回值报告 token 是否被
+// 替换，以便处理器在不回显密钥的情况下应答 api_token_set。
 func (s *ZoneService) UpdateNode(ctx context.Context, id int64, name, host, apiUser, apiToken string, enabled *bool) (*model.PVENode, bool, error) {
 	name = strings.TrimSpace(name)
 	host = strings.TrimSpace(host)
@@ -219,7 +213,7 @@ func (s *ZoneService) UpdateNode(ctx context.Context, id int64, name, host, apiU
 	return updated, tokenChanged, nil
 }
 
-// ListNodesByZone returns the nodes of a zone; the zone must exist.
+// ListNodesByZone 返回区域的节点列表；区域必须存在。
 func (s *ZoneService) ListNodesByZone(ctx context.Context, zoneID int64) ([]model.PVENode, error) {
 	if _, err := s.zoneRepo.GetZone(ctx, zoneID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -234,23 +228,20 @@ func (s *ZoneService) ListNodesByZone(ctx context.Context, zoneID int64) ([]mode
 	return nodes, nil
 }
 
-// SelectReachableNode probes the candidate nodes in order and returns the
-// first one whose PVE API answers (each probe is bounded by nodeProbeTimeout;
-// the whole sweep is bounded by nodeProbeBudget so many dead nodes cannot
-// accumulate into a long stall). A node that fails (unreachable, TLS,
-// timeout or invalid token) is skipped and the failure is logged at debug
-// level with the error as reported by the PVE client, which never embeds
-// credentials (see pve.NewClient redaction). When none is reachable a
-// KindNodeUnavailable error is returned. VM creation (task 7.1) uses this to
-// pick the deployment node.
+// SelectReachableNode 按顺序探测候选节点，返回第一个 PVE API 可达的节点
+// （每次探测受 nodeProbeTimeout 限制；整轮扫描受 nodeProbeBudget 限制，避免
+// 多个死节点累积成长时间阻塞）。失败的节点（不可达、TLS、超时或 token 无效）
+// 会被跳过，失败以 debug 级别记录，携带 PVE 客户端报告的原始错误——该错误
+// 从不包含凭据（参见 pve.NewClient 的脱敏处理）。当没有任何节点可达时，返回
+// KindNodeUnavailable 错误。VM 创建（任务 7.1）使用该函数选择部署节点。
 func SelectReachableNode(ctx context.Context, nodes []model.PVENode) (model.PVENode, error) {
 	return selectReachableNode(ctx, nodes, func(host, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient(host, apiUser, apiTokenSecret, pve.WithTimeout(nodeProbeTimeout))
 	})
 }
 
-// selectReachableNode is SelectReachableNode with the client factory injected
-// so tests can point the probes at fake servers.
+// selectReachableNode 是注入了客户端工厂的 SelectReachableNode，以便测试
+// 将探测指向假服务器。
 func selectReachableNode(ctx context.Context, nodes []model.PVENode, newClient func(host, apiUser, apiTokenSecret string) *pve.Client) (model.PVENode, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, nodeProbeBudget)
 	defer cancel()

@@ -10,18 +10,18 @@ import (
 	"spark/service"
 )
 
-// IPPoolHandler serves the /ip-pools routes.
+// IPPoolHandler 提供 /ip-pools 路由。
 type IPPoolHandler struct {
 	svc *service.IPPoolService
 }
 
-// NewIPPoolHandler creates an IPPoolHandler backed by svc.
+// NewIPPoolHandler 创建一个由 svc 支撑的 IPPoolHandler。
 func NewIPPoolHandler(svc *service.IPPoolService) *IPPoolHandler {
 	return &IPPoolHandler{svc: svc}
 }
 
-// RegisterIPPoolsRoutes mounts the IP pool routes on rg. It is called by the
-// router with the /ip-pools group.
+// RegisterIPPoolsRoutes 在 rg 上挂载 IP pool 路由。由
+// router 以 /ip-pools 分组调用。
 func RegisterIPPoolsRoutes(rg *gin.RouterGroup, svc *service.IPPoolService) {
 	h := NewIPPoolHandler(svc)
 	rg.POST("", Handler(h.CreatePool))
@@ -30,7 +30,7 @@ func RegisterIPPoolsRoutes(rg *gin.RouterGroup, svc *service.IPPoolService) {
 	rg.GET("/:id/nodes", Handler(h.GetPoolNodes))
 }
 
-// createPoolRequest is the request body for POST /ip-pools.
+// createPoolRequest 是 POST /ip-pools 的请求体。
 type createPoolRequest struct {
 	ZoneID      int64  `json:"zone_id"`
 	Name        string `json:"name"`
@@ -39,8 +39,8 @@ type createPoolRequest struct {
 	DNS         string `json:"dns"`
 }
 
-// CreatePool handles POST /ip-pools: creates the pool and expands the CIDR
-// into per-address ip rows.
+// CreatePool 处理 POST /ip-pools：创建 pool 并将 CIDR 展开为
+// 逐地址的 ip 行。
 func (h *IPPoolHandler) CreatePool(c *gin.Context) error {
 	var req createPoolRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -58,12 +58,11 @@ func (h *IPPoolHandler) CreatePool(c *gin.Context) error {
 	return nil
 }
 
-// ListPools handles GET /ip-pools. With a zone_id query parameter it returns
-// only that zone's pools — deliberately unpaginated (a zone embeds few
-// pools); without it, all pools paged by the shared limit/offset query
-// parameters. X-Total-Count carries the total count in both branches. The
-// limit/offset parameters are validated in both branches so a bad value
-// fails consistently regardless of the filter.
+// ListPools 处理 GET /ip-pools。带 zone_id 查询参数时只返回该 zone 的
+// pools —— 刻意不分页（一个 zone 内嵌的 pool 很少）；不带时返回全部
+// pools，按共享的 limit/offset 查询参数分页。两个分支都通过
+// X-Total-Count 携带总数。limit/offset 参数在两个分支都会校验，
+// 使非法值无论是否带过滤条件都一致失败。
 func (h *IPPoolHandler) ListPools(c *gin.Context) error {
 	ctx := c.Request.Context()
 	limit, offset, err := parsePagination(c)
@@ -92,13 +91,13 @@ func (h *IPPoolHandler) ListPools(c *gin.Context) error {
 	return nil
 }
 
-// setPoolNodesRequest is the request body for PUT /ip-pools/:id/nodes.
+// setPoolNodesRequest 是 PUT /ip-pools/:id/nodes 的请求体。
 type setPoolNodesRequest struct {
 	NodeIDs []int64 `json:"node_ids"`
 }
 
-// SetPoolNodes handles PUT /ip-pools/:id/nodes: full replacement of the
-// pool's node whitelist. The response returns the resulting whitelist.
+// SetPoolNodes 处理 PUT /ip-pools/:id/nodes：完整替换 pool 的
+// node 白名单。响应返回替换后的白名单。
 func (h *IPPoolHandler) SetPoolNodes(c *gin.Context) error {
 	poolID, err := parseIDParam(c, "id")
 	if err != nil {
@@ -124,7 +123,7 @@ func (h *IPPoolHandler) SetPoolNodes(c *gin.Context) error {
 	return nil
 }
 
-// GetPoolNodes handles GET /ip-pools/:id/nodes.
+// GetPoolNodes 处理 GET /ip-pools/:id/nodes。
 func (h *IPPoolHandler) GetPoolNodes(c *gin.Context) error {
 	poolID, err := parseIDParam(c, "id")
 	if err != nil {

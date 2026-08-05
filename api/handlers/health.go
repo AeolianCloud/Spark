@@ -11,17 +11,17 @@ import (
 	"spark/database"
 )
 
-// HealthHandler serves liveness/readiness checks.
+// HealthHandler 提供服务存活/就绪检查。
 type HealthHandler struct {
 	pool *pgxpool.Pool
 }
 
-// NewHealthHandler creates a HealthHandler backed by the given pool.
+// NewHealthHandler 创建一个由给定 pool 支撑的 HealthHandler。
 func NewHealthHandler(pool *pgxpool.Pool) *HealthHandler {
 	return &HealthHandler{pool: pool}
 }
 
-// Healthz reports service and database status.
+// Healthz 报告服务与数据库状态。
 // GET /healthz
 // 健康探活不是业务 API：200 正常响应不携带错误契约头；503 degraded 状态
 // 携带 x-ms-error-code: service_unavailable 头（见 docs/api-errors.md），

@@ -9,16 +9,15 @@ import (
 	"time"
 )
 
-// DefaultWaitInterval is the polling interval used when WaitTask receives no
-// explicit interval.
+// DefaultWaitInterval 是 WaitTask 未收到显式间隔时使用的轮询间隔。
 const DefaultWaitInterval = 2 * time.Second
 
-// DefaultWaitTimeout bounds WaitTask when no explicit timeout is given.
+// DefaultWaitTimeout 在未给出显式超时时限制 WaitTask 的时长。
 const DefaultWaitTimeout = 10 * time.Minute
 
-// UPID is a parsed Proxmox VE task ID. The canonical format is
-// "UPID:node:pid:pstart:starttime:type:id:user" with pid, pstart and
-// starttime in hexadecimal:
+// UPID 是解析后的 Proxmox VE 任务 ID。规范格式为
+// "UPID:node:pid:pstart:starttime:type:id:user"，其中 pid、pstart 和
+// starttime 是十六进制：
 //
 //	UPID:pve1:0000FD0F:01CA7A4A:5FAB1EC4:qmsnapshot:100:root@pam:
 type UPID struct {
@@ -32,8 +31,8 @@ type UPID struct {
 	User      string
 }
 
-// ParseUPID parses a UPID string. The hex-encoded numeric fields are decoded
-// to their integer values.
+// ParseUPID 解析 UPID 字符串。十六进制编码的数字字段会被解码为其
+// 整数值。
 func ParseUPID(s string) (UPID, error) {
 	parts := strings.Split(s, ":")
 	if len(parts) != 9 {
@@ -64,9 +63,9 @@ func parseUPIDHex(s string) (uint64, error) {
 	return v, nil
 }
 
-// TaskStatus is the payload of GET /nodes/{node}/tasks/{upid}/status.
-// Status is "running" or "stopped"; ExitStatus is "OK" on success and is
-// absent while the task is still running.
+// TaskStatus 是 GET /nodes/{node}/tasks/{upid}/status 的负载。Status 取值
+// 为 "running" 或 "stopped"；ExitStatus 成功时为 "OK"，任务仍在运行时
+// 该字段不出现。
 type TaskStatus struct {
 	UPID       string `json:"upid"`
 	Node       string `json:"node"`
@@ -80,7 +79,7 @@ type TaskStatus struct {
 	ExitStatus string `json:"exitstatus,omitempty"`
 }
 
-// GetTaskStatus reads a single task status sample.
+// GetTaskStatus 读取单个任务状态样本。
 func (c *Client) GetTaskStatus(ctx context.Context, node, upid string) (*TaskStatus, error) {
 	path := fmt.Sprintf("/nodes/%s/tasks/%s/status", node, upid)
 	raw, err := c.doJSON(ctx, http.MethodGet, path, nil, nil)
@@ -94,12 +93,11 @@ func (c *Client) GetTaskStatus(ctx context.Context, node, upid string) (*TaskSta
 	return &st, nil
 }
 
-// WaitTask polls a task's status until it stops or timeout elapses. The node
-// to query is taken from the UPID itself when it parses (PVE may schedule a
-// task on a different node than the one that was asked, and the UPID carries
-// the actual executor), falling back to the passed node. interval and timeout
-// of zero fall back to DefaultWaitInterval/DefaultWaitTimeout. A stopped task
-// with a non-OK exit status returns an error containing the exit status.
+// WaitTask 轮询任务状态直至其停止或超时。当 UPID 可解析时，要查询的
+// 节点取自 UPID 本身（PVE 可能将任务调度到与请求不同的节点上，UPID 携带
+// 实际执行节点），否则回退到传入的 node。interval 和 timeout 为 0 时回退
+// 到 DefaultWaitInterval/DefaultWaitTimeout。已停止且退出状态非 OK 的任务
+// 会返回包含退出状态的错误。
 func (c *Client) WaitTask(ctx context.Context, node, upid string, interval, timeout time.Duration) (*TaskStatus, error) {
 	if upid == "" {
 		return nil, fmt.Errorf("pve: wait task: empty upid")
@@ -138,11 +136,11 @@ func (c *Client) WaitTask(ctx context.Context, node, upid string, interval, time
 	}
 }
 
-// DiskImportString builds the scsi0 disk string that imports a cloud image
-// during VM creation: "<storage>:0,import-from=<source>". Pass it to
-// CreateVMParams.Scsi0 (PVE 7.0+ supports import-from at create time), so
-// create and image import happen in the single qmcreate task. There is no
-// REST importdisk endpoint in PVE 7/8/9 (importdisk is only a qm CLI command).
+// DiskImportString 构建在 VM 创建期间导入云镜像的 scsi0 磁盘字符串：
+// "<storage>:0,import-from=<source>"。将其传给 CreateVMParams.Scsi0
+// （PVE 7.0+ 支持在创建时 import-from），使创建与镜像导入在单个 qmcreate
+// 任务中完成。PVE 7/8/9 没有 REST 形式的 importdisk 端点（importdisk 只是
+// qm CLI 命令）。
 func DiskImportString(storage, source string) string {
 	return storage + ":0,import-from=" + source
 }

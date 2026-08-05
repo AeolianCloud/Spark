@@ -9,23 +9,22 @@ import (
 	"spark/model"
 )
 
-// ImageRepository persists model.Image rows, including the node_images JSONB
-// map (node name -> storage path or presence marker).
+// ImageRepository 负责持久化 model.Image 行，包括 node_images JSONB
+// 映射（节点名 -> 存储路径或存在性标记）。
 type ImageRepository struct {
 	pool *pgxpool.Pool
 }
 
-// NewImageRepository creates an ImageRepository backed by pool.
+// NewImageRepository 创建由 pool 支撑的 ImageRepository。
 func NewImageRepository(pool *pgxpool.Pool) *ImageRepository {
 	return &ImageRepository{pool: pool}
 }
 
 const imageCols = "id, name, default_user, node_images, created_at"
 
-// Create inserts an image and returns it with id and created_at filled. A nil
-// nodeImages is normalized to an empty map so the JSONB column is written as
-// '{}' (migration convention), never as SQL NULL. A duplicate name yields
-// ErrConflict.
+// Create 插入一个镜像并返回它，且已填充 id 与 created_at。nil 的
+// nodeImages 会被规范化为空 map，使 JSONB 列写为 '{}'（migration 约定），
+// 绝不为 SQL NULL。名称重复时产生 ErrConflict。
 func (r *ImageRepository) Create(ctx context.Context, name, defaultUser string, nodeImages map[string]string) (*model.Image, error) {
 	if nodeImages == nil {
 		nodeImages = map[string]string{}
@@ -41,7 +40,7 @@ func (r *ImageRepository) Create(ctx context.Context, name, defaultUser string, 
 	return img, nil
 }
 
-// Get returns the image with the given id, or pgx.ErrNoRows when absent.
+// Get 返回指定 id 的镜像；不存在时返回 pgx.ErrNoRows。
 func (r *ImageRepository) Get(ctx context.Context, id int64) (*model.Image, error) {
 	var img model.Image
 	err := r.pool.QueryRow(ctx, "SELECT "+imageCols+" FROM images WHERE id=$1", id).
@@ -52,8 +51,7 @@ func (r *ImageRepository) Get(ctx context.Context, id int64) (*model.Image, erro
 	return &img, nil
 }
 
-// GetByName returns the image with the given name, or pgx.ErrNoRows when
-// absent.
+// GetByName 返回指定名称的镜像；不存在时返回 pgx.ErrNoRows。
 func (r *ImageRepository) GetByName(ctx context.Context, name string) (*model.Image, error) {
 	var img model.Image
 	err := r.pool.QueryRow(ctx, "SELECT "+imageCols+" FROM images WHERE name=$1", name).
@@ -64,7 +62,7 @@ func (r *ImageRepository) GetByName(ctx context.Context, name string) (*model.Im
 	return &img, nil
 }
 
-// List returns all images ordered by id.
+// List 返回按 id 排序的全部镜像。
 func (r *ImageRepository) List(ctx context.Context) ([]model.Image, error) {
 	rows, err := r.pool.Query(ctx, "SELECT "+imageCols+" FROM images ORDER BY id")
 	if err != nil {
@@ -86,8 +84,8 @@ func (r *ImageRepository) List(ctx context.Context) ([]model.Image, error) {
 	return images, nil
 }
 
-// ListPage returns one page of images ordered by id. It feeds the paginated
-// GET /images endpoint (without a zone filter).
+// ListPage 返回按 id 排序的一页镜像。它服务于分页的 GET /images
+// 端点（不带区域过滤）。
 func (r *ImageRepository) ListPage(ctx context.Context, limit, offset int) ([]model.Image, error) {
 	rows, err := r.pool.Query(ctx,
 		"SELECT "+imageCols+" FROM images ORDER BY id LIMIT $1 OFFSET $2", limit, offset)
@@ -110,8 +108,7 @@ func (r *ImageRepository) ListPage(ctx context.Context, limit, offset int) ([]mo
 	return images, nil
 }
 
-// Count returns the total number of images, backing the X-Total-Count
-// header of GET /images.
+// Count 返回镜像总数，支撑 GET /images 的 X-Total-Count 响应头。
 func (r *ImageRepository) Count(ctx context.Context) (int, error) {
 	var n int
 	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM images").Scan(&n); err != nil {
@@ -120,8 +117,8 @@ func (r *ImageRepository) Count(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// ZoneExists reports whether a zone with the given id exists. It backs
-// ImageService.ListImagesByZone.
+// ZoneExists 报告指定 id 的区域是否存在。它支撑
+// ImageService.ListImagesByZone。
 func (r *ImageRepository) ZoneExists(ctx context.Context, id int64) (bool, error) {
 	var exists bool
 	if err := r.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM zones WHERE id=$1)", id).Scan(&exists); err != nil {
@@ -130,8 +127,8 @@ func (r *ImageRepository) ZoneExists(ctx context.Context, id int64) (bool, error
 	return exists, nil
 }
 
-// EnabledNodeNamesByZone returns the names of the enabled nodes in a zone,
-// ordered by id. It backs ImageService.ListImagesByZone.
+// EnabledNodeNamesByZone 返回区域内已启用节点的名称，按 id 排序。
+// 它支撑 ImageService.ListImagesByZone。
 func (r *ImageRepository) EnabledNodeNamesByZone(ctx context.Context, zoneID int64) ([]string, error) {
 	rows, err := r.pool.Query(ctx, "SELECT name FROM pve_nodes WHERE zone_id=$1 AND enabled=TRUE ORDER BY id", zoneID)
 	if err != nil {

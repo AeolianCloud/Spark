@@ -26,11 +26,10 @@ import (
 
 var vmTestTime = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
-// ---------- fakes ----------
+// ---------- 测试替身 ----------
 
-// fakeTx implements pgx.Tx minimally: the service tests only exercise
-// Commit/Rollback directly; repo calls receive it as an opaque handle and
-// ignore it.
+// fakeTx 以最小方式实现 pgx.Tx：服务测试只直接使用 Commit/Rollback；仓库
+// 调用把它当作不透明句柄并忽略它。
 type fakeTx struct {
 	committed  bool
 	rolledBack bool
@@ -67,12 +66,11 @@ func (f *fakeBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
 	return f.tx, nil
 }
 
-// fakeVMRepository is a scriptable VMRepository for service tests. It
-// records the arguments of every mutation and serves a configurable GetVM.
+// fakeVMRepository 是供服务测试使用的可脚本化 VMRepository。它记录每次
+// 变更的参数，并提供可配置的 GetVM。
 //
-// mu guards the fields written by the detached provisioning goroutine
-// (UpdateVMPVEVMID, SetProvisionError) against the reads in the test
-// goroutine, so -race stays clean.
+// mu 保护分离式供给 goroutine（UpdateVMPVEVMID、SetProvisionError）写入的
+// 字段，防止与测试 goroutine 的读取产生竞争，使 -race 保持干净。
 type fakeVMRepository struct {
 	mu               sync.Mutex
 	created          *model.VM
@@ -93,8 +91,8 @@ type fakeVMRepository struct {
 	deleteErr        error
 }
 
-// specUpdate records one UpdateSpec call: the optimistic lock baseline (old
-// values read by the service) and the new values persisted.
+// specUpdate 记录一次 UpdateSpec 调用：乐观锁基线（服务读取的旧值）和
+// 持久化的新值。
 type specUpdate struct {
 	old spec
 	new spec
@@ -106,8 +104,7 @@ type spec struct {
 	diskGB int64
 }
 
-// vmid returns the last VMID linked by the provisioning goroutine, safe for
-// concurrent polling.
+// vmid 返回供给 goroutine 最后关联的 VMID，可安全地并发轮询。
 func (f *fakeVMRepository) vmid() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -207,13 +204,13 @@ func (f *fakeVMRepository) DeleteVMTx(ctx context.Context, tx pgx.Tx, id int64) 
 	return nil
 }
 
-// fakeVMIPPoolRepository is a scriptable VMIPPoolRepository for service
-// tests: scripted pool list/nodes and scripted claim results.
+// fakeVMIPPoolRepository 是供服务测试使用的可脚本化 VMIPPoolRepository：
+// 脚本化的池列表/节点以及脚本化的抢占结果。
 type fakeVMIPPoolRepository struct {
 	pools        []model.IPPool
 	poolNodes    map[int64][]model.PVENode
-	claimResults []claimResult // consumed in order
-	claimDefault error         // returned when the script is exhausted
+	claimResults []claimResult // 按顺序消费
+	claimDefault error         // 脚本耗尽时返回
 	claimedVMIDs []int64
 	released     []int64
 }
@@ -251,7 +248,7 @@ func (f *fakeVMIPPoolRepository) ReleaseIPByVMTx(ctx context.Context, tx pgx.Tx,
 	return nil
 }
 
-// fakeVMZoneRepository is a scriptable VMZoneRepository for service tests.
+// fakeVMZoneRepository 是供服务测试使用的可脚本化 VMZoneRepository。
 type fakeVMZoneRepository struct {
 	zones []model.Zone
 	err   error
@@ -281,7 +278,7 @@ func (f *fakeVMZoneRepository) ListZones(ctx context.Context) ([]model.Zone, err
 	return out, nil
 }
 
-// fakeVMNodeRepository is a scriptable VMNodeRepository for service tests.
+// fakeVMNodeRepository 是供服务测试使用的可脚本化 VMNodeRepository。
 type fakeVMNodeRepository struct {
 	nodes []model.PVENode
 	err   error
@@ -313,7 +310,7 @@ func (f *fakeVMNodeRepository) ListEnabledNodesByZone(ctx context.Context, zoneI
 	return out, nil
 }
 
-// fakeVMImageRepository is a scriptable VMImageRepository for service tests.
+// fakeVMImageRepository 是供服务测试使用的可脚本化 VMImageRepository。
 type fakeVMImageRepository struct {
 	images    []model.Image
 	nodeNames []string
@@ -340,8 +337,8 @@ func (f *fakeVMImageRepository) EnabledNodeNamesByZone(ctx context.Context, zone
 	return f.nodeNames, nil
 }
 
-// fakeVMStorageTypeRepository is a scriptable VMStorageTypeRepository for
-// service tests.
+// fakeVMStorageTypeRepository 是供服务测试使用的可脚本化
+// VMStorageTypeRepository。
 type fakeVMStorageTypeRepository struct {
 	types []model.StorageType
 }
@@ -356,9 +353,9 @@ func (f *fakeVMStorageTypeRepository) Get(ctx context.Context, id int64) (*model
 	return nil, pgx.ErrNoRows
 }
 
-// ---------- helpers ----------
+// ---------- 辅助函数 ----------
 
-// testCipher builds a cipher from a deterministic 32-byte key.
+// testCipher 使用确定性的 32 字节密钥构建密码器。
 func testCipher(t *testing.T) *crypto.Cipher {
 	t.Helper()
 	key := make([]byte, 32)
@@ -374,12 +371,10 @@ func testCipher(t *testing.T) *crypto.Cipher {
 	return c
 }
 
-// newVMService wires a VMService with fakes and a fake transaction
-// beginner; the node selector is stubbed to return the first candidate. The
-// default PVE client points the detached provisioning chain at a full
-// success-chain server, so tests that spawn the chain complete quietly and
-// deterministically; tests that exercise the chain itself override
-// newClient.
+// newVMService 用测试替身和假事务开启器装配一个 VMService；节点选择器被
+// 桩化为返回第一个候选。默认 PVE 客户端将分离式供给链指向完整的成功链服务器，
+// 因此会启动供给链的测试能安静且确定性地完成；真正测试供给链本身的测试会
+// 覆盖 newClient。
 func newVMService(t *testing.T, vmRepo VMRepository, ipRepo VMIPPoolRepository,
 	zoneRepo VMZoneRepository, nodeRepo VMNodeRepository, imageRepo VMImageRepository,
 	stRepo VMStorageTypeRepository) *VMService {
@@ -396,9 +391,9 @@ func newVMService(t *testing.T, vmRepo VMRepository, ipRepo VMIPPoolRepository,
 	return svc
 }
 
-// waitForProvision blocks until the detached provisioning goroutine has
-// finished (the fake repo's UpdateVMPVEVMID was called) or a short timeout,
-// so tests do not race with the goroutine and its server stays open.
+// waitForProvision 阻塞直到分离式供给 goroutine 完成（fake 仓库的
+// UpdateVMPVEVMID 已被调用）或短暂超时，使测试不与 goroutine 竞争，且其
+// 服务器保持打开。
 func waitForProvision(t *testing.T, repo *fakeVMRepository) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -411,8 +406,8 @@ func waitForProvision(t *testing.T, repo *fakeVMRepository) {
 	t.Fatal("provisioning goroutine did not finish in time")
 }
 
-// firstReachableCandidate is a fake node selector: it returns the first
-// candidate or a node_unavailable error for an empty list.
+// firstReachableCandidate 是假节点选择器：返回第一个候选，空列表时返回
+// node_unavailable 错误。
 func firstReachableCandidate(ctx context.Context, nodes []model.PVENode) (model.PVENode, error) {
 	if len(nodes) == 0 {
 		return model.PVENode{}, nodeUnavailablef("no candidates")
@@ -420,8 +415,8 @@ func firstReachableCandidate(ctx context.Context, nodes []model.PVENode) (model.
 	return nodes[0], nil
 }
 
-// scriptedSelectNode builds a fake node selector that returns the first
-// candidate whose name is not in dead.
+// scriptedSelectNode 构建一个假节点选择器，返回第一个名称不在 dead 中的
+// 候选。
 func scriptedSelectNode(dead map[string]bool) func(ctx context.Context, nodes []model.PVENode) (model.PVENode, error) {
 	return func(ctx context.Context, nodes []model.PVENode) (model.PVENode, error) {
 		for _, n := range nodes {
@@ -433,16 +428,15 @@ func scriptedSelectNode(dead map[string]bool) func(ctx context.Context, nodes []
 	}
 }
 
-// testPVENode is a node with valid PVE token credentials (split form
-// "root@pam" + "spark=uuid" -> PVEAPIToken=root@pam!spark=uuid).
+// testPVENode 是带有效 PVE token 凭据的节点（拆分形式 "root@pam" +
+// "spark=uuid" -> PVEAPIToken=root@pam!spark=uuid）。
 func testPVENode(id int64) model.PVENode {
 	return model.PVENode{ID: id, ZoneID: 1, Name: "pve1", Host: "h",
 		APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
 }
 
-// createEnv builds a fully valid fake environment for happy-path create
-// tests: zone 1 with one enabled node, one pool whitelisting that node, one
-// image present on the node and one storage type.
+// createEnv 为快乐路径创建测试构建完全有效的假环境：区域 1 带一个启用节点、
+// 一个将该节点加入白名单的池、一个存在于该节点上的镜像以及一个存储类型。
 func createEnv() (*fakeVMZoneRepository, *fakeVMImageRepository, *fakeVMStorageTypeRepository, *fakeVMNodeRepository, *fakeVMIPPoolRepository) {
 	node := testPVENode(1)
 	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
@@ -464,7 +458,7 @@ func validCreateRequest() CreateVMRequest {
 	return CreateVMRequest{Name: "vm1", CPU: 2, MemMB: 2048, DiskGB: 10, ImageID: 1, StorageTypeID: 1, ZoneID: 1, Password: "s3cret"}
 }
 
-// ---------- validation tests ----------
+// ---------- 校验测试 ----------
 
 func TestValidateCreateVMRequest(t *testing.T) {
 	req := validCreateRequest()
@@ -495,7 +489,7 @@ func TestValidateCreateVMRequest(t *testing.T) {
 			}
 		})
 	}
-	// PVE-legal name variants (dash/dot/underscore after the first char).
+	// PVE 合法的名称变体（首字符之后允许短横线/点/下划线）。
 	for _, name := range []string{"vm-1", "vm_1", "vm.1", "v1.2-3_x"} {
 		r := req
 		r.Name = name
@@ -512,23 +506,23 @@ func TestValidateResizeSpec(t *testing.T) {
 	disk := int64(20)
 	smallDisk := int64(5)
 
-	// No field -> bad request.
+	// 无字段 -> bad request。
 	if err := validateResizeSpec(nil, nil, nil, current); !isKind(err, KindBadRequest) {
 		t.Fatalf("no fields err = %v, want KindBadRequest", err)
 	}
-	// Disk shrink -> KindDiskShrinkNotAllowed.
+	// 磁盘缩小 -> KindDiskShrinkNotAllowed。
 	if err := validateResizeSpec(nil, nil, &smallDisk, current); !isKind(err, KindDiskShrinkNotAllowed) {
 		t.Fatalf("shrink err = %v, want KindDiskShrinkNotAllowed", err)
 	}
-	// Disk equal -> allowed (documented no-op).
+	// 磁盘相等 -> 允许（文档化的无操作）。
 	if err := validateResizeSpec(nil, nil, &current.DiskGB, current); err != nil {
 		t.Fatalf("equal disk err = %v, want nil (no-op)", err)
 	}
-	// Grow everything -> allowed.
+	// 全部增大 -> 允许。
 	if err := validateResizeSpec(&cpu, &mem, &disk, current); err != nil {
 		t.Fatalf("grow err = %v, want nil", err)
 	}
-	// Non-positive values -> bad request.
+	// 非正值 -> bad request。
 	zeroMem := int64(0)
 	zeroCPU := 0
 	if err := validateResizeSpec(nil, &zeroMem, nil, current); !isKind(err, KindBadRequest) {
@@ -558,7 +552,7 @@ func TestPoolCandidates(t *testing.T) {
 	}
 }
 
-// ---------- create flow tests ----------
+// ---------- 创建流程测试 ----------
 
 func TestCreateVMHappyPath(t *testing.T) {
 	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
@@ -579,8 +573,7 @@ func TestCreateVMHappyPath(t *testing.T) {
 	if vm.VM.IPID == nil || *vm.VM.IPID != 7 {
 		t.Fatalf("ip_id = %v, want 7", vm.VM.IPID)
 	}
-	// The transaction order: claim linked the created vm id, then the
-	// ip_id link was written.
+	// 事务顺序：抢占先关联已创建的 vm id，随后写入 ip_id 关联。
 	if len(ipRepo.claimedVMIDs) != 1 || ipRepo.claimedVMIDs[0] != 1 {
 		t.Fatalf("claimed vm ids = %v, want [1]", ipRepo.claimedVMIDs)
 	}
@@ -590,9 +583,8 @@ func TestCreateVMHappyPath(t *testing.T) {
 	waitForProvision(t, vmRepo)
 }
 
-// TestCreateVMEncryptsPassword pins down that the password is encrypted
-// before it is handed to the repository: the stored value differs from the
-// plaintext and decrypts back to it.
+// TestCreateVMEncryptsPassword 固定密码在交给仓库之前已被加密：存储值与
+// 明文不同，且能解密回明文。
 func TestCreateVMEncryptsPassword(t *testing.T) {
 	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
 	vmRepo := &fakeVMRepository{}
@@ -624,25 +616,25 @@ func TestCreateVMValidationOrder(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
 
 	req := validCreateRequest()
-	// Unknown zone -> not_found.
+	// 未知区域 -> not_found。
 	r := req
 	r.ZoneID = 99
 	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindNotFound) {
 		t.Fatalf("unknown zone err = %v, want KindNotFound", err)
 	}
-	// Unknown image -> not_found.
+	// 未知镜像 -> not_found。
 	r = req
 	r.ImageID = 99
 	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindNotFound) {
 		t.Fatalf("unknown image err = %v, want KindNotFound", err)
 	}
-	// Unknown storage type -> not_found.
+	// 未知存储类型 -> not_found。
 	r = req
 	r.StorageTypeID = 99
 	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindNotFound) {
 		t.Fatalf("unknown storage err = %v, want KindNotFound", err)
 	}
-	// Image not present on all enabled nodes -> KindImageNotAvailable.
+	// 镜像未出现在所有启用节点上 -> KindImageNotAvailable。
 	imgRepo := &fakeVMImageRepository{
 		images: []model.Image{{ID: 1, Name: "debian-12-cloud", DefaultUser: "debian",
 			NodeImages: map[string]string{"pve1": "/t.img"}}},
@@ -652,13 +644,13 @@ func TestCreateVMValidationOrder(t *testing.T) {
 	if _, err := svc2.CreateVM(context.Background(), req); !isKind(err, KindImageNotAvailable) {
 		t.Fatalf("image not available err = %v, want KindImageNotAvailable", err)
 	}
-	// Empty password -> bad_request.
+	// 空密码 -> bad_request。
 	r = req
 	r.Password = ""
 	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindBadRequest) {
 		t.Fatalf("empty password err = %v, want KindBadRequest", err)
 	}
-	// Zero cpu -> bad_request.
+	// 零 cpu -> bad_request。
 	r = req
 	r.CPU = 0
 	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindBadRequest) {
@@ -714,9 +706,8 @@ func TestCreateVMClaimNoFreeAddress(t *testing.T) {
 	}
 }
 
-// TestSelectPoolAndNodeSkipsUnreachablePools verifies D4: an unreachable
-// pool is skipped in favor of the next one, and a zone with no reachable
-// pool yields node_unavailable.
+// TestSelectPoolAndNodeSkipsUnreachablePools 验证 D4：不可达的池会被跳过
+// 转而使用下一个，没有可达池的区域会产生 node_unavailable。
 func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 	deadNode := model.PVENode{ID: 1, ZoneID: 1, Name: "pve-dead", Host: "h1", Enabled: true}
 	aliveNode := model.PVENode{ID: 2, ZoneID: 1, Name: "pve-alive", Host: "h2", Enabled: true}
@@ -732,7 +723,7 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, testCipher(t))
 
-	// Pool 1's only node is dead, pool 2's is reachable -> pool 2 wins.
+	// 池 1 的唯一节点是死的，池 2 的可达 -> 池 2 胜出。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve-dead": true})
 	pool, node, err := svc.selectPoolAndNode(context.Background(), 1)
 	if err != nil {
@@ -742,14 +733,14 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 		t.Fatalf("pool = %+v node = %+v, want pool 2 / pve-alive", pool, node)
 	}
 
-	// Both pools' nodes are dead -> node_unavailable.
+	// 两个池的节点都是死的 -> node_unavailable。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve-dead": true, "pve-alive": true})
 	_, _, err = svc.selectPoolAndNode(context.Background(), 1)
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
 
-	// No pools at all -> node_unavailable (candidate set empty).
+	// 完全没有池 -> node_unavailable（候选集为空）。
 	ipRepo.pools = nil
 	_, _, err = svc.selectPoolAndNode(context.Background(), 1)
 	if !isKind(err, KindNodeUnavailable) {
@@ -757,15 +748,15 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 	}
 }
 
-// ---------- provisioning chain tests ----------
+// ---------- 供给链测试 ----------
 
-// scriptedProvisionServer answers the whole successful provisioning chain
-// (nextid, create, task status, config) and records what CreateVM was asked
-// to do. requestDisk/configSize control the resize behavior.
+// scriptedProvisionServer 应答整条成功的供给链（nextid、create、任务状态、
+// config），并记录 CreateVM 被要求执行的内容。requestDisk/configSize 控制
+// resize 行为。
 type scriptedProvisionServer struct {
 	t          *testing.T
 	createBody map[string]any
-	configSize string // size= value in the returned scsi0 config
+	configSize string // 返回的 scsi0 配置中的 size= 值
 	creates    int
 	resizes    int
 	destroyed  bool
@@ -806,11 +797,9 @@ func (s *scriptedProvisionServer) handler() http.HandlerFunc {
 	}
 }
 
-// TestProvisionSuccessChain verifies the full single-step chain: create
-// carries the import-from disk, cloud-init disk, vmbr0 net and cloud-init
-// injection in one call, and the pve_vmid plus the final disk size land in
-// the DB. The image is bigger than the request, so no resize happens and
-// the actual size is persisted.
+// TestProvisionSuccessChain 验证完整的单步链：create 在单次调用中携带
+// import-from 磁盘、cloud-init 磁盘、vmbr0 网络和 cloud-init 注入，pve_vmid
+// 及最终磁盘大小落入数据库。镜像大于请求，因此不进行 resize，持久化实际大小。
 func TestProvisionSuccessChain(t *testing.T) {
 	srv := newScriptedProvisionServer(t, "15G")
 	ts := httptest.NewServer(srv.handler())
@@ -836,7 +825,7 @@ func TestProvisionSuccessChain(t *testing.T) {
 		t.Fatalf("provision: %v", err)
 	}
 
-	// Single-step create payload (D5).
+	// 单步创建请求体（D5）。
 	body := srv.createBody
 	if body["vmid"] != float64(100) || body["name"] != "vm1" ||
 		body["memory"] != float64(2048) || body["cores"] != float64(2) ||
@@ -852,7 +841,7 @@ func TestProvisionSuccessChain(t *testing.T) {
 	if srv.resizes != 0 {
 		t.Fatalf("resizes = %d, want 0 (image already >= request)", srv.resizes)
 	}
-	// Metadata: vmid recorded, disk synced to the actual image size 15G.
+	// 元数据：记录 vmid，磁盘同步为实际镜像大小 15G。
 	if vmRepo.linkedVMID != 100 {
 		t.Fatalf("vmid = %d, want 100", vmRepo.linkedVMID)
 	}
@@ -861,9 +850,8 @@ func TestProvisionSuccessChain(t *testing.T) {
 	}
 }
 
-// TestProvisionSuccessChainWithResize covers the grow path: the imported
-// image is smaller than the request, so a resize task runs and the requested
-// size is persisted.
+// TestProvisionSuccessChainWithResize 覆盖扩展路径：导入的镜像小于请求，
+// 因此会运行 resize 任务并持久化请求的大小。
 func TestProvisionSuccessChainWithResize(t *testing.T) {
 	srv := newScriptedProvisionServer(t, "5G")
 	ts := httptest.NewServer(srv.handler())
@@ -895,9 +883,8 @@ func TestProvisionSuccessChainWithResize(t *testing.T) {
 	}
 }
 
-// TestProvisionFailureSetsSanitizedError drives the failure branch of the
-// detached chain: the PVE error message contains the plaintext password and
-// the persisted provision_error must not leak it.
+// TestProvisionFailureSetsSanitizedError 驱动分离式链的失败分支：PVE 错误
+// 消息包含明文密码，持久化的 provision_error 绝不能泄露它。
 func TestProvisionFailureSetsSanitizedError(t *testing.T) {
 	const pw = "s3cretpw-leak-check"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -936,8 +923,7 @@ func TestProvisionFailureSetsSanitizedError(t *testing.T) {
 	}
 }
 
-// TestProvisionMissingImagePath records a provisioning failure when the
-// image has no path on the selected node.
+// TestProvisionMissingImagePath 记录镜像在所选中节点上没有路径时的供给失败。
 func TestProvisionMissingImagePath(t *testing.T) {
 	vmRepo := &fakeVMRepository{}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
@@ -958,10 +944,9 @@ func TestProvisionMissingImagePath(t *testing.T) {
 	}
 }
 
-// TestProvisionFailureAfterCreateIncludesVMID covers the half-created state:
-// the create task succeeded on PVE (vmid=100) but waiting for it failed, so
-// the persisted provision_error must carry the vmid so operators can locate
-// and clean up the orphaned VM.
+// TestProvisionFailureAfterCreateIncludesVMID 覆盖半创建状态：create 任务在
+// PVE 上成功（vmid=100）但等待它失败，因此持久化的 provision_error 必须携带
+// vmid，以便运维定位并清理孤儿 VM。
 func TestProvisionFailureAfterCreateIncludesVMID(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1005,7 +990,7 @@ func TestProvisionFailureAfterCreateIncludesVMID(t *testing.T) {
 	}
 }
 
-// TestSanitizeProvisionError pins down redaction and length bounding.
+// TestSanitizeProvisionError 固定脱敏与长度限制行为。
 func TestSanitizeProvisionError(t *testing.T) {
 	msg := sanitizeProvisionError(errors.New("cipassword 'abc123' failed for 'abc123'"), "abc123")
 	if strings.Contains(msg, "abc123") {
@@ -1021,12 +1006,10 @@ func TestSanitizeProvisionError(t *testing.T) {
 	}
 }
 
-// TestFailProvisionBoundsLength pins down the failProvision contract: the
-// step prefix is assembled first and the whole message sanitized (redact
-// then truncate), so a verbose PVE error cannot push the stored
-// provision_error past maxProvisionErrorLen, the prefix is never truncated
-// away, and a secret straddling the truncation boundary never leaks a
-// fragment.
+// TestFailProvisionBoundsLength 固定 failProvision 契约：先拼接步骤前缀，
+// 再对整条消息脱敏（先脱敏后截断），因此冗长的 PVE 错误无法把存储的
+// provision_error 推过 maxProvisionErrorLen，前缀绝不会被截掉，跨越截断边界
+// 的机密也绝不会泄露片段。
 func TestFailProvisionBoundsLength(t *testing.T) {
 	const secret = "s3cretpw-boundary"
 	prefix := "create succeeded (vmid=100) but wait create failed: "
@@ -1034,8 +1017,8 @@ func TestFailProvisionBoundsLength(t *testing.T) {
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 
-	// The secret ends right after the truncation point of the prefixed
-	// message, so a truncate-before-redact order would leave a fragment.
+	// 机密恰好结束于带前缀消息的截断点之后，因此先截断后脱敏的顺序会留下
+	// 片段。
 	err := svc.failProvision(context.Background(), 1, 100, "wait create",
 		errors.New(strings.Repeat("a", maxProvisionErrorLen-len(prefix)-4)+secret), secret)
 	if err == nil {
@@ -1059,11 +1042,9 @@ func TestFailProvisionBoundsLength(t *testing.T) {
 	}
 }
 
-// TestSanitizeProvisionErrorRedactsBeforeTruncate pins down the
-// redact-then-truncate order: a secret straddling the length boundary must
-// not leak a partial fragment, and the result must stay valid UTF-8 (a naive
-// byte truncation would split multi-byte runes and the DB would reject the
-// value, Postgres 22021).
+// TestSanitizeProvisionErrorRedactsBeforeTruncate 固定先脱敏后截断的顺序：
+// 跨越长度边界的机密绝不能泄露部分片段，且结果必须保持合法的 UTF-8（朴素的
+// 字节截断会切分多字节 rune，数据库会拒绝该值，Postgres 22021）。
 func TestSanitizeProvisionErrorRedactsBeforeTruncate(t *testing.T) {
 	secret := "PASSWORD-1234-5678"
 	msg := strings.Repeat("a", maxProvisionErrorLen-8) + secret
@@ -1076,9 +1057,8 @@ func TestSanitizeProvisionErrorRedactsBeforeTruncate(t *testing.T) {
 	}
 }
 
-// TestSanitizeProvisionErrorKeepsUTF8 checks the rune-safe truncation of a
-// multi-byte message: a byte cut inside a UTF-8 character would produce an
-// invalid sequence (Postgres rejects it, error 22021).
+// TestSanitizeProvisionErrorKeepsUTF8 检查多字节消息的 rune 安全截断：在
+// UTF-8 字符内部按字节切割会产生非法序列（Postgres 拒绝它，错误 22021）。
 func TestSanitizeProvisionErrorKeepsUTF8(t *testing.T) {
 	msg := strings.Repeat("界", maxProvisionErrorLen+3)
 	out := sanitizeProvisionError(errors.New(msg))
@@ -1114,7 +1094,7 @@ func TestParseDiskSizeGB(t *testing.T) {
 	}
 }
 
-// ---------- lifecycle operation tests ----------
+// ---------- 生命周期操作测试 ----------
 
 func provisionedVM() *repository.VMWithIP {
 	return &repository.VMWithIP{
@@ -1123,7 +1103,7 @@ func provisionedVM() *repository.VMWithIP {
 	}
 }
 
-// startStopRestartServer answers the three status endpoints with a UPID.
+// startStopRestartServer 以 UPID 应答三个状态端点。
 func startStopRestartServer(t *testing.T) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ok := false
@@ -1182,8 +1162,8 @@ func TestStartVMNotProvisioned(t *testing.T) {
 	}
 }
 
-// TestStartVMPVENotFound maps a PVE 404 (the VM no longer exists on the
-// node) onto vm_not_ready.
+// TestStartVMPVENotFound 将 PVE 404（VM 在节点上已不存在）映射为
+// vm_not_ready。
 func TestStartVMPVENotFound(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -1224,7 +1204,7 @@ func TestDestroyFlow(t *testing.T) {
 	if !srv.destroyed {
 		t.Fatal("PVE destroy was not invoked")
 	}
-	// IP released and row deleted in the same tx.
+	// IP 在同一事务中释放且行被删除。
 	if len(ipRepo.released) != 1 || ipRepo.released[0] != 1 {
 		t.Fatalf("released = %v, want [1]", ipRepo.released)
 	}
@@ -1233,8 +1213,8 @@ func TestDestroyFlow(t *testing.T) {
 	}
 }
 
-// TestDestroyUnprovisioned skips the PVE call (no pve_vmid yet) but still
-// cleans up the local record and the IP.
+// TestDestroyUnprovisioned 跳过 PVE 调用（还没有 pve_vmid）但仍清理本地记录
+// 和 IP。
 func TestDestroyUnprovisioned(t *testing.T) {
 	vm := provisionedVM()
 	vm.VM.PVEVmid = 0
@@ -1242,8 +1222,8 @@ func TestDestroyUnprovisioned(t *testing.T) {
 	ipRepo := &fakeVMIPPoolRepository{}
 	svc := newVMService(t, vmRepo, ipRepo, &fakeVMZoneRepository{}, &fakeVMNodeRepository{},
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	// newClient from newVMService answers 503 for everything; the PVE call
-	// must never happen, so any invocation would fail the test below.
+	// newVMService 的 newClient 对所有请求都应答 503；PVE 调用绝不能发生，
+	// 因此任何调用都会导致下面的测试失败。
 
 	if err := svc.Destroy(context.Background(), 1); err != nil {
 		t.Fatalf("Destroy: %v", err)
@@ -1261,8 +1241,8 @@ func TestDestroyVMNotFound(t *testing.T) {
 	}
 }
 
-// TestDestroyPVEFailureKeepsRecordAndIP verifies that a PVE failure aborts
-// the destroy: neither the IP nor the row are touched.
+// TestDestroyPVEFailureKeepsRecordAndIP 验证 PVE 失败会中止销毁：IP 和行
+// 都未被触碰。
 func TestDestroyPVEFailureKeepsRecordAndIP(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1288,9 +1268,8 @@ func TestDestroyPVEFailureKeepsRecordAndIP(t *testing.T) {
 	}
 }
 
-// TestDestroyPVE404CleansUpLocal treats a PVE 404 on destroy (the VM was
-// already removed on the node, e.g. by an operator) as "already destroyed":
-// the local cleanup still runs and the destroy succeeds.
+// TestDestroyPVE404CleansUpLocal 将销毁时的 PVE 404（VM 已在节点上被移除，
+// 例如被运维删除）视为"已销毁"：本地清理仍然执行且销毁成功。
 func TestDestroyPVE404CleansUpLocal(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -1319,10 +1298,10 @@ func TestDestroyPVE404CleansUpLocal(t *testing.T) {
 	}
 }
 
-// ---------- resize tests ----------
+// ---------- 调整（resize）测试 ----------
 
-// noCallServer fails the test when the PVE client is used; used to assert
-// that no PVE call happens on validation/no-op paths.
+// noCallServer 在使用 PVE 客户端时使测试失败；用于断言校验/无操作路径上
+// 不会发生 PVE 调用。
 func noCallServer(t *testing.T) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected PVE call: %s %s", r.Method, r.URL.Path)
@@ -1348,8 +1327,8 @@ func TestResizeRejectsShrinkBeforePVE(t *testing.T) {
 	}
 }
 
-// TestResizeNoOpEqualDisk verifies the documented equal-disk no-op: no PVE
-// call and no spec persistence.
+// TestResizeNoOpEqualDisk 验证文档化的磁盘相等无操作：没有 PVE 调用，也
+// 没有规格持久化。
 func TestResizeNoOpEqualDisk(t *testing.T) {
 	ts := noCallServer(t)
 	defer ts.Close()
@@ -1363,7 +1342,7 @@ func TestResizeNoOpEqualDisk(t *testing.T) {
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	disk := int64(10) // equals the current 10G
+	disk := int64(10) // 等于当前 10G
 	vm, err := svc.Resize(context.Background(), 1, nil, nil, &disk)
 	if err != nil {
 		t.Fatalf("Resize: %v", err)
@@ -1376,8 +1355,8 @@ func TestResizeNoOpEqualDisk(t *testing.T) {
 	}
 }
 
-// resizeServer answers PUT /config (synchronous), PUT /resize (UPID) and
-// the resize task status.
+// resizeServer 应答 PUT /config（同步）、PUT /resize（UPID）以及 resize
+// 任务状态。
 func resizeServer(t *testing.T) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1431,9 +1410,8 @@ func TestResizeGrowAll(t *testing.T) {
 	}
 }
 
-// TestResizeSpecConflict covers the optimistic-lock branch: a concurrent
-// resize committed between the read and the persist, so UpdateSpec reports
-// ErrSpecConflict and the caller surfaces KindConflict.
+// TestResizeSpecConflict 覆盖乐观锁分支：并发的调整在读取与持久化之间提交，
+// 因此 UpdateSpec 报告 ErrSpecConflict，调用方呈现 KindConflict。
 func TestResizeSpecConflict(t *testing.T) {
 	ts := resizeServer(t)
 	defer ts.Close()

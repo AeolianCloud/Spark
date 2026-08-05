@@ -10,18 +10,18 @@ import (
 	"spark/service"
 )
 
-// StorageTypeHandler serves the /storage-types routes.
+// StorageTypeHandler 提供 /storage-types 路由。
 type StorageTypeHandler struct {
 	svc *service.StorageTypeService
 }
 
-// NewStorageTypeHandler creates a StorageTypeHandler backed by svc.
+// NewStorageTypeHandler 创建一个由 svc 支撑的 StorageTypeHandler。
 func NewStorageTypeHandler(svc *service.StorageTypeService) *StorageTypeHandler {
 	return &StorageTypeHandler{svc: svc}
 }
 
-// RegisterStorageTypesRoutes mounts the storage type CRUD routes on rg. It is
-// called by the router with the /storage-types group.
+// RegisterStorageTypesRoutes 在 rg 上挂载 storage type 的 CRUD 路由。
+// 由 router 以 /storage-types 分组调用。
 func RegisterStorageTypesRoutes(rg *gin.RouterGroup, svc *service.StorageTypeService) {
 	h := NewStorageTypeHandler(svc)
 	rg.POST("", Handler(h.Create))
@@ -31,14 +31,14 @@ func RegisterStorageTypesRoutes(rg *gin.RouterGroup, svc *service.StorageTypeSer
 	rg.DELETE("/:id", Handler(h.Delete))
 }
 
-// storageTypeRequest is the request body for create/update storage types.
+// storageTypeRequest 是创建/更新 storage type 的请求体。
 type storageTypeRequest struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
 	PVEStorage  string `json:"pve_storage"`
 }
 
-// Create handles POST /storage-types.
+// Create 处理 POST /storage-types。
 func (h *StorageTypeHandler) Create(c *gin.Context) error {
 	var req storageTypeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -53,7 +53,7 @@ func (h *StorageTypeHandler) Create(c *gin.Context) error {
 	return nil
 }
 
-// Get handles GET /storage-types/:id.
+// Get 处理 GET /storage-types/:id。
 func (h *StorageTypeHandler) Get(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -67,9 +67,8 @@ func (h *StorageTypeHandler) Get(c *gin.Context) error {
 	return nil
 }
 
-// List handles GET /storage-types: one page of storage types (shared
-// limit/offset query parameters), with X-Total-Count carrying the total
-// count.
+// List 处理 GET /storage-types：一页 storage types（共享的
+// limit/offset 查询参数），X-Total-Count 携带总数。
 func (h *StorageTypeHandler) List(c *gin.Context) error {
 	limit, offset, err := parsePagination(c)
 	if err != nil {
@@ -84,7 +83,7 @@ func (h *StorageTypeHandler) List(c *gin.Context) error {
 	return nil
 }
 
-// Update handles PUT /storage-types/:id.
+// Update 处理 PUT /storage-types/:id。
 func (h *StorageTypeHandler) Update(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -102,7 +101,7 @@ func (h *StorageTypeHandler) Update(c *gin.Context) error {
 	return nil
 }
 
-// Delete handles DELETE /storage-types/:id.
+// Delete 处理 DELETE /storage-types/:id。
 func (h *StorageTypeHandler) Delete(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -115,8 +114,8 @@ func (h *StorageTypeHandler) Delete(c *gin.Context) error {
 	return nil
 }
 
-// parseIDParam parses a positive int64 path parameter, answering a 400
-// bad_request error otherwise.
+// parseIDParam 解析正 int64 路径参数，否则返回 400
+// bad_request 错误。
 func parseIDParam(c *gin.Context, name string) (int64, error) {
 	raw := c.Param(name)
 	id, err := strconv.ParseInt(raw, 10, 64)

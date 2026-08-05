@@ -10,32 +10,32 @@ import (
 	"spark/service"
 )
 
-// ImageHandler serves the /images routes.
+// ImageHandler 提供 /images 路由。
 type ImageHandler struct {
 	svc *service.ImageService
 }
 
-// NewImageHandler creates an ImageHandler backed by svc.
+// NewImageHandler 创建一个由 svc 支撑的 ImageHandler。
 func NewImageHandler(svc *service.ImageService) *ImageHandler {
 	return &ImageHandler{svc: svc}
 }
 
-// RegisterImagesRoutes mounts the image registration and listing routes on
-// rg. It is called by the router with the /images group.
+// RegisterImagesRoutes 在 rg 上挂载镜像注册与列表路由。
+// 由 router 以 /images 分组调用。
 func RegisterImagesRoutes(rg *gin.RouterGroup, svc *service.ImageService) {
 	h := NewImageHandler(svc)
 	rg.POST("", Handler(h.Create))
 	rg.GET("", Handler(h.List))
 }
 
-// imageRequest is the request body for registering an image.
+// imageRequest 是注册镜像的请求体。
 type imageRequest struct {
 	Name        string            `json:"name"`
 	DefaultUser string            `json:"default_user"`
 	NodeImages  map[string]string `json:"node_images"`
 }
 
-// Create handles POST /images.
+// Create 处理 POST /images。
 func (h *ImageHandler) Create(c *gin.Context) error {
 	var req imageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -50,12 +50,10 @@ func (h *ImageHandler) Create(c *gin.Context) error {
 	return nil
 }
 
-// List handles GET /images. With a zone_id query parameter it returns only
-// the images available on every enabled node of that zone; without it, all
-// images including their full node_images map. Both branches honor the
-// shared limit/offset query parameters and set X-Total-Count to the total
-// count of the branch's result set (all images, or the zone's available
-// images).
+// List 处理 GET /images。带 zone_id 查询参数时只返回该 zone 所有
+// 启用节点上都可用的镜像；不带时返回全部镜像及其完整的 node_images 映射。
+// 两个分支都遵循共享的 limit/offset 查询参数，并将 X-Total-Count 设为
+// 该分支结果集的总数（全部镜像，或该 zone 可用的镜像）。
 func (h *ImageHandler) List(c *gin.Context) error {
 	ctx := c.Request.Context()
 	limit, offset, err := parsePagination(c)

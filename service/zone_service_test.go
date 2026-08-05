@@ -14,7 +14,7 @@ import (
 	"spark/pve"
 )
 
-// fakeZoneRepository is a scriptable ZoneRepository for tests.
+// fakeZoneRepository 是供测试使用的可脚本化 ZoneRepository。
 type fakeZoneRepository struct {
 	zones   []model.Zone
 	err     error
@@ -64,7 +64,7 @@ func (f *fakeZoneRepository) CountZones(ctx context.Context) (int, error) {
 	return len(f.zones), nil
 }
 
-// fakeNodeRepository is a scriptable NodeRepository for tests.
+// fakeNodeRepository 是供测试使用的可脚本化 NodeRepository。
 type fakeNodeRepository struct {
 	nodes []model.PVENode
 	err   error
@@ -178,9 +178,8 @@ func TestListZonesIncludesNodes(t *testing.T) {
 	}
 }
 
-// TestListZonesPagination verifies the page slicing: limit/offset select the
-// zone page (the node lists inside stay complete), and total is the full
-// zone count regardless of the page.
+// TestListZonesPagination 验证页切片：limit/offset 选择区域页（页内的节点
+// 列表保持完整），total 始终是区域总数，与页无关。
 func TestListZonesPagination(t *testing.T) {
 	zoneRepo := &fakeZoneRepository{zones: []model.Zone{
 		{ID: 1, Name: "z1"}, {ID: 2, Name: "z2"}, {ID: 3, Name: "z3"},
@@ -222,35 +221,35 @@ func TestCreateNodeValidation(t *testing.T) {
 	}}
 	svc := NewZoneService(zoneRepo, nodeRepo)
 
-	// Unknown zone -> not_found.
+	// 未知区域 -> not_found。
 	if _, err := svc.CreateNode(context.Background(), 99, "pve9", "10.0.0.9", "root@pam!spark", "t", nil); err == nil {
 		t.Fatal("unknown zone: want error")
 	} else if err.(*Error).Kind != KindNotFound {
 		t.Fatalf("unknown zone: kind = %v, want KindNotFound", err.(*Error).Kind)
 	}
 
-	// Duplicate name in zone -> conflict.
+	// 区域内重名 -> conflict。
 	if _, err := svc.CreateNode(context.Background(), 1, "pve1", "10.0.0.9", "root@pam!spark", "t", nil); err == nil {
 		t.Fatal("duplicate name: want error")
 	} else if err.(*Error).Kind != KindConflict {
 		t.Fatalf("duplicate name: kind = %v, want KindConflict", err.(*Error).Kind)
 	}
 
-	// Missing host -> bad_request.
+	// 缺少 host -> bad_request。
 	if _, err := svc.CreateNode(context.Background(), 1, "pve9", " ", "root@pam!spark", "t", nil); err == nil {
 		t.Fatal("empty host: want error")
 	} else if err.(*Error).Kind != KindBadRequest {
 		t.Fatalf("empty host: kind = %v, want KindBadRequest", err.(*Error).Kind)
 	}
 
-	// Missing api_user -> bad_request.
+	// 缺少 api_user -> bad_request。
 	if _, err := svc.CreateNode(context.Background(), 1, "pve9", "10.0.0.9", "", "t", nil); err == nil {
 		t.Fatal("empty api_user: want error")
 	} else if err.(*Error).Kind != KindBadRequest {
 		t.Fatalf("empty api_user: kind = %v, want KindBadRequest", err.(*Error).Kind)
 	}
 
-	// Success: enabled defaults to true when omitted.
+	// 成功：省略时 enabled 默认为 true。
 	n, err := svc.CreateNode(context.Background(), 1, "pve9", "10.0.0.9", "root@pam!spark", "tok", nil)
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -259,7 +258,7 @@ func TestCreateNodeValidation(t *testing.T) {
 		t.Fatalf("unexpected node: %+v", n)
 	}
 
-	// enabled=false is honored.
+	// enabled=false 会被采纳。
 	n, err = svc.CreateNode(context.Background(), 1, "pve10", "10.0.0.10", "root@pam!spark", "tok", boolPtr(false))
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -275,7 +274,7 @@ func TestUpdateNode(t *testing.T) {
 	}}
 	svc := NewZoneService(&fakeZoneRepository{}, nodeRepo)
 
-	// Empty api_token keeps the stored secret.
+	// 空的 api_token 保留已存储的密钥。
 	n, tokenChanged, err := svc.UpdateNode(context.Background(), 1, "pve1", "10.0.0.20", "root@pam!spark", "", nil)
 	if err != nil {
 		t.Fatalf("update node: %v", err)
@@ -290,7 +289,7 @@ func TestUpdateNode(t *testing.T) {
 		t.Fatalf("host = %q, want 10.0.0.20", n.Host)
 	}
 
-	// A provided api_token replaces the secret.
+	// 提供的 api_token 会替换密钥。
 	n, tokenChanged, err = svc.UpdateNode(context.Background(), 1, "pve1", "10.0.0.20", "root@pam!spark", "new-secret", nil)
 	if err != nil {
 		t.Fatalf("update node: %v", err)
@@ -299,7 +298,7 @@ func TestUpdateNode(t *testing.T) {
 		t.Fatalf("token not replaced: changed=%v secret=%q", tokenChanged, n.APITokenSecret)
 	}
 
-	// Renaming onto an existing name -> conflict.
+	// 重命名为已有名称 -> conflict。
 	nodeRepo.nodes = append(nodeRepo.nodes, model.PVENode{ID: 2, ZoneID: 1, Name: "pve2", Host: "10.0.0.30"})
 	if _, _, err := svc.UpdateNode(context.Background(), 1, "pve2", "10.0.0.20", "root@pam!spark", "", nil); err == nil {
 		t.Fatal("rename to existing name: want error")
@@ -307,7 +306,7 @@ func TestUpdateNode(t *testing.T) {
 		t.Fatalf("rename: kind = %v, want KindConflict", err.(*Error).Kind)
 	}
 
-	// Unknown node -> not_found.
+	// 未知节点 -> not_found。
 	if _, _, err := svc.UpdateNode(context.Background(), 99, "pve9", "10.0.0.9", "root@pam!spark", "", nil); err == nil {
 		t.Fatal("unknown node: want error")
 	} else if err.(*Error).Kind != KindNotFound {
@@ -338,7 +337,7 @@ func TestListNodesByZone(t *testing.T) {
 	}
 }
 
-// reachablePVEServer answers GET /version with a valid PVE envelope.
+// reachablePVEServer 以有效的 PVE 信封应答 GET /version。
 func reachablePVEServer() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/version" {
@@ -363,8 +362,8 @@ func TestSelectReachableNodePicksFirstReachable(t *testing.T) {
 	alive := reachablePVEServer()
 	defer alive.Close()
 
-	// Per-candidate client factory keyed by the node's host: node 1 probes
-	// the dead server, node 2 the alive one.
+	// 按节点 host 键控的逐候选客户端工厂：节点 1 探测死服务器，节点 2 探测
+	// 活服务器。
 	servers := map[string]*httptest.Server{"h1": dead, "h2": alive}
 	nodes := []model.PVENode{
 		{ID: 1, Name: "dead", Host: "h1", APIUser: "root@pam!probe", APITokenSecret: "secret123"},

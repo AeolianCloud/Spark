@@ -8,11 +8,10 @@ import (
 	"strings"
 )
 
-// NextVMID asks the cluster for the next free VMID (GET /cluster/nextid).
-// PVE returns the candidate as a JSON string (e.g. "100"), so the payload is
-// parsed as a string before converting to int. The VM create chain (service
-// batch 7) uses this to assign the VMID at provisioning time instead of
-// asking the client to pick one.
+// NextVMID 向集群请求下一个空闲 VMID（GET /cluster/nextid）。PVE 以
+// JSON 字符串形式返回候选值（例如 "100"），因此在转换为 int 前负载被
+// 解析为字符串。VM 创建链路（服务批次 7）在部署时用它分配 VMID，而不是
+// 让客户端自行选择。
 func (c *Client) NextVMID(ctx context.Context) (int, error) {
 	raw, err := c.doJSON(ctx, http.MethodGet, "/cluster/nextid", nil, nil)
 	if err != nil {

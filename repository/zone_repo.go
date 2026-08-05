@@ -7,19 +7,19 @@ import (
 	"spark/model"
 )
 
-// ZoneRepository persists model.Zone rows.
+// ZoneRepository 负责持久化 model.Zone 行。
 type ZoneRepository struct {
 	pool pgxQuerier
 }
 
-// NewZoneRepository creates a ZoneRepository backed by pool.
+// NewZoneRepository 创建由 pool 支撑的 ZoneRepository。
 func NewZoneRepository(pool pgxQuerier) *ZoneRepository {
 	return &ZoneRepository{pool: pool}
 }
 
 const zoneCols = "id, name, created_at"
 
-// CreateZone inserts a zone and returns it with id and created_at filled.
+// CreateZone 插入一个区域并返回它，且已填充 id 与 created_at。
 func (r *ZoneRepository) CreateZone(ctx context.Context, name string) (*model.Zone, error) {
 	z := &model.Zone{Name: name}
 	err := r.pool.QueryRow(ctx,
@@ -31,7 +31,7 @@ func (r *ZoneRepository) CreateZone(ctx context.Context, name string) (*model.Zo
 	return z, nil
 }
 
-// GetZone returns the zone with the given id, or pgx.ErrNoRows when absent.
+// GetZone 返回指定 id 的区域；不存在时返回 pgx.ErrNoRows。
 func (r *ZoneRepository) GetZone(ctx context.Context, id int64) (*model.Zone, error) {
 	var z model.Zone
 	err := r.pool.QueryRow(ctx, "SELECT "+zoneCols+" FROM zones WHERE id=$1", id).
@@ -42,7 +42,7 @@ func (r *ZoneRepository) GetZone(ctx context.Context, id int64) (*model.Zone, er
 	return &z, nil
 }
 
-// ListZones returns all zones ordered by id.
+// ListZones 返回按 id 排序的全部区域。
 func (r *ZoneRepository) ListZones(ctx context.Context) ([]model.Zone, error) {
 	rows, err := r.pool.Query(ctx, "SELECT "+zoneCols+" FROM zones ORDER BY id")
 	if err != nil {
@@ -64,9 +64,8 @@ func (r *ZoneRepository) ListZones(ctx context.Context) ([]model.Zone, error) {
 	return zones, nil
 }
 
-// ListZonesPage returns one page of zones ordered by id. It feeds the
-// paginated GET /zones endpoint; ListZones stays available for the internal
-// full scans (create duplicate checks, the VM list's zone enumeration).
+// ListZonesPage 返回按 id 排序的一页区域。它服务于分页的 GET /zones
+// 端点；ListZones 仍可供内部全量扫描使用（创建时的重名校验、VM 列表的区域枚举）。
 func (r *ZoneRepository) ListZonesPage(ctx context.Context, limit, offset int) ([]model.Zone, error) {
 	rows, err := r.pool.Query(ctx,
 		"SELECT "+zoneCols+" FROM zones ORDER BY id LIMIT $1 OFFSET $2", limit, offset)
@@ -89,8 +88,7 @@ func (r *ZoneRepository) ListZonesPage(ctx context.Context, limit, offset int) (
 	return zones, nil
 }
 
-// CountZones returns the total number of zones, backing the X-Total-Count
-// header of GET /zones.
+// CountZones 返回区域总数，支撑 GET /zones 的 X-Total-Count 响应头。
 func (r *ZoneRepository) CountZones(ctx context.Context) (int, error) {
 	var n int
 	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM zones").Scan(&n); err != nil {

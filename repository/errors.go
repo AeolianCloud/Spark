@@ -2,18 +2,15 @@ package repository
 
 import "errors"
 
-// Sentinel errors shared by repository implementations. Services map these
-// (and pgx.ErrNoRows) onto API errors.
+// 仓库实现共享的哨兵错误。服务层会把这些（以及 pgx.ErrNoRows）
+// 映射为 API 错误。
 var (
-	// ErrConflict is returned when an insert or update would violate a
-	// uniqueness constraint (PostgreSQL SQLSTATE 23505).
+	// ErrConflict 在插入或更新违反唯一约束时返回（PostgreSQL SQLSTATE 23505）。
 	ErrConflict = errors.New("repository: unique constraint violation")
-	// ErrInUse is returned when an operation is refused because other rows
-	// still reference the target row: a delete (or insert/update) that
-	// violates a foreign key (PostgreSQL SQLSTATE 23503).
+	// ErrInUse 在操作因其他行仍引用目标行而被拒绝时返回：删除（或
+	// 插入/更新）违反了外键（PostgreSQL SQLSTATE 23503）。
 	ErrInUse = errors.New("repository: resource still in use")
-	// ErrSpecConflict is returned when an optimistic-lock update touched no
-	// row: the spec was concurrently modified (or the row deleted) between
-	// the caller's read and the write.
+	// ErrSpecConflict 在乐观锁更新没有命中任何行时返回：规格在调用方
+	// 读取与写入之间被并发修改（或行被删除）。
 	ErrSpecConflict = errors.New("repository: vm spec was concurrently modified")
 )

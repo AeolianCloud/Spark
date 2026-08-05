@@ -12,7 +12,7 @@ import (
 	"spark/api/middleware"
 )
 
-// errorBody mirrors the unified error payload {"error":{"code","message"}}.
+// errorBody 镜像统一的错误负载 {"error":{"code","message"}}。
 type errorBody struct {
 	Error struct {
 		Code    string `json:"code"`
@@ -20,10 +20,10 @@ type errorBody struct {
 	} `json:"error"`
 }
 
-// TestHandlerErrorResponseContract is a smoke test of the Handler wrapper:
-// it drives a minimal gin engine through httptest and asserts the unified
-// error contract — HTTP status, body {"error":{"code","message"}} and the
-// x-ms-error-code response header mirroring the body code.
+// TestHandlerErrorResponseContract 是 Handler 包装器的冒烟测试：
+// 通过 httptest 驱动最小 gin 引擎，断言统一错误契约 —— HTTP 状态码、
+// 响应体 {"error":{"code","message"}} 以及镜像 body 错误码的
+// x-ms-error-code 响应头。
 func TestHandlerErrorResponseContract(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

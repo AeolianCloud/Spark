@@ -14,7 +14,7 @@ import (
 	"spark/repository"
 )
 
-// IPPoolRepository is the IP pool data access the IPPoolService depends on.
+// IPPoolRepository 是 IPPoolService 依赖的 IP 池数据访问层。
 type IPPoolRepository interface {
 	CreatePoolWithIPs(ctx context.Context, pool model.IPPool, ips []model.IP) (*model.IPPool, error)
 	GetPool(ctx context.Context, id int64) (*model.IPPool, error)
@@ -28,46 +28,43 @@ type IPPoolRepository interface {
 	ReleaseIPByVM(ctx context.Context, vmID int64) error
 }
 
-// IPPoolService implements the business rules for IP pools: creation with
-// CIDR expansion, node whitelisting and concurrency-safe random allocation.
+// IPPoolService 实现 IP 池的业务规则：CIDR 展开创建、节点白名单以及
+// 并发安全的随机分配。
 type IPPoolService struct {
 	poolRepo IPPoolRepository
 	zoneRepo ZoneRepository
 	nodeRepo NodeRepository
 }
 
-// NewIPPoolService creates an IPPoolService backed by the repositories.
+// NewIPPoolService 使用给定的仓库创建一个 IPPoolService。
 func NewIPPoolService(poolRepo IPPoolRepository, zoneRepo ZoneRepository, nodeRepo NodeRepository) *IPPoolService {
 	return &IPPoolService{poolRepo: poolRepo, zoneRepo: zoneRepo, nodeRepo: nodeRepo}
 }
 
-// KindIPExhausted marks "no free address available". The value sits outside
-// the iota range of the shared kinds in errors.go (owned by other batches) to
-// avoid coupling this file to their edits.
+// KindIPExhausted 表示"没有可用空闲地址"。该值位于 errors.go 中共享 kind
+// 的 iota 范围之外（该范围归其他批次所有），以避免本文件与它们的改动产生
+// 耦合。
 const KindIPExhausted ErrorKind = 101
 
-// ipExhaustedf builds a KindIPExhausted service error.
+// ipExhaustedf 构造一个 KindIPExhausted 服务错误。
 func ipExhaustedf(format string, args ...any) *Error {
 	return &Error{Kind: KindIPExhausted, Message: fmt.Sprintf(format, args...)}
 }
 
 const (
-	// maxPoolPrefixBits is the smallest allowed network mask length: a /22
-	// pool expands to 1024 addresses (~1021 usable ip rows); anything larger
-	// (e.g. /21 with 2048 addresses) is rejected to keep pool creation cheap
-	// and prevent accidentally huge pools.
+	// maxPoolPrefixBits 是允许的最短网络掩码长度：一个 /22 池展开为 1024 个
+	// 地址（约 1021 条可用 ip 行）；更大的网段（如含 2048 个地址的 /21）会被
+	// 拒绝，以保持池创建的低开销并防止意外创建过大的池。
 	maxPoolPrefixBits = 22
-	// maxAllocationAttempts bounds the retry loop when concurrent claims
-	// keep losing the conditional-update race (repository.ErrAllocationRetry).
+	// maxAllocationAttempts 限制并发抢占持续输掉条件更新竞态时的重试循环
+	// 次数（repository.ErrAllocationRetry）。
 	maxAllocationAttempts = 5
 )
 
-// CreateIPPool creates a pool in a zone and materializes one ip row per
-// usable address of the CIDR (network, broadcast and gateway excluded). The
-// zone must exist, the name must be unique within the zone, the CIDR must be
-// IPv4 and no larger than /maxPoolPrefixBits, /31 and /32 are rejected (no
-// usable addresses), and the gateway must fall inside the CIDR but neither on
-// the network address nor on the broadcast address.
+// CreateIPPool 在区域中创建一个池，并为 CIDR 的每个可用地址物化一条 ip 行
+// （排除网络地址、广播地址和网关）。区域必须存在，名称在区域内必须唯一，
+// CIDR 必须是 IPv4 且不能大于 /maxPoolPrefixBits，/31 和 /32 会被拒绝（没有
+// 可用地址），网关必须在 CIDR 内，但既不能是网络地址也不能是广播地址。
 func (s *IPPoolService) CreateIPPool(ctx context.Context, zoneID int64, name, networkCIDR, gateway, dns string) (*model.IPPool, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -137,10 +134,9 @@ func (s *IPPoolService) CreateIPPool(ctx context.Context, zoneID int64, name, ne
 	return created, nil
 }
 
-// expandPoolIPs materializes every address of the prefix as a free ip row
-// except the network address, the IPv4 broadcast address and the gateway.
-// CreateIPPool rejects a gateway on the network/broadcast address before this
-// is called, but the exclusions are kept defensively for direct callers.
+// expandPoolIPs 将前缀的每个地址物化为一条空闲 ip 行，但网络地址、IPv4
+// 广播地址和网关除外。CreateIPPool 在调用本函数之前会拒绝位于网络/广播地址
+// 上的网关，但排除逻辑仍保留为防御性措施，以保护直接调用者。
 func expandPoolIPs(prefix netip.Prefix, gateway netip.Addr) []model.IP {
 	addr := prefix.Addr()
 	excluded := map[string]struct{}{addr.String(): {}}
@@ -162,8 +158,7 @@ func expandPoolIPs(prefix netip.Prefix, gateway netip.Addr) []model.IP {
 	return ips
 }
 
-// lastAddr4 computes the broadcast address of an IPv4 prefix (all host bits
-// set).
+// lastAddr4 计算 IPv4 前缀的广播地址（所有主机位均置 1）。
 func lastAddr4(prefix netip.Prefix) netip.Addr {
 	a := prefix.Addr().As4()
 	for i := prefix.Bits(); i < 32; i++ {
@@ -172,11 +167,10 @@ func lastAddr4(prefix netip.Prefix) netip.Addr {
 	return netip.AddrFrom4(a)
 }
 
-// ListPools returns the pools of GET /ip-pools. With zoneID set the zone's
-// pools are returned in full — a zone embeds few pools, so the zone-filtered
-// list is deliberately not paginated (total is the zone's pool count).
-// Without zoneID the pools are paged by limit/offset and total is the
-// overall pool count. The zone must exist.
+// ListPools 返回 GET /ip-pools 的池列表。设置了 zoneID 时返回该区域的全部
+// 池——一个区域包含的池很少，因此按区域过滤的列表刻意不做分页（total 为该
+// 区域的池数量）。未设置 zoneID 时按 limit/offset 分页，total 为全部池数量。
+// 区域必须存在。
 func (s *IPPoolService) ListPools(ctx context.Context, zoneID *int64, limit, offset int) ([]model.IPPool, int, error) {
 	if zoneID == nil {
 		pools, err := s.poolRepo.ListPoolsPage(ctx, limit, offset)
@@ -202,8 +196,7 @@ func (s *IPPoolService) ListPools(ctx context.Context, zoneID *int64, limit, off
 	return pools, len(pools), nil
 }
 
-// GetPoolNodes returns the nodes whitelisted for the pool; the pool must
-// exist.
+// GetPoolNodes 返回池白名单中的节点；池必须存在。
 func (s *IPPoolService) GetPoolNodes(ctx context.Context, poolID int64) ([]model.PVENode, error) {
 	if _, err := s.poolRepo.GetPool(ctx, poolID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -218,9 +211,8 @@ func (s *IPPoolService) GetPoolNodes(ctx context.Context, poolID int64) ([]model
 	return nodes, nil
 }
 
-// SetPoolNodes replaces the pool's node whitelist. Every node must exist and
-// belong to the pool's zone (cross-zone whitelisting is a conflict);
-// duplicate ids are collapsed and sorted.
+// SetPoolNodes 替换池的节点白名单。每个节点都必须存在且属于池所在区域
+// （跨区域白名单视为冲突）；重复的 id 会被去重并排序。
 func (s *IPPoolService) SetPoolNodes(ctx context.Context, poolID int64, nodeIDs []int64) error {
 	pool, err := s.poolRepo.GetPool(ctx, poolID)
 	if err != nil {
@@ -257,11 +249,10 @@ func (s *IPPoolService) SetPoolNodes(ctx context.Context, poolID int64, nodeIDs 
 	return nil
 }
 
-// AllocateIP claims a random free address of the pool and returns it. The
-// claim itself is atomic (single conditional UPDATE in the repository), so
-// concurrent allocations never hand out the same address; when a claim loses
-// a race the call retries, up to maxAllocationAttempts. An exhausted pool
-// (or one that keeps losing the race) yields a KindIPExhausted error.
+// AllocateIP 抢占池中一个随机的空闲地址并返回。抢占本身是原子的（仓库中的
+// 单条条件 UPDATE），因此并发分配绝不会给出相同的地址；当抢占在竞态中失败
+// 时，调用会重试，最多 maxAllocationAttempts 次。地址耗尽的池（或一直输掉
+// 竞态的池）会产生 KindIPExhausted 错误。
 func (s *IPPoolService) AllocateIP(ctx context.Context, poolID int64) (model.IP, error) {
 	if _, err := s.poolRepo.GetPool(ctx, poolID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -285,11 +276,9 @@ func (s *IPPoolService) AllocateIP(ctx context.Context, poolID int64) (model.IP,
 	return model.IP{}, ipExhaustedf("pool %d has no free ip after %d attempts", poolID, maxAllocationAttempts)
 }
 
-// AllocateIPInZone claims a random free address of the pool after checking
-// that the pool belongs to the zone. Cross-zone usage (ip-pool spec) is
-// refused with a conflict; the allocation itself is delegated to AllocateIP.
-// VM creation (task 7.1) selects the pool and calls this to enforce the zone
-// boundary.
+// AllocateIPInZone 在确认池属于该区域后，抢占池中一个随机的空闲地址。
+// 跨区域使用（ip-pool 规范）会以冲突错误拒绝；分配本身委托给 AllocateIP。
+// VM 创建（任务 7.1）选择池后调用本函数以强制区域边界。
 func (s *IPPoolService) AllocateIPInZone(ctx context.Context, zoneID, poolID int64) (model.IP, error) {
 	pool, err := s.poolRepo.GetPool(ctx, poolID)
 	if err != nil {
@@ -304,11 +293,10 @@ func (s *IPPoolService) AllocateIPInZone(ctx context.Context, zoneID, poolID int
 	return s.AllocateIP(ctx, poolID)
 }
 
-// ReleaseIPByVM frees the address claimed by the VM, if any. Idempotent: an
-// unknown vm id is not an error. Per the migration conventions the caller
-// (VM destroy, task 7.4) must run this inside the same transaction that
-// deletes the vms row and before the delete, so a freed address never ends up
-// with status='used' and no owner.
+// ReleaseIPByVM 释放该 VM 抢占的地址（如有）。幂等：未知的 vm id 不是错误。
+// 按照迁移约定，调用方（VM 销毁，任务 7.4）必须在删除 vms 行的同一事务内、
+// 且先于删除执行本调用，这样被释放的地址永远不会以 status='used' 且无所有
+// 者的状态残留。
 func (s *IPPoolService) ReleaseIPByVM(ctx context.Context, vmID int64) error {
 	if err := s.poolRepo.ReleaseIPByVM(ctx, vmID); err != nil {
 		return fmt.Errorf("release ip of vm %d: %w", vmID, err)

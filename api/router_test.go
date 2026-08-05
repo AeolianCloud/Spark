@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"gopkg.in/yaml.v3"
 
 	"spark/api/handlers"
 	"spark/api/middleware"
@@ -17,8 +18,8 @@ import (
 	"spark/crypto"
 )
 
-// testRouterPool builds a lazy pool that never opens a connection, good
-// enough for routing-level tests that do not touch the database.
+// testRouterPool 构建一个从不打开连接的懒加载 pool，
+// 足以用于不触碰数据库的路由层测试。
 func testRouterPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool, err := pgxpool.New(context.Background(), "postgres://user:pass@127.0.0.1:1/db")
@@ -29,7 +30,7 @@ func testRouterPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// testRouterCipher builds a cipher from a deterministic 32-byte key.
+// testRouterCipher 用确定的 32 字节密钥构建 cipher。
 func testRouterCipher(t *testing.T) *crypto.Cipher {
 	t.Helper()
 	key := make([]byte, 32)
@@ -45,11 +46,9 @@ func testRouterCipher(t *testing.T) *crypto.Cipher {
 	return c
 }
 
-// TestRouterRegistersAllRoutes builds the full router with a lazy pool (no
-// connection is ever opened) and asserts the complete route table. gin
-// panics on conflicting route registrations, so merely building the router
-// is the conflict check; the assertions pin down the expected paths,
-// including the batch-7 /vms group.
+// TestRouterRegistersAllRoutes 用懒加载 pool（不打开任何连接）构建完整
+// 路由并断言完整路由表。gin 在路由注册冲突时会 panic，因此仅构建路由
+// 本身就是冲突检查；断言则固定了预期路径，包括 batch-7 的 /vms 分组。
 func TestRouterRegistersAllRoutes(t *testing.T) {
 	pool := testRouterPool(t)
 
@@ -57,6 +56,9 @@ func TestRouterRegistersAllRoutes(t *testing.T) {
 
 	want := []string{
 		"GET /healthz",
+		"GET /docs",
+		"GET /docs/*any",
+		"GET /openapi.yaml",
 		"POST /zones",
 		"GET /zones",
 		"POST /zones/:zone_id/nodes",
@@ -93,7 +95,7 @@ func TestRouterRegistersAllRoutes(t *testing.T) {
 	}
 }
 
-// errorBody mirrors the unified error payload {"error":{"code","message"}}.
+// errorBody 镜像统一的错误负载 {"error":{"code","message"}}。
 type errorBody struct {
 	Error struct {
 		Code    string `json:"code"`
@@ -101,9 +103,8 @@ type errorBody struct {
 	} `json:"error"`
 }
 
-// TestRouterUnmatchedPathAndMethod verifies the unified error contract
-// covers the whole API surface: unknown paths yield the 404 shape and
-// known paths with an unregistered method yield 405 plus the Allow header.
+// TestRouterUnmatchedPathAndMethod 验证统一错误契约覆盖整个 API 表面：
+// 未知路径返回 404 结构，已知路径配未注册方法返回 405 并带 Allow 头。
 func TestRouterUnmatchedPathAndMethod(t *testing.T) {
 	r := NewRouter(testRouterPool(t), testRouterCipher(t))
 
@@ -181,11 +182,53 @@ func TestRouterUnmatchedPathAndMethod(t *testing.T) {
 	})
 }
 
-// TestErrorCodeConstantsLocked guards the duplicated internal-error code
-// across packages: handlers.CodeInternal and middleware.errCodeInternal
-// (asserted in middleware_test.go) must both equal the documented value.
-// middleware cannot import handlers (cycle), so the lock lives here in the
-// api package where both dependencies are legal.
+// TestDocsRoutes 走完整路由栈验证契约在线浏览端点：GET /docs 返回
+// Swagger UI 页面（含 swagger-ui 关键标记），GET /openapi.yaml 返回
+// 200 且 Content-Type 为 application/yaml、body 可解析为 YAML 并声明
+// openapi 3.0.3。这两条路由刻意不写入契约本身（docs/openapi.yaml），
+// 因此断言的是实际挂载行为而非契约内容。
+func TestDocsRoutes(t *testing.T) {
+	r := NewRouter(testRouterPool(t), testRouterCipher(t))
+
+	t.Run("GET /docs renders swagger ui page", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/docs", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+		if !strings.Contains(w.Body.String(), "#swagger-ui") {
+			t.Error("body 缺少 swagger-ui 挂载点标记 #swagger-ui")
+		}
+	})
+
+	t.Run("GET /openapi.yaml serves contract", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/openapi.yaml", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+		if got := w.Header().Get("Content-Type"); got != "application/yaml" {
+			t.Errorf("Content-Type = %q, want application/yaml", got)
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal(w.Body.Bytes(), &doc); err != nil {
+			t.Fatalf("body 不是合法 YAML: %v", err)
+		}
+		if doc["openapi"] != "3.0.3" {
+			t.Errorf("openapi 版本 = %v, want 3.0.3", doc["openapi"])
+		}
+	})
+}
+
+// TestErrorCodeConstantsLocked 守护跨包重复的 internal-error 错误码：
+// handlers.CodeInternal 与 middleware.errCodeInternal（在
+// middleware_test.go 中断言）都必须等于文档化的值。
+// middleware 不能 import handlers（成环），因此该锁定断言放在
+// api 包中，那里两个依赖都是合法的。
 func TestErrorCodeConstantsLocked(t *testing.T) {
 	if handlers.CodeInternal != "internal_error" {
 		t.Errorf("handlers.CodeInternal = %q, want %q", handlers.CodeInternal, "internal_error")
@@ -198,11 +241,10 @@ func TestErrorCodeConstantsLocked(t *testing.T) {
 	}
 }
 
-// TestHealthzServiceDown verifies the degraded contract: when the database
-// ping fails the endpoint returns 503 and carries the x-ms-error-code
-// header so probes and load balancers can treat the service as unavailable.
-// The lazy pool points at 127.0.0.1:1 where nothing listens, so the ping is
-// guaranteed to fail.
+// TestHealthzServiceDown 验证 degraded 契约：数据库 ping 失败时
+// 端点返回 503 并携带 x-ms-error-code 头，使探活器与负载均衡可将其
+// 视为服务不可用。懒加载 pool 指向无人监听的 127.0.0.1:1，
+// 因此 ping 必然失败。
 func TestHealthzServiceDown(t *testing.T) {
 	r := NewRouter(testRouterPool(t), testRouterCipher(t))
 

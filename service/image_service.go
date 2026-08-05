@@ -12,21 +12,20 @@ import (
 	"spark/repository"
 )
 
-// ImageService implements the business rules for registered cloud images.
+// ImageService 实现已注册云镜像的业务规则。
 type ImageService struct {
 	repo *repository.ImageRepository
 }
 
-// NewImageService creates an ImageService backed by repo.
+// NewImageService 使用 repo 创建一个 ImageService。
 func NewImageService(repo *repository.ImageRepository) *ImageService {
 	return &ImageService{repo: repo}
 }
 
-// Create validates the fields and persists a new image. A duplicate name is a
-// conflict. A nil nodeImages is normalized to an empty map by the repository
-// so the JSONB column is written as '{}'. The node_images keys are trimmed
-// before validation and persistence, so whitespace-padded node names cannot
-// create entries that never match the enabled-node list of a zone.
+// Create 校验字段并持久化一个新的镜像。名称重复视为冲突。nil 的 nodeImages
+// 会被仓库规范化为空 map，因此 JSONB 列以 '{}' 写入。node_images 的键在校验
+// 和持久化前会被去掉首尾空白，这样带空白填充的节点名不会产生永远无法匹配
+// 区域启用节点列表的条目。
 func (s *ImageService) Create(ctx context.Context, name, defaultUser string, nodeImages map[string]string) (*model.Image, error) {
 	switch {
 	case strings.TrimSpace(name) == "":
@@ -52,7 +51,7 @@ func (s *ImageService) Create(ctx context.Context, name, defaultUser string, nod
 	return img, nil
 }
 
-// Get returns the image with the given id, or a not_found error.
+// Get 返回指定 id 的镜像，或返回 not_found 错误。
 func (s *ImageService) Get(ctx context.Context, id int64) (*model.Image, error) {
 	img, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -64,7 +63,7 @@ func (s *ImageService) Get(ctx context.Context, id int64) (*model.Image, error) 
 	return img, nil
 }
 
-// GetByName returns the image with the given name, or a not_found error.
+// GetByName 返回指定名称的镜像，或返回 not_found 错误。
 func (s *ImageService) GetByName(ctx context.Context, name string) (*model.Image, error) {
 	img, err := s.repo.GetByName(ctx, name)
 	if err != nil {
@@ -76,8 +75,8 @@ func (s *ImageService) GetByName(ctx context.Context, name string) (*model.Image
 	return img, nil
 }
 
-// List returns one page of all registered images with their full node_images
-// map; total is the total number of images, independent of the page.
+// List 返回一页全部已注册镜像及其完整 node_images 映射；total 是镜像总数，
+// 与分页无关。
 func (s *ImageService) List(ctx context.Context, limit, offset int) ([]model.Image, int, error) {
 	images, err := s.repo.ListPage(ctx, limit, offset)
 	if err != nil {
@@ -90,17 +89,14 @@ func (s *ImageService) List(ctx context.Context, limit, offset int) ([]model.Ima
 	return images, total, nil
 }
 
-// ListImagesByZone returns one page of the images available in a zone. The
-// zone must exist; an image is available only when its node_images map
-// contains every enabled node of the zone (intersection semantics). A zone
-// without enabled nodes yields an empty list, not an error.
+// ListImagesByZone 返回一页在区域中可用的镜像。区域必须存在；只有当镜像的
+// node_images 映射包含区域的每个启用节点时，该镜像才可用（交集语义）。没有
+// 启用节点的区域返回空列表而非错误。
 //
-// Pagination is applied AFTER the availability filter: the intersection is a
-// service-level rule that SQL LIMIT/OFFSET cannot express (it would slice
-// before filtering and produce short or empty pages), so the full registered
-// list is scanned and the available slice is paged in Go. The images table
-// is a small metadata set, so the full scan is cheap. total is the number of
-// available images, independent of the page.
+// 分页在可用性过滤之后应用：交集是 SQL LIMIT/OFFSET 无法表达的服务层规则
+// （它会在过滤前切片并产生过短或空的页），因此会扫描全部已注册列表，并在
+// Go 中对可用切片分页。images 表是小型的元数据集，全量扫描开销很低。total
+// 是可用镜像的数量，与分页无关。
 func (s *ImageService) ListImagesByZone(ctx context.Context, zoneID int64, limit, offset int) ([]model.Image, int, error) {
 	exists, err := s.repo.ZoneExists(ctx, zoneID)
 	if err != nil {
@@ -123,13 +119,11 @@ func (s *ImageService) ListImagesByZone(ctx context.Context, zoneID int64, limit
 	return slicePage(available, limit, offset), len(available), nil
 }
 
-// slicePage returns the limit/offset slice of items (offset past the end
-// yields an empty slice, never nil). Shared by the paginated list paths that
-// page in Go instead of SQL. Negative limit/offset are clamped to 0 — the
-// HTTP layer rejects negative values via parsePagination and the service
-// callers always pass non-negative values, but this package-level helper is
-// reused by VM/zone/IP-pool test doubles and repo callers must not panic on
-// the slice arithmetic or silently turn LIMIT -1 into "no limit" downstream.
+// slicePage 返回 items 的 limit/offset 切片（offset 越界时返回空切片，绝不
+// 返回 nil）。供在 Go 中而非 SQL 中分页的列表路径共用。负的 limit/offset 会
+// 被钳制为 0——HTTP 层通过 parsePagination 拒绝负值，服务调用方也总是传入
+// 非负值，但该包级辅助函数会被 VM/区域/IP 池的测试替身以及仓库调用方复用，
+// 因此绝不能因切片运算而 panic，也不能在下游把 LIMIT -1 静默当作"不限制"。
 func slicePage[T any](items []T, limit, offset int) []T {
 	if limit < 0 {
 		limit = 0
@@ -142,11 +136,9 @@ func slicePage[T any](items []T, limit, offset int) []T {
 	return items[start:end]
 }
 
-// filterImagesAvailableByNodes keeps the images whose node_images map
-// contains a key for every node in nodes. Presence on a node is decided by
-// key membership (the value holds the storage path or a presence marker). An
-// empty node list yields an empty result, never nil, so JSON serializes as
-// [].
+// filterImagesAvailableByNodes 保留 node_images 映射中包含 nodes 中每个节点
+// 键的镜像。节点上是否存在由键的成员关系决定（值存放存储路径或存在性标记）。
+// 空节点列表产生空结果而非 nil，因此 JSON 序列化为 []。
 func filterImagesAvailableByNodes(images []model.Image, nodes []string) []model.Image {
 	available := make([]model.Image, 0, len(images))
 	if len(nodes) == 0 {

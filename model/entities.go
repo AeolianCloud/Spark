@@ -2,14 +2,14 @@ package model
 
 import "time"
 
-// Zone is a deployment region grouping nodes, IP pools and VMs.
+// Zone 是一个部署区域，用于将节点、IP 池和虚拟机分组。
 type Zone struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// PVENode is a registered Proxmox VE node with its API credentials.
+// PVENode 是已注册的 Proxmox VE 节点，包含其 API 凭据。
 type PVENode struct {
 	ID             int64     `json:"id"`
 	ZoneID         int64     `json:"zone_id"`
@@ -21,7 +21,7 @@ type PVENode struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// IPPool is an IP address pool within a zone.
+// IPPool 是区域内的一个 IP 地址池。
 type IPPool struct {
 	ID          int64     `json:"id"`
 	ZoneID      int64     `json:"zone_id"`
@@ -32,20 +32,20 @@ type IPPool struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// IPPoolNode is a many-to-many join between IP pools and the nodes that may
-// serve addresses from the pool (the "available" whitelist).
+// IPPoolNode 是 IP 池与节点之间的多对多关联，这些节点可以从池中提供地址
+// （"可用"白名单）。
 type IPPoolNode struct {
 	IPPoolID int64 `json:"ip_pool_id"`
 	NodeID   int64 `json:"node_id"`
 }
 
-// IP status values.
+// IP 状态值。
 const (
 	IPStatusFree = "free"
 	IPStatusUsed = "used"
 )
 
-// IP is a single address inside an IP pool.
+// IP 是 IP 池中的单个地址。
 type IP struct {
 	ID        int64     `json:"id"`
 	PoolID    int64     `json:"pool_id"`
@@ -55,7 +55,7 @@ type IP struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// StorageType abstracts a PVE storage (e.g. local-ssd) behind a display name.
+// StorageType 用一个显示名称对 PVE 存储（如 local-ssd）进行抽象。
 type StorageType struct {
 	ID          int64     `json:"id"`
 	Name        string    `json:"name"`
@@ -64,8 +64,8 @@ type StorageType struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// Image is a registered cloud image. NodeImages maps node name to the image's
-// storage path (or presence marker) on that node.
+// Image 是已注册的云镜像。NodeImages 将节点名称映射为该节点上镜像的
+// 存储路径（或存在标记）。
 type Image struct {
 	ID          int64             `json:"id"`
 	Name        string            `json:"name"`
@@ -74,20 +74,19 @@ type Image struct {
 	CreatedAt   time.Time         `json:"created_at"`
 }
 
-// VM state constants used when the VM is not (yet) present on the PVE side.
-// The live status itself is pass-through (queried from PVE, not stored).
+// VM 状态常量，用于虚拟机尚未（或暂时未）存在于 PVE 侧时。
+// 实时状态本身是透传的（从 PVE 查询，不存储）。
 const (
 	VMStateCreating = "creating"
-	// VMStateFailed marks a VM whose detached provisioning chain failed; the
-	// failure message is carried in vms.provision_error.
+	// VMStateFailed 标记预配置链失败的虚拟机；
+	// 失败消息记录在 vms.provision_error 中。
 	VMStateFailed = "failed"
-	// VMStateReady is a transitional stand-in for the pass-through status of
-	// batch 8: the VM exists on PVE (pve_vmid set, no provision error).
+	// VMStateReady 是 batch 8 透传状态的过渡占位：
+	// 虚拟机已存在于 PVE 上（已设置 pve_vmid，无预配置错误）。
 	VMStateReady = "ready"
 )
 
-// VM is a virtual machine record; the live status is not stored (pass-through
-// queries against PVE, see design D1).
+// VM 是虚拟机记录；实时状态不存储（对 PVE 的透传查询，见设计 D1）。
 type VM struct {
 	ID                int64  `json:"id"`
 	UUID              string `json:"uuid"`
@@ -102,8 +101,8 @@ type VM struct {
 	DiskGB            int64  `json:"disk_gb"`
 	IPID              *int64 `json:"ip_id,omitempty"`
 	PasswordEncrypted string `json:"password_encrypted,omitempty"`
-	// ProvisionError carries the sanitized failure message of the detached
-	// PVE provisioning chain (empty while provisioning or after success).
+	// ProvisionError 携带分离式 PVE 预配置链的脱敏失败消息
+	// （预配置中或成功后为空）。
 	ProvisionError string    `json:"provision_error,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`

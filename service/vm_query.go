@@ -16,19 +16,15 @@ import (
 	"spark/repository"
 )
 
-// listVMsTimeout bounds the whole list query (DB reads plus every node's PVE
-// list call). The node calls run in parallel, so the budget is the total wall
-// time for all of them, not the sum of their individual latencies: the
-// deadline is derived from the request context, and any node call that has
-// not answered when it fires fails with a context error that becomes a
-// warning — the same partial-failure semantics as an unreachable node
-// (task 8.3).
+// listVMsTimeout 限制整个列表查询（数据库读取加每个节点的 PVE 列表调用）。
+// 节点调用并行执行，因此该预算指它们总的墙钟时间，而非各自延迟之和：截止
+// 时间由请求 context 推导，任何在其触发时尚未响应的节点调用都会以 context
+// 错误失败并成为一条警告——与不可达节点相同的部分失败语义（任务 8.3）。
 const listVMsTimeout = 10 * time.Second
 
-// LiveVMStatus is the pass-through runtime portion of a VM, read live from
-// the PVE node (design D1; the DB only stores metadata). Sizes are bytes and
-// CPUUsage is the fraction of the configured cores currently in use; a
-// stopped VM reports zero values.
+// LiveVMStatus 是 VM 的透传运行时部分，从 PVE 节点实时读取（设计 D1；数据库
+// 仅存储元数据）。大小单位为字节，CPUUsage 是当前已配置核心被占用的比例；
+// 已停止的 VM 报告零值。
 type LiveVMStatus struct {
 	Status   string
 	CPUUsage float64
@@ -39,75 +35,66 @@ type LiveVMStatus struct {
 	Uptime   int64
 }
 
-// VMListItem is one merged row of the pass-through list/detail (task 8.1/8.2):
-// the local metadata (spec values as requested at create time, design D1)
-// plus the live status when the VM exists on PVE. Status is "creating" while
-// the VM has no PVE counterpart (or it vanished, design D5) and "failed" when
-// provisioning failed; in both cases Live is nil.
+// VMListItem 是透传列表/详情的合并行（任务 8.1/8.2）：本地元数据（创建时
+// 请求的规格值，设计 D1）加上 VM 存在于 PVE 时的实时状态。当 VM 没有对应的
+// PVE 实体（或它已消失，设计 D5）时 Status 为 "creating"，供给失败时为
+// "failed"；这两种情况下 Live 均为 nil。
 type VMListItem struct {
 	VM     repository.VMWithIP
 	Status string
 	Live   *LiveVMStatus
 }
 
-// NodeWarning is a partial-failure notice attached to the list response: the
-// node's live query failed (unreachable, TLS, auth, ...) and its VMs are
-// omitted from the list (task 8.3). Error is safe to surface: the PVE client
-// sanitizes its own errors (pve.NewClient redacts the API user and never
-// echoes the token secret), and this package only copies them verbatim.
+// NodeWarning 是附加到列表响应的部分失败通知：节点的实时查询失败（不可达、
+// TLS、认证失败等），其 VM 从列表中省略（任务 8.3）。Error 可安全展示：PVE
+// 客户端会脱敏自己的错误（pve.NewClient 脱敏 API 用户且绝不回显 token 密钥），
+// 本包只是原样复制它们。
 type NodeWarning struct {
 	Node  string
 	Error string
 }
 
-// nodeQueryResult carries one node's PVE list outcome for mergeVMListItems:
-// the live VM list, or the failure that replaced it.
+// nodeQueryResult 为 mergeVMListItems 携带一个节点的 PVE 列表结果：实时 VM
+// 列表，或替代它的失败。
 type nodeQueryResult struct {
 	Name string
 	VMs  []pve.VMStatus
 	Err  error
 }
 
-// mergeVMListItems is the pure merge of the pass-through list (task 8.1):
-// for every local VM the live status is looked up in its node's PVE list and
-// merged; VMs without a PVE counterpart are reported as creating/failed; VMs
-// of failed nodes are omitted and collected into warnings. VMs whose node is
-// not among the queried enabled nodes (disabled or removed) are omitted and
-// warned about the same way. The result keeps the local (id) order and the
-// warnings are sorted by node name, so the output is deterministic. PVE-only
-// VMs (present on a node, no local row) have no metadata to merge and are
-// deliberately skipped: they are not managed by this service.
+// mergeVMListItems 是透传列表（任务 8.1）的纯合并：对每个本地 VM，在其节点
+// 的 PVE 列表中查找实时状态并合并；没有 PVE 对应实体的 VM 报告为
+// creating/failed；失败节点的 VM 被省略并收集进警告。节点不在被查询的启用
+// 节点之列（被禁用或已移除）的 VM 同样被省略并给出警告。结果保持本地（id）
+// 顺序，警告按节点名排序，因此输出是确定性的。仅存在于 PVE 的 VM（节点上
+// 存在、无本地行）没有可合并的元数据，被刻意跳过：它们不受本服务管理。
 //
-// It is a pure function of its inputs so the merge semantics are unit-testable
-// without PVE or DB access.
+// 它是输入的纯函数，因此合并语义无需访问 PVE 或数据库即可进行单元测试。
 func mergeVMListItems(local []repository.VMWithIP, nodes map[int64]nodeQueryResult) ([]VMListItem, []NodeWarning) {
 	items := make([]VMListItem, 0, len(local))
-	// disabled collects the warnings for local VMs whose node is not among
-	// the queried enabled nodes, keyed by the node id string so they merge
-	// into the same deterministic sort as the query-failure warnings.
+	// disabled 收集节点不在被查询启用节点之列的本地 VM 的警告，以节点 id 字符串
+	// 为键，使它们与查询失败的警告合并到同一次确定性排序中。
 	disabled := make(map[string]string)
-	// indexes caches one vmid -> status lookup map per node, built once per
-	// node in O(P) so merging every VM of that node is O(1) instead of a
-	// linear scan of the PVE list on each row.
+	// indexes 为每个节点缓存一个 vmid -> status 查找映射，每个节点以 O(P) 构建
+	// 一次，使该节点每个 VM 的合并为 O(1)，而不是每行都对 PVE 列表做线性扫描。
 	indexes := make(map[int64]map[int64]pve.VMStatus)
 	for i := range local {
 		vm := local[i]
 		res, ok := nodes[vm.VM.NodeID]
 		if !ok {
-			// Local metadata points at a node that is not among the enabled
-			// nodes that were queried (disabled or removed): the VM is omitted
-			// and a warning is emitted, mirroring the failed-node semantics.
+			// 本地元数据指向的节点不在被查询的启用节点之列（被禁用或已移除）：
+			// 该 VM 被省略并产生一条警告，镜像失败节点的语义。
 			disabled[strconv.FormatInt(vm.VM.NodeID, 10)] = fmt.Sprintf("node %d not among enabled nodes", vm.VM.NodeID)
 			continue
 		}
 		if res.Err != nil {
-			// The node's live query failed: its VMs are omitted as a partial
-			// failure (task 8.3); the warning is collected below.
+			// 节点的实时查询失败：其 VM 作为部分失败被省略（任务 8.3）；警告在
+			// 下方收集。
 			continue
 		}
 		switch {
 		case vm.VM.ProvisionError != "":
-			// provision_error wins over creating: the detached chain failed.
+			// provision_error 优先于 creating：分离式供给链已失败。
 			items = append(items, VMListItem{VM: vm, Status: model.VMStateFailed})
 		case vm.VM.PVEVmid == 0:
 			items = append(items, VMListItem{VM: vm, Status: model.VMStateCreating})
@@ -127,9 +114,8 @@ func mergeVMListItems(local []repository.VMWithIP, nodes map[int64]nodeQueryResu
 				}})
 				continue
 			}
-			// The node answers but the VM is gone from it: per design D5 the
-			// state reads as not-provisioned (creating). The row keeps its
-			// pve_vmid so operators can spot the inconsistency.
+			// 节点有响应但 VM 已不在其中：按设计 D5，状态读取为未供给（creating）。
+			// 该行保留其 pve_vmid，便于运维发现不一致。
 			items = append(items, VMListItem{VM: vm, Status: model.VMStateCreating})
 		}
 	}
@@ -155,9 +141,8 @@ func mergeVMListItems(local []repository.VMWithIP, nodes map[int64]nodeQueryResu
 	return items, warnings
 }
 
-// findVM returns the live status of the VM with the given vmid within the
-// node's list, if present. The list merge (mergeVMListItems) uses a
-// prebuilt vmid map instead; findVM serves the single-VM detail path.
+// findVM 返回节点列表中指定 vmid 的 VM 的实时状态（如果存在）。列表合并
+// （mergeVMListItems）改用预构建的 vmid 映射；findVM 服务于单 VM 详情路径。
 func findVM(vms []pve.VMStatus, vmid int64) (pve.VMStatus, bool) {
 	for _, v := range vms {
 		if v.VMID == vmid {
@@ -167,27 +152,21 @@ func findVM(vms []pve.VMStatus, vmid int64) (pve.VMStatus, bool) {
 	return pve.VMStatus{}, false
 }
 
-// ListVMs implements the pass-through list (task 8.1, design D1): the enabled
-// nodes of every zone are queried with exactly one PVE list call per node
-// (design D1), one page of the local metadata is read (with IPs), and both
-// are merged. The whole query runs under a request-level budget (listVMsTimeout).
-// The node queries run in parallel so the total latency is bounded by the
-// slowest node, not by the sum of all nodes; a node whose list call fails —
-// including the shared deadline firing — contributes a warning instead of its
-// VMs (task 8.3) and never fails the whole request.
+// ListVMs 实现透传列表（任务 8.1，设计 D1）：查询每个区域的启用节点，每个
+// 节点恰好一次 PVE 列表调用（设计 D1），读取一页本地元数据（含 IP），并将
+// 两者合并。整个查询运行在请求级预算（listVMsTimeout）之内。节点查询并行
+// 执行，因此总延迟由最慢的节点决定，而非所有节点延迟之和；列表调用失败的
+// 节点——包括共享截止时间触发——贡献一条警告而非其 VM（任务 8.3），绝不会
+// 让整个请求失败。
 //
-// Pagination (limit/offset) applies to the local vms metadata query: the
-// SQL LIMIT/OFFSET runs on the vms table and the PVE merge only sees the
-// page's rows, so the worst case is maxPageLimit rows merged per node. total
-// is the total local VM count (CountVMs): the merge can drop rows of failed
-// or disabled nodes, so total may exceed the item count of the page. The
-// warnings logic is unchanged: only the page's local rows are considered.
+// 分页（limit/offset）作用于本地 vms 元数据查询：SQL LIMIT/OFFSET 在 vms
+// 表上执行，PVE 合并只看到该页的行，因此最坏情况是每个节点合并 maxPageLimit
+// 行。total 是本地 VM 总数（CountVMs）：合并可能丢弃失败或禁用节点的行，
+// 因此 total 可能超过该页的行数。警告逻辑不变：只考虑该页的本地行。
 func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListItem, []NodeWarning, int, error) {
-	// Request-level total timeout: bounds DB reads plus all parallel node
-	// calls together, so a slow or hanging node cannot stretch the request.
-	// The same deadline is shared by every node goroutine below; when it
-	// fires, the pending calls fail with a context error that surfaces as a
-	// warning like any other node failure.
+	// 请求级总超时：一起限制数据库读取与所有并行节点调用，因此慢或挂起的节点
+	// 无法拉长请求。下方每个节点 goroutine 共享同一个截止时间；当它触发时，
+	// 挂起的调用会以 context 错误失败，并像其他任何节点失败一样呈现为警告。
 	ctx, cancel := context.WithTimeout(ctx, listVMsTimeout)
 	defer cancel()
 
@@ -204,10 +183,9 @@ func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListIte
 		nodes = append(nodes, zn...)
 	}
 
-	// One PVE list call per enabled node, parallelized: each goroutine writes
-	// only its own slot of the results slice (distinct indices, no shared
-	// state), so no locking is needed. nodeQueryResult values are collected
-	// into a map afterwards for the merge.
+	// 每个启用节点一次 PVE 列表调用，并行执行：每个 goroutine 只写 results
+	// 切片自己的槽位（索引互不相同，无共享状态），因此无需加锁。之后将
+	// nodeQueryResult 值收集到 map 中供合并使用。
 	results := make([]nodeQueryResult, len(nodes))
 	var wg sync.WaitGroup
 	for i := range nodes {
@@ -218,10 +196,9 @@ func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListIte
 			client := s.newClient(n.Host, n.APIUser, n.APITokenSecret)
 			vms, err := client.ListVMs(ctx, n.Name)
 			if err != nil {
-				// Partial failure (task 8.3): the node's VMs are dropped and a
-				// warning is emitted. The message is safe to surface — the PVE
-				// client never embeds credentials in its errors (defense in
-				// depth: do not rewrap with credentials here either).
+				// 部分失败（任务 8.3）：丢弃该节点的 VM 并产生一条警告。消息可安全
+				// 展示——PVE 客户端绝不在其错误中内嵌凭据（纵深防御：这里也不要
+				// 用凭据重新包装）。
 				results[i] = nodeQueryResult{Name: n.Name, Err: err}
 				return
 			}
@@ -247,16 +224,15 @@ func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListIte
 	return items, warnings, total, nil
 }
 
-// GetVM implements the pass-through detail (task 8.2, design D5/D6): the
-// local metadata plus the live status read from the VM's node.
+// GetVM 实现透传详情（任务 8.2，设计 D5/D6）：本地元数据加上从 VM 所在节点
+// 读取的实时状态。
 //
-//	VM row absent               -> not_found
-//	pve_vmid == 0               -> creating (failed when provision_error set)
-//	node row absent             -> node_unavailable (503), never disguised
-//	                               as creating
-//	node's list call fails      -> node_unavailable (503), never disguised
-//	                               as creating (task 8.3)
-//	node answers, VM absent     -> creating (design D5: PVE 不存在 → 创建中)
+//	VM 行不存在                 -> not_found
+//	pve_vmid == 0               -> creating（已设置 provision_error 时为 failed）
+//	节点行不存在                -> node_unavailable (503)，绝不伪装成 creating
+//	节点列表调用失败            -> node_unavailable (503)，绝不伪装成
+//	                               creating（任务 8.3）
+//	节点有响应但 VM 不存在      -> creating（设计 D5：PVE 不存在 → 创建中）
 func (s *VMService) GetVM(ctx context.Context, id int64) (*VMListItem, error) {
 	vm, err := s.vmRepo.GetVM(ctx, id)
 	if err != nil {
@@ -274,10 +250,9 @@ func (s *VMService) GetVM(ctx context.Context, id int64) (*VMListItem, error) {
 
 	node, err := s.nodeRepo.GetNode(ctx, vm.VM.NodeID)
 	if err != nil {
-		// A VM whose node row is gone (disabled/removed independently of the
-		// vms rows) cannot report a live status: this is the same
-		// node_unavailable semantics as an unreachable node (task 8.3),
-		// never a fake "creating".
+		// 节点行已消失的 VM（与 vms 行相互独立地被禁用/移除）无法报告实时状态：
+		// 这与不可达节点具有相同的 node_unavailable 语义（任务 8.3），绝不是
+		// 伪造的 "creating"。
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nodeUnavailablef("node %d of vm %d not found", vm.VM.NodeID, id)
 		}
@@ -286,9 +261,8 @@ func (s *VMService) GetVM(ctx context.Context, id int64) (*VMListItem, error) {
 	client := s.newClient(node.Host, node.APIUser, node.APITokenSecret)
 	vms, err := client.ListVMs(ctx, node.Name)
 	if err != nil {
-		// Task 8.3: a node failure on the detail path is an explicit error,
-		// not a fake "creating". The pve client sanitizes its own errors
-		// (never embeds the token), so the message is safe to surface.
+		// 任务 8.3：详情路径上的节点失败是显式错误，不是伪造的 "creating"。
+		// pve 客户端会脱敏自己的错误（绝不内嵌 token），因此消息可安全展示。
 		return nil, nodeUnavailablef("node %q unavailable: %v", node.Name, err)
 	}
 	if st, found := findVM(vms, vm.VM.PVEVmid); found {
@@ -297,7 +271,6 @@ func (s *VMService) GetVM(ctx context.Context, id int64) (*VMListItem, error) {
 			Disk: st.Disk, MaxDisk: st.MaxDisk, Uptime: st.Uptime,
 		}}, nil
 	}
-	// The node is reachable but the VM no longer exists on it (removed
-	// outside the service): design D5 reads this as not-provisioned.
+	// 节点可达但 VM 已不在其上（在服务之外被移除）：设计 D5 将其解读为未供给。
 	return &VMListItem{VM: *vm, Status: model.VMStateCreating}, nil
 }

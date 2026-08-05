@@ -6,28 +6,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// XTotalCountHeader is the response header of the paginated list endpoints
-// (GET /zones, /ip-pools, /storage-types, /images, /vms): the total number
-// of items matching the query, before limit/offset are applied. It lets
-// clients render pager controls without a second request.
+// XTotalCountHeader 是分页列表端点的响应头
+// （GET /zones、/ip-pools、/storage-types、/images、/vms）：应用
+// limit/offset 之前匹配查询的条目总数。它让客户端无需二次请求即可
+// 渲染分页控件。
 const XTotalCountHeader = "X-Total-Count"
 
 const (
-	// defaultPageLimit is the page size when the client sends no limit.
+	// defaultPageLimit 是客户端未发送 limit 时的分页大小。
 	defaultPageLimit = 25
-	// maxPageLimit caps the page size: an oversized limit is truncated to
-	// this value instead of being rejected. The cap is a DoS guard (a page
-	// query is at most this many rows, and for /vms at most this many PVE
-	// merges), and truncating instead of erroring keeps a misbehaving client
-	// on a working path instead of a 400 it may not retry.
+	// maxPageLimit 限制分页大小：过大的 limit 被截断为
+	// 该值而不是被拒绝。该上限是 DoS 防护（一次分页查询最多返回
+	// 这么多行，对 /vms 最多执行这么多次 PVE 合并），
+	// 截断而非报错让异常客户端仍走可用路径，而不是可能不会重试的 400。
 	maxPageLimit = 100
 )
 
-// parsePagination reads the shared limit/offset query parameters of the
-// paginated list endpoints. limit defaults to defaultPageLimit, an
-// oversized limit is capped at maxPageLimit, offset defaults to 0; a
-// negative or non-numeric value is rejected with 400 bad_request. The
-// returned limit/offset are always non-negative.
+// parsePagination 读取分页列表端点共享的 limit/offset 查询参数。
+// limit 默认为 defaultPageLimit，过大的 limit 上限为 maxPageLimit，
+// offset 默认为 0；负数或非数值被拒绝并返回 400 bad_request。
+// 返回的 limit/offset 始终非负。
 func parsePagination(c *gin.Context) (limit, offset int, err error) {
 	limit = defaultPageLimit
 	if raw := c.Query("limit"); raw != "" {
@@ -50,7 +48,7 @@ func parsePagination(c *gin.Context) (limit, offset int, err error) {
 	return limit, offset, nil
 }
 
-// setTotalCount writes the X-Total-Count response header.
+// setTotalCount 写入 X-Total-Count 响应头。
 func setTotalCount(c *gin.Context, total int) {
 	c.Header(XTotalCountHeader, strconv.Itoa(total))
 }

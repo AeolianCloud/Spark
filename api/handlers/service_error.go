@@ -7,9 +7,9 @@ import (
 	"spark/service"
 )
 
-// mapServiceError converts a service-layer error into the unified *APIError,
-// or returns it unchanged when it is not a service error — the Handler
-// wrapper then logs it and answers a generic 500 so internals never leak.
+// mapServiceError 将 service 层错误转换为统一的 *APIError；
+// 若非 service 错误则原样返回 —— Handler 包装器随后记录它并返回
+// 通用 500，使内部细节永不泄露。
 func mapServiceError(err error) error {
 	var serr *service.Error
 	if !errors.As(err, &serr) {

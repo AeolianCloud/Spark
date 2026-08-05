@@ -20,18 +20,15 @@ import (
 	"spark/repository"
 )
 
-// Additional service error kinds for the VM lifecycle domain. The values sit
-// outside the shared iota range of errors.go (owned by other batches) to
-// avoid coupling this file to their edits.
+// VM 生命周期领域附加的服务错误种类。这些值位于 errors.go 共享 iota 范围
+// 之外（该范围归其他批次所有），以避免本文件与它们的改动产生耦合。
 const (
-	// KindVMNotReady: the VM has no PVE counterpart yet (provisioning not
-	// finished or the PVE VM is gone); lifecycle operations are refused.
+	// KindVMNotReady：VM 尚没有对应的 PVE 实体（供给未完成或 PVE VM 已消失）；
+	// 生命周期操作被拒绝。
 	KindVMNotReady ErrorKind = 102
-	// KindDiskShrinkNotAllowed: the requested disk size is smaller than the
-	// current one.
+	// KindDiskShrinkNotAllowed：请求的磁盘大小小于当前大小。
 	KindDiskShrinkNotAllowed ErrorKind = 103
-	// KindImageNotAvailable: the image is not present on every enabled node
-	// of the requested zone.
+	// KindImageNotAvailable：镜像未出现在请求区域的每个启用节点上。
 	KindImageNotAvailable ErrorKind = 104
 )
 
@@ -48,32 +45,31 @@ func imageNotAvailablef(format string, args ...any) *Error {
 }
 
 const (
-	// vmClaimRetries bounds the conditional-IP-claim retry loop inside the
-	// create transaction (repository.ErrAllocationRetry).
+	// vmClaimRetries 限制创建事务内条件式 IP 抢占的重试循环次数
+	// （repository.ErrAllocationRetry）。
 	vmClaimRetries = 5
-	// vmProvisionTimeout bounds the whole detached provisioning chain:
-	// NextVMID + create + WaitTask (default 10m) + resize + config read.
+	// vmProvisionTimeout 限制整条分离式供给链：NextVMID + create + WaitTask
+	// （默认 10 分钟）+ resize + 配置读取。
 	vmProvisionTimeout = 12 * time.Minute
-	// maxProvisionErrorLen caps the provision_error value stored in vms so a
-	// verbose PVE dump cannot bloat the row.
+	// maxProvisionErrorLen 限制存储在 vms 中的 provision_error 值长度，避免
+	// 冗长的 PVE dump 撑大该行。
 	maxProvisionErrorLen = 1000
-	// vmNamePattern is the PVE qm name rule: it must match
-	// ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$ (a letter, digit or underscore first,
-	// then letters, digits, underscores, dots and dashes).
+	// vmNamePattern 是 PVE qm 的名称规则：必须匹配
+	// ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$（首字符为字母、数字或下划线，之后
+	// 可以是字母、数字、下划线、点和短横线）。
 	vmNamePattern = `^[A-Za-z0-9_][A-Za-z0-9_.\-]*$`
 )
 
 var vmNameRegex = regexp.MustCompile(vmNamePattern)
 
-// TxBeginner begins a database transaction; *pgxpool.Pool satisfies it. The
-// VM service keeps the IP-allocation transaction orchestration in the
-// service layer (per the migration 0002 header conventions), so it needs a
-// transaction entry point in addition to the repositories.
+// TxBeginner 开启一个数据库事务；*pgxpool.Pool 满足该接口。VM 服务将 IP
+// 分配的事务编排保留在服务层（按 migration 0002 头部约定），因此除了各仓库
+// 之外，它还需要一个事务入口。
 type TxBeginner interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// VMRepository is the vms data access the VMService depends on.
+// VMRepository 是 VMService 依赖的 vms 数据访问层。
 type VMRepository interface {
 	CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error)
 	GetVM(ctx context.Context, id int64) (*repository.VMWithIP, error)
@@ -87,19 +83,19 @@ type VMRepository interface {
 	DeleteVMTx(ctx context.Context, tx pgx.Tx, id int64) error
 }
 
-// VMZoneRepository is the zone data access the VMService depends on.
+// VMZoneRepository 是 VMService 依赖的区域数据访问层。
 type VMZoneRepository interface {
 	GetZone(ctx context.Context, id int64) (*model.Zone, error)
 	ListZones(ctx context.Context) ([]model.Zone, error)
 }
 
-// VMNodeRepository is the node data access the VMService depends on.
+// VMNodeRepository 是 VMService 依赖的节点数据访问层。
 type VMNodeRepository interface {
 	GetNode(ctx context.Context, id int64) (*model.PVENode, error)
 	ListEnabledNodesByZone(ctx context.Context, zoneID int64) ([]model.PVENode, error)
 }
 
-// VMIPPoolRepository is the IP pool data access the VMService depends on.
+// VMIPPoolRepository 是 VMService 依赖的 IP 池数据访问层。
 type VMIPPoolRepository interface {
 	ListPoolsByZone(ctx context.Context, zoneID int64) ([]model.IPPool, error)
 	GetPoolNodes(ctx context.Context, poolID int64) ([]model.PVENode, error)
@@ -107,20 +103,19 @@ type VMIPPoolRepository interface {
 	ReleaseIPByVMTx(ctx context.Context, tx pgx.Tx, vmID int64) error
 }
 
-// VMImageRepository is the image data access the VMService depends on.
+// VMImageRepository 是 VMService 依赖的镜像数据访问层。
 type VMImageRepository interface {
 	Get(ctx context.Context, id int64) (*model.Image, error)
 	EnabledNodeNamesByZone(ctx context.Context, zoneID int64) ([]string, error)
 }
 
-// VMStorageTypeRepository is the storage type data access the VMService
-// depends on.
+// VMStorageTypeRepository 是 VMService 依赖的存储类型数据访问层。
 type VMStorageTypeRepository interface {
 	Get(ctx context.Context, id int64) (*model.StorageType, error)
 }
 
-// CreateVMRequest is the validated input of VMService.CreateVM; the field
-// names match the D6 API shape exactly (POST /vms body).
+// CreateVMRequest 是 VMService.CreateVM 的已校验输入；字段名与 D6 API 的
+// 形态完全一致（POST /vms 请求体）。
 type CreateVMRequest struct {
 	Name          string `json:"name"`
 	CPU           int    `json:"cpu"`
@@ -132,10 +127,9 @@ type CreateVMRequest struct {
 	Password      string `json:"password"`
 }
 
-// validateCreateVMRequest enforces the non-existence parts of the create
-// validation: the name and the positive specs, and a non-empty password. The
-// existence checks (zone, image, storage type, image-on-zone) run before
-// this in CreateVM, matching the documented validation order.
+// validateCreateVMRequest 强制创建校验中与存在性无关的部分：名称、正数规格
+// 以及非空密码。存在性检查（区域、镜像、存储类型、镜像在区域内的可用性）在
+// CreateVM 中先于本函数执行，与文档化的校验顺序一致。
 func validateCreateVMRequest(req CreateVMRequest) error {
 	switch {
 	case strings.TrimSpace(req.Name) == "":
@@ -154,9 +148,8 @@ func validateCreateVMRequest(req CreateVMRequest) error {
 	return nil
 }
 
-// VMService implements the business rules of the VM lifecycle: create (with
-// atomic IP allocation and a detached PVE provisioning chain), start/stop/
-// restart, destroy (with IP release) and spec changes.
+// VMService 实现 VM 生命周期的业务规则：创建（原子 IP 分配与分离式 PVE
+// 供给链）、启动/停止/重启、销毁（含 IP 释放）以及规格变更。
 type VMService struct {
 	beginner    TxBeginner
 	vmRepo      VMRepository
@@ -166,19 +159,17 @@ type VMService struct {
 	imageRepo   VMImageRepository
 	storageRepo VMStorageTypeRepository
 	cipher      *crypto.Cipher
-	// newClient builds the PVE client for a node; injectable so tests can
-	// point the provisioning chain and lifecycle calls at fake servers.
+	// newClient 为节点构建 PVE 客户端；可注入，以便测试将供给链和生命周期
+	// 调用指向假服务器。
 	newClient func(host, apiUser, apiTokenSecret string) *pve.Client
-	// selectNode picks the deployment node among the pool candidates;
-	// injectable for tests, the production default probes reachability with
-	// the same newClient factory the service uses for every other node
-	// interaction (so SetClientFactory redirects the probes too).
+	// selectNode 在池候选节点中挑选部署节点；可注入用于测试，生产默认使用与
+	// 服务在其他所有节点交互时相同的 newClient 工厂来探测可达性（因此
+	// SetClientFactory 同样会重定向这些探测）。
 	selectNode func(ctx context.Context, nodes []model.PVENode) (model.PVENode, error)
 }
 
-// NewVMService creates a VMService backed by the given repositories and the
-// encryption cipher (used to encrypt the cloud-init password before it is
-// stored).
+// NewVMService 使用给定的仓库和加密密码器创建一个 VMService（密码器用于在
+// 存储前加密 cloud-init 密码）。
 func NewVMService(beginner TxBeginner, vmRepo VMRepository, ipPoolRepo VMIPPoolRepository,
 	zoneRepo VMZoneRepository, nodeRepo VMNodeRepository, imageRepo VMImageRepository,
 	storageRepo VMStorageTypeRepository, cipher *crypto.Cipher) *VMService {
@@ -195,38 +186,32 @@ func NewVMService(beginner TxBeginner, vmRepo VMRepository, ipPoolRepo VMIPPoolR
 			return pve.NewClient(host, apiUser, apiTokenSecret)
 		},
 	}
-	// The reachability probes must use the same client factory as every
-	// other node interaction, so overriding newClient (SetClientFactory,
-	// tests, reverse proxies) redirects the probes as well. It is assigned
-	// after construction because it closes over s itself.
+	// 可达性探测必须与其他所有节点交互使用相同的客户端工厂，因此覆盖
+	// newClient（SetClientFactory、测试、反向代理）也会一并重定向这些探测。
+	// 该字段在构造之后才赋值，因为它闭包捕获了 s 自身。
 	s.selectNode = func(ctx context.Context, nodes []model.PVENode) (model.PVENode, error) {
 		return selectReachableNode(ctx, nodes, s.newClient)
 	}
 	return s
 }
 
-// SetClientFactory replaces the PVE client factory used for every node
-// interaction (provisioning chain, lifecycle operations, pass-through
-// queries, reachability probes). The default factory builds clients against
-// https://{host}:8006/api2/json; overriding it lets callers point the
-// service at a different base URL (tests, reverse proxies).
+// SetClientFactory 替换用于所有节点交互（供给链、生命周期操作、透传查询、
+// 可达性探测）的 PVE 客户端工厂。默认工厂针对 https://{host}:8006/api2/json
+// 构建客户端；覆盖它可以让调用方将服务指向不同的 base URL（测试、反向代理）。
 func (s *VMService) SetClientFactory(fn func(host, apiUser, apiTokenSecret string) *pve.Client) {
 	if fn != nil {
 		s.newClient = fn
 	}
 }
 
-// CreateVM validates the request, picks a reachable node (D4), atomically
-// allocates an IP and persists the VM record (D3 + migration 0002
-// conventions), then launches the detached provisioning chain (D5) and
-// returns the VM with its plaintext IP. The returned record has
-// "creating" semantics: pve_vmid stays zero until the chain succeeds.
+// CreateVM 校验请求、挑选可达节点（D4）、原子分配 IP 并持久化 VM 记录（D3 +
+// migration 0002 约定），随后启动分离式供给链（D5）并返回带明文 IP 的 VM。
+// 返回的记录具有 "creating" 语义：在供给链成功之前 pve_vmid 保持为零。
 //
-// The provisioning goroutine must not borrow the caller's context (it is
-// cancelled when the HTTP handler returns), so it runs under a detached
-// background context bounded by vmProvisionTimeout.
+// 供给 goroutine 不得借用调用方的 context（HTTP 处理器返回时该 context 会
+// 被取消），因此它在受 vmProvisionTimeout 限制的分离式后台 context 下运行。
 func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*repository.VMWithIP, error) {
-	// 1. zone existence.
+	// 1. 检查区域是否存在。
 	if req.ZoneID <= 0 {
 		return nil, badRequestf("zone_id must be a positive integer")
 	}
@@ -236,7 +221,7 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 		}
 		return nil, fmt.Errorf("create vm: check zone: %w", err)
 	}
-	// 2. image existence.
+	// 2. 检查镜像是否存在。
 	if req.ImageID <= 0 {
 		return nil, badRequestf("image_id must be a positive integer")
 	}
@@ -247,7 +232,7 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 		}
 		return nil, fmt.Errorf("create vm: get image: %w", err)
 	}
-	// 3. storage type existence.
+	// 3. 检查存储类型是否存在。
 	if req.StorageTypeID <= 0 {
 		return nil, badRequestf("storage_type_id must be a positive integer")
 	}
@@ -258,9 +243,8 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 		}
 		return nil, fmt.Errorf("create vm: get storage type: %w", err)
 	}
-	// 4. image availability on every enabled node of the zone (reuses the
-	// 6.3 intersection semantics: the node_images map must have a key for
-	// each enabled node).
+	// 4. 镜像在区域每个启用节点上的可用性（复用 6.3 的交集语义：node_images
+	// 映射必须为每个启用节点都包含一个键）。
 	nodeNames, err := s.imageRepo.EnabledNodeNamesByZone(ctx, req.ZoneID)
 	if err != nil {
 		return nil, fmt.Errorf("create vm: enabled nodes by zone: %w", err)
@@ -268,30 +252,29 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 	if len(filterImagesAvailableByNodes([]model.Image{*image}, nodeNames)) == 0 {
 		return nil, imageNotAvailablef("image %d is not available on every enabled node of zone %d", req.ImageID, req.ZoneID)
 	}
-	// 5. password and specs.
+	// 5. 校验密码与规格。
 	if err := validateCreateVMRequest(req); err != nil {
 		return nil, err
 	}
 
-	// Node and pool selection (D4): the zone's pools in id order; for each
-	// pool its whitelisted nodes intersect the zone's enabled nodes and the
-	// first reachable node wins; an unreachable pool is skipped in favor of
-	// the next one.
+	// 节点与池的选择（D4）：按 id 顺序遍历区域的池；对每个池，其白名单节点与
+	// 区域启用节点求交集，第一个可达节点胜出；不可达的池会被跳过，继续尝试
+	// 下一个池。
 	pool, node, err := s.selectPoolAndNode(ctx, req.ZoneID)
 	if err != nil {
 		return nil, err
 	}
 
-	// The cloud-init password is stored encrypted (crypto.Cipher) and is
-	// never persisted, logged or echoed in plain text.
+	// cloud-init 密码以加密形式存储（crypto.Cipher），绝不持久化、记录或以明文
+	// 回显。
 	passwordEncrypted, err := s.cipher.Encrypt(req.Password)
 	if err != nil {
 		return nil, fmt.Errorf("create vm: encrypt password: %w", err)
 	}
 
-	// Atomic placement (D3 + migration 0002 conventions): one transaction
-	// runs INSERT vms (ip_id NULL) -> claim ip -> UPDATE vms.ip_id; any
-	// failure rolls back the vms row together with the claim.
+	// 原子落位（D3 + migration 0002 约定）：单个事务依次执行 INSERT vms
+	// （ip_id 为 NULL）-> 抢占 ip -> UPDATE vms.ip_id；任何失败都会连同抢占
+	// 一起回滚 vms 行。
 	tx, err := s.beginner.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("create vm: begin tx: %w", err)
@@ -322,7 +305,7 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 			break
 		}
 		if errors.Is(err, repository.ErrAllocationRetry) {
-			continue // pick another random candidate inside the same tx
+			continue // 在同一事务内挑选另一个随机候选地址
 		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ipExhaustedf("pool %d has no free ip", pool.ID)
@@ -343,23 +326,20 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 	ipID := claimed.ID
 	created.IPID = &ipID
 
-	// Detached provisioning chain (D5): the request has already succeeded,
-	// so chain failures are recorded into vms.provision_error instead of
-	// being returned. context.Background() (NOT the request ctx, which is
-	// cancelled when the handler returns), bounded by vmProvisionTimeout.
+	// 分离式供给链（D5）：请求已经成功返回，因此供给链的失败会被记录到
+	// vms.provision_error 而非返回给调用方。使用 context.Background()（而非
+	// 请求的 ctx，后者在处理器返回时被取消），受 vmProvisionTimeout 限制。
 	vm := *created
 	go s.provisionVM(vm, node, image, storageType, pool, req.Password, claimed.IP)
 
 	return &repository.VMWithIP{VM: vm, IP: claimed.IP}, nil
 }
 
-// selectPoolAndNode walks the zone's IP pools in id order (D4). For each
-// pool the whitelisted nodes (ip_pool_nodes, by node id) are intersected
-// with the zone's enabled nodes and the first reachable node is picked; a
-// pool without reachable candidates is skipped in favor of the next pool.
-// When no pool yields a reachable node a KindNodeUnavailable error is
-// returned (this also covers a zone without any pool: the candidate set is
-// empty by construction).
+// selectPoolAndNode 按 id 顺序遍历区域的 IP 池（D4）。对每个池，将白名单
+// 节点（ip_pool_nodes，按节点 id）与区域启用节点求交集，并挑选第一个可达
+// 节点；没有可达候选的池会被跳过，继续尝试下一个池。当没有池能产出可达节点
+// 时，返回 KindNodeUnavailable 错误（这也涵盖没有池的区域：候选集在构造上
+// 即为空）。
 func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64) (model.IPPool, model.PVENode, error) {
 	enabledNodes, err := s.nodeRepo.ListEnabledNodesByZone(ctx, zoneID)
 	if err != nil {
@@ -382,15 +362,14 @@ func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64) (model.
 		if err == nil {
 			return pool, node, nil
 		}
-		// KindNodeUnavailable: keep the last error and try the next pool.
+		// KindNodeUnavailable：保留最后的错误并尝试下一个池。
 	}
 	return model.IPPool{}, model.PVENode{}, nodeUnavailablef("no reachable node for zone %d", zoneID)
 }
 
-// poolCandidates intersects the pool's whitelisted nodes with the zone's
-// enabled nodes. The result follows the node id order returned by
-// GetPoolNodes; v1 accepts this node-id order instead of the pool's check
-// order (the check order itself is not persisted, no schema change).
+// poolCandidates 将池的白名单节点与区域启用节点求交集。结果遵循
+// GetPoolNodes 返回的节点 id 顺序；v1 接受这种节点 id 顺序而非池的勾选顺序
+// （勾选顺序本身未被持久化，无需改动 schema）。
 func poolCandidates(poolNodes, enabledNodes []model.PVENode) []model.PVENode {
 	enabled := make(map[int64]struct{}, len(enabledNodes))
 	for _, n := range enabledNodes {
@@ -405,13 +384,13 @@ func poolCandidates(poolNodes, enabledNodes []model.PVENode) []model.PVENode {
 	return candidates
 }
 
-// provisionVM runs the detached PVE provisioning chain (D5) and records
-// failures into vms.provision_error. It is invoked as a goroutine with a
-// detached background context; the returned error is only for logging.
+// provisionVM 运行分离式 PVE 供给链（D5）并将失败记录到
+// vms.provision_error。它以 goroutine 形式配合分离式后台 context 被调用；
+// 返回的错误仅用于记录日志。
 //
-// The goroutine must never take the process down: a panic anywhere in the
-// chain is recovered here and recorded as an internal provisioning error,
-// leaving the VM row inspectable (provision_error set, pve_vmid still zero).
+// 该 goroutine 绝不能拖垮进程：链中任何位置的 panic 都会在此被恢复并记录
+// 为内部供给错误，使 VM 行保持可检查状态（provision_error 已设置，pve_vmid
+// 仍为零）。
 func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Image,
 	storageType *model.StorageType, pool model.IPPool, plainPassword, ipAddr string) {
 	ctx, cancel := context.WithTimeout(context.Background(), vmProvisionTimeout)
@@ -438,14 +417,12 @@ func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Im
 	}
 }
 
-// provision executes the single-step create chain (design D5): NextVMID,
-// then one CreateVM call carrying the scsi0 import-from disk, the
-// cloud-init data disk (ide2), vmbr0 networking and the cloud-init
-// injection (ciuser/cipassword/ipconfig0/nameserver); then WaitTask for the
-// qmcreate task; then a disk resize to the requested size when the imported
-// image is smaller; and finally the pve_vmid/disk_gb metadata update. Every
-// failure is persisted via SetProvisionError with a sanitized message (the
-// plaintext cloud-init password never lands in the DB or the logs).
+// provision 执行单步创建链（设计 D5）：先 NextVMID，然后一次 CreateVM 调用
+// 携带 scsi0 的 import-from 磁盘、cloud-init 数据盘（ide2）、vmbr0 网络以及
+// cloud-init 注入（ciuser/cipassword/ipconfig0/nameserver）；再对 qmcreate
+// 任务执行 WaitTask；当导入镜像小于请求大小时将磁盘扩展到请求大小；最后
+// 更新 pve_vmid/disk_gb 元数据。每次失败都通过 SetProvisionError 以脱敏消息
+// 持久化（明文 cloud-init 密码绝不会进入数据库或日志）。
 func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENode,
 	image *model.Image, storageType *model.StorageType, pool model.IPPool,
 	plainPassword, ipAddr string) error {
@@ -491,9 +468,8 @@ func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENo
 		return s.failProvision(ctx, vm.ID, int64(vmid), "wait create", err, plainPassword)
 	}
 
-	// The imported image may be smaller than the requested size; the disk is
-	// grown to disk_gb in that case. When the image is at least as big as
-	// requested, the actual size is what gets persisted.
+	// 导入的镜像可能小于请求的大小；此时磁盘会被扩展到 disk_gb。当镜像至少
+	// 与请求大小相同时，持久化的是实际大小。
 	diskGB := vm.DiskGB
 	cfg, err := client.GetVMConfig(ctx, node.Name, int64(vmid))
 	if err != nil {
@@ -522,8 +498,7 @@ func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENo
 
 	if err := s.vmRepo.UpdateVMPVEVMID(ctx, vm.ID, int64(vmid), diskGB); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The VM row was destroyed while provisioning; the PVE VM is
-			// orphaned on the node and needs manual cleanup.
+			// 供给期间 VM 行被销毁；PVE VM 成为节点上的孤儿，需要人工清理。
 			return fmt.Errorf("provision vm %d: row deleted during provisioning (orphaned pve vmid %d)", vm.ID, vmid)
 		}
 		return fmt.Errorf("provision vm %d: persist vmid: %w", vm.ID, err)
@@ -531,8 +506,8 @@ func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENo
 	return nil
 }
 
-// parseDiskSizeGB converts the size field of a PVE disk string
-// ("local-lvm:vm-100-disk-0,size=10G") to whole GiB.
+// parseDiskSizeGB 将 PVE 磁盘字符串的 size 字段
+// （"local-lvm:vm-100-disk-0,size=10G"）转换为整 GiB。
 func parseDiskSizeGB(diskString string) (int64, error) {
 	size := ""
 	for _, part := range strings.Split(diskString, ",") {
@@ -555,20 +530,17 @@ func parseDiskSizeGB(diskString string) (int64, error) {
 	return gb, nil
 }
 
-// failProvision persists the provisioning failure in vms.provision_error
-// with a sanitized message and returns a sanitized error for logging. The IP
-// stays allocated on failure by design (design doc Risks: no automatic
-// release, an operator reclaims dirty addresses manually).
+// failProvision 将供给失败以脱敏消息持久化到 vms.provision_error，并返回供
+// 日志使用的脱敏错误。按设计，失败时 IP 保持已分配状态（设计文档 Risks：
+// 不自动释放，由运维人工回收脏地址）。
 //
-// vmid is the PVE VMID allocated by NextVMID (0 when the chain failed before
-// the VMID was known). Once the VMID exists, the message embeds it (and the
-// "create succeeded" marker for post-create steps) so operators can locate
-// and clean up half-created VMs on the node.
+// vmid 是 NextVMID 分配的 PVE VMID（当链在得知 VMID 之前就失败时为 0）。
+// 一旦存在 VMID，消息会内嵌它（以及 create 之后步骤的 "create succeeded"
+// 标记），以便运维定位并清理节点上半成品 VM。
 //
-// The step prefix is assembled first and the whole message is sanitized
-// afterwards (redact then truncate), so a verbose PVE error can never push
-// the stored value past maxProvisionErrorLen and the prefix itself is never
-// truncated away — the same length rule as the recover branch of provisionVM.
+// 先拼接步骤前缀，再对整条消息做脱敏（先脱敏后截断），因此冗长的 PVE 错误
+// 永远不会把存储值推过 maxProvisionErrorLen，前缀本身也绝不会被截掉——与
+// provisionVM 中 recover 分支的长度规则一致。
 func (s *VMService) failProvision(ctx context.Context, vmID, vmid int64, step string, err error, plainPassword string) error {
 	var msg string
 	switch {
@@ -586,13 +558,11 @@ func (s *VMService) failProvision(ctx context.Context, vmID, vmid int64, step st
 	return fmt.Errorf("provision vm %d: %s", vmID, msg)
 }
 
-// sanitizeProvisionError redacts every occurrence of the given secrets (the
-// cloud-init password) from the error message and bounds its length, so
-// vms.provision_error and the logs never carry the password or an unbounded
-// PVE dump. Redaction runs before truncation so a secret spanning the length
-// boundary is never half-stored; the truncation cuts on a rune boundary so
-// multi-byte UTF-8 characters are never split into invalid sequences (the
-// vms.provision_error column would reject them, Postgres 22021).
+// sanitizeProvisionError 从错误消息中脱敏掉给定机密（cloud-init 密码）的
+// 每一次出现，并限制其长度，因此 vms.provision_error 和日志绝不会携带密码
+// 或无界的 PVE dump。脱敏先于截断执行，因此跨越长度边界的机密绝不会被半
+// 存储；截断按 rune 边界切割，多字节 UTF-8 字符绝不会被切成非法序列
+// （vms.provision_error 列会拒绝它们，Postgres 22021）。
 func sanitizeProvisionError(err error, secrets ...string) string {
 	msg := err.Error()
 	for _, secret := range secrets {
@@ -608,9 +578,8 @@ func sanitizeProvisionError(err error, secrets ...string) string {
 	return msg
 }
 
-// vmAndNode loads the VM (mapping a missing row to not_found) and its node.
-// A VM whose pve_vmid is still zero has not been provisioned yet and yields
-// KindVMNotReady.
+// vmAndNode 加载 VM（缺失的行映射为 not_found）及其节点。pve_vmid 仍为零
+// 的 VM 尚未完成供给，会产生 KindVMNotReady。
 func (s *VMService) vmAndNode(ctx context.Context, id int64) (*repository.VMWithIP, *model.PVENode, error) {
 	vm, err := s.vmRepo.GetVM(ctx, id)
 	if err != nil {
@@ -629,11 +598,9 @@ func (s *VMService) vmAndNode(ctx context.Context, id int64) (*repository.VMWith
 	return vm, node, nil
 }
 
-// mapPVEOpError converts a lifecycle-operation failure into a service
-// error: a PVE 404 means the pve_vmid refers to nothing on the node anymore
-// (the VM was removed outside the service), which is surfaced as
-// vm_not_ready; every other failure stays a plain error (rendered as a
-// generic 500 by the handler).
+// mapPVEOpError 将生命周期操作失败转换为服务错误：PVE 404 表示 pve_vmid
+// 在节点上已不再指向任何实体（VM 在服务之外被移除），以 vm_not_ready 呈现；
+// 其余失败保持普通错误（由处理器呈现为通用的 500）。
 func mapPVEOpError(err error, op string, id int64) error {
 	var upErr *pve.UpstreamError
 	if errors.As(err, &upErr) && upErr.StatusCode == http.StatusNotFound {
@@ -642,9 +609,9 @@ func mapPVEOpError(err error, op string, id int64) error {
 	return fmt.Errorf("%s vm %d: %w", op, id, err)
 }
 
-// Start boots the VM (POST /nodes/{node}/qemu/{vmid}/status/start). The PVE
-// task ID is not exposed: the client has nothing to poll it with and the
-// VM's real state is read pass-through anyway (batch 8).
+// Start 启动 VM（POST /nodes/{node}/qemu/{vmid}/status/start）。PVE 任务 ID
+// 不对外暴露：调用方没有可轮询它的对象，且 VM 的真实状态反正会通过透传读取
+// （批次 8）。
 func (s *VMService) Start(ctx context.Context, id int64) error {
 	vm, node, err := s.vmAndNode(ctx, id)
 	if err != nil {
@@ -657,8 +624,8 @@ func (s *VMService) Start(ctx context.Context, id int64) error {
 	return nil
 }
 
-// Stop shuts the VM down (POST .../status/stop). force=false performs a
-// clean ACPI shutdown; forced PVE-side stops are left to operators.
+// Stop 关闭 VM（POST .../status/stop）。force=false 执行干净的 ACPI 关机；
+// PVE 侧的强制停机留给运维自行操作。
 func (s *VMService) Stop(ctx context.Context, id int64) error {
 	vm, node, err := s.vmAndNode(ctx, id)
 	if err != nil {
@@ -671,7 +638,7 @@ func (s *VMService) Stop(ctx context.Context, id int64) error {
 	return nil
 }
 
-// Restart reboots the VM (POST .../status/reboot).
+// Restart 重启 VM（POST .../status/reboot）。
 func (s *VMService) Restart(ctx context.Context, id int64) error {
 	vm, node, err := s.vmAndNode(ctx, id)
 	if err != nil {
@@ -684,15 +651,12 @@ func (s *VMService) Restart(ctx context.Context, id int64) error {
 	return nil
 }
 
-// Destroy removes the VM: first the PVE VM is destroyed (purge=true, the
-// task is waited on inside DestroyVM); only on success, one transaction
-// releases the claimed IP and deletes the vms row (migration 0002
-// conventions: release BEFORE delete). Any PVE failure aborts the destroy
-// and keeps both the DB record and the IP, so the operator can inspect or
-// retry — except a PVE 404 (the VM was already removed on the PVE side, e.g.
-// by an operator), which is treated as "already destroyed" and continues
-// with the local cleanup. A VM that never reached PVE (pve_vmid == 0) skips
-// the PVE call and only cleans up the local record.
+// Destroy 删除 VM：先销毁 PVE VM（purge=true，任务在 DestroyVM 内部等待
+// 完成）；仅当成功后才在单个事务内释放已抢占的 IP 并删除 vms 行（migration
+// 0002 约定：先释放后删除）。任何 PVE 失败都会中止销毁并同时保留数据库记录
+// 与 IP，以便运维检查或重试——但 PVE 404 除外（VM 已在 PVE 侧被移除，例如
+// 被运维手动删除），它被视为"已销毁"并继续本地清理。从未到达 PVE 的 VM
+// （pve_vmid == 0）会跳过 PVE 调用，仅清理本地记录。
 func (s *VMService) Destroy(ctx context.Context, id int64) error {
 	vm, err := s.vmRepo.GetVM(ctx, id)
 	if err != nil {
@@ -710,8 +674,7 @@ func (s *VMService) Destroy(ctx context.Context, id int64) error {
 		if _, err := client.DestroyVM(ctx, node.Name, vm.VM.PVEVmid, true); err != nil {
 			var upErr *pve.UpstreamError
 			if errors.As(err, &upErr) && upErr.StatusCode == http.StatusNotFound {
-				// The PVE VM is already gone (removed outside the service);
-				// the local cleanup below still runs.
+				// PVE VM 已不存在（在服务之外被移除）；下面的本地清理仍会执行。
 			} else {
 				return fmt.Errorf("destroy vm %d on pve: %w (vm record and ip kept)", id, err)
 			}
@@ -736,12 +699,10 @@ func (s *VMService) Destroy(ctx context.Context, id int64) error {
 	return nil
 }
 
-// validateResizeSpec validates a resize request against the VM's current
-// values: at least one field must be present and positive; the disk may only
-// grow — a smaller disk_gb is refused with KindDiskShrinkNotAllowed. An
-// equal disk_gb is allowed and treated as a no-op (no resize call is made
-// for it), which keeps resize idempotent for callers that always send the
-// full spec. cpu and mem may grow or shrink.
+// validateResizeSpec 对照 VM 当前值校验调整请求：至少一个字段必须存在且
+// 为正数；磁盘只能增大——更小的 disk_gb 会以 KindDiskShrinkNotAllowed 被
+// 拒绝。相等的 disk_gb 被允许并视为无操作（不会为其发起 resize 调用），从而
+// 使总是发送完整规格的调用方获得幂等的调整行为。cpu 和 mem 可增可减。
 func validateResizeSpec(cpu *int, memMB, diskGB *int64, current model.VM) error {
 	if cpu == nil && memMB == nil && diskGB == nil {
 		return badRequestf("at least one of cpu, mem_mb, disk_gb is required")
@@ -761,16 +722,13 @@ func validateResizeSpec(cpu *int, memMB, diskGB *int64, current model.VM) error 
 	return nil
 }
 
-// Resize adjusts the VM spec: cpu and mem change via SetVMConfig
-// (synchronous on PVE 7/8/9), a larger disk via ResizeDisk. The changes are
-// applied to PVE first and only then persisted to the vms row. The persist
-// step uses the spec read at the start as an optimistic lock (UpdateSpec
-// re-checks it in the WHERE clause): when a concurrent resize committed in
-// between, the caller gets KindConflict and can retry. The returned record
-// carries the spec applied by this call (the requested fields, the others as
-// read at the start); it is NOT a fresh read from the database — callers
-// that need the latest persisted row or a live pass-through status must
-// fetch it themselves via GetVM.
+// Resize 调整 VM 规格：cpu 和 mem 通过 SetVMConfig 变更（在 PVE 7/8/9 上
+// 同步生效），更大的磁盘通过 ResizeDisk 调整。变更先应用到 PVE，之后才
+// 持久化到 vms 行。持久化步骤以开始时读取的规格作为乐观锁（UpdateSpec 在
+// WHERE 子句中重新检查它）：当期间有并发的调整先提交，调用方会得到
+// KindConflict 并可重试。返回的记录携带本次调用实际应用的规格（请求的字段
+// 取新值，其余为开始时读取的值）；它不是从数据库重新读取的新数据——需要
+// 最新持久化行或实时透传状态的调用方必须自行通过 GetVM 获取。
 func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskGB *int64) (*repository.VMWithIP, error) {
 	vm, node, err := s.vmAndNode(ctx, id)
 	if err != nil {
@@ -780,9 +738,8 @@ func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskG
 		return nil, err
 	}
 
-	// The spec to persist once the PVE-side changes succeeded: requested
-	// fields take the new values, the others stay as read. The values read
-	// here double as the optimistic-lock baseline for UpdateSpec.
+	// PVE 侧变更成功之后需要持久化的规格：请求的字段取新值，其余保持读取时
+	// 的值。此处读取的值同时充当 UpdateSpec 的乐观锁基线。
 	next := vm.VM
 	if cpu != nil {
 		next.CPU = *cpu
@@ -835,7 +792,7 @@ func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskG
 	}
 
 	if !changed {
-		return vm, nil // no-op (e.g. disk_gb equal to the current value)
+		return vm, nil // 无操作（例如 disk_gb 与当前值相等）
 	}
 
 	if err := s.vmRepo.UpdateSpec(ctx, id, next.CPU, next.MemMB, next.DiskGB,
@@ -845,10 +802,9 @@ func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskG
 		}
 		return nil, fmt.Errorf("resize vm %d: persist spec: %w", id, err)
 	}
-	// The persisted spec equals next (UpdateSpec succeeded with it), so the
-	// pre-built record is returned instead of re-reading the row: the
-	// handler that needs a live pass-through status re-reads via GetVM
-	// anyway, and skipping the extra query keeps the PATCH path at a single
-	// DB round-trip after the PVE-side changes.
+	// 已持久化的规格与 next 相同（UpdateSpec 以它为参数成功），因此直接返回
+	// 预构建的记录而不重新读取该行：需要实时透传状态的处理器反正会通过 GetVM
+	// 重新读取，而省掉额外查询可使 PATCH 路径在 PVE 侧变更后保持单次数据库
+	// 往返。
 	return &repository.VMWithIP{VM: next, IP: vm.IP}, nil
 }

@@ -12,19 +12,18 @@ import (
 	"spark/repository"
 )
 
-// StorageTypeService implements the business rules for storage types, the
-// metadata abstracting a PVE storage (name/display_name/pve_storage).
+// StorageTypeService 实现存储类型的业务规则；存储类型是抽象 PVE 存储的
+// 元数据（name/display_name/pve_storage）。
 type StorageTypeService struct {
 	repo *repository.StorageTypeRepository
 }
 
-// NewStorageTypeService creates a StorageTypeService backed by repo.
+// NewStorageTypeService 使用 repo 创建一个 StorageTypeService。
 func NewStorageTypeService(repo *repository.StorageTypeRepository) *StorageTypeService {
 	return &StorageTypeService{repo: repo}
 }
 
-// Create validates the fields and persists a new storage type. A duplicate
-// name is a conflict.
+// Create 校验字段并持久化一个新的存储类型。名称重复视为冲突。
 func (s *StorageTypeService) Create(ctx context.Context, name, displayName, pveStorage string) (*model.StorageType, error) {
 	if err := validateStorageType(name, displayName, pveStorage); err != nil {
 		return nil, err
@@ -39,8 +38,7 @@ func (s *StorageTypeService) Create(ctx context.Context, name, displayName, pveS
 	return st, nil
 }
 
-// List returns one page of storage types ordered by id; total is the total
-// number of storage types, independent of the page.
+// List 返回按 id 排序的一页存储类型；total 是存储类型总数，与分页无关。
 func (s *StorageTypeService) List(ctx context.Context, limit, offset int) ([]model.StorageType, int, error) {
 	types, err := s.repo.ListPage(ctx, limit, offset)
 	if err != nil {
@@ -53,7 +51,7 @@ func (s *StorageTypeService) List(ctx context.Context, limit, offset int) ([]mod
 	return types, total, nil
 }
 
-// Get returns the storage type with the given id, or a not_found error.
+// Get 返回指定 id 的存储类型，或返回 not_found 错误。
 func (s *StorageTypeService) Get(ctx context.Context, id int64) (*model.StorageType, error) {
 	st, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -65,9 +63,8 @@ func (s *StorageTypeService) Get(ctx context.Context, id int64) (*model.StorageT
 	return st, nil
 }
 
-// Update replaces the metadata of an existing storage type. Updating the
-// mapping never rewrites existing VMs: storage_types is pure metadata and VMs
-// reference the row by id, so the change only affects future provisioning.
+// Update 替换已有存储类型的元数据。更新映射不会改写已有 VM：storage_types
+// 是纯元数据，VM 按 id 引用该行，因此该变更只影响后续的供给。
 func (s *StorageTypeService) Update(ctx context.Context, id int64, name, displayName, pveStorage string) (*model.StorageType, error) {
 	if err := validateStorageType(name, displayName, pveStorage); err != nil {
 		return nil, err
@@ -85,8 +82,8 @@ func (s *StorageTypeService) Update(ctx context.Context, id int64, name, display
 	return st, nil
 }
 
-// Delete removes a storage type. Deletion is refused with a conflict while
-// any VM still references it, so existing VMs keep their mapping intact.
+// Delete 删除一个存储类型。当仍有 VM 引用它时，删除会被以冲突错误拒绝，
+// 从而保证现有 VM 的映射保持不变。
 func (s *StorageTypeService) Delete(ctx context.Context, id int64) error {
 	err := s.repo.Delete(ctx, id)
 	switch {
@@ -101,7 +98,7 @@ func (s *StorageTypeService) Delete(ctx context.Context, id int64) error {
 	}
 }
 
-// validateStorageType enforces that every field is non-empty.
+// validateStorageType 强制要求每个字段均非空。
 func validateStorageType(name, displayName, pveStorage string) error {
 	switch {
 	case strings.TrimSpace(name) == "":

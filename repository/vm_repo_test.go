@@ -8,14 +8,13 @@ import (
 	"github.com/pashagolub/pgxmock/v4"
 )
 
-// updateSpecSQL is the exact optimistic-lock statement UpdateSpec runs.
+// updateSpecSQL 是 UpdateSpec 运行的确切的乐观锁语句。
 const updateSpecSQL = "UPDATE vms SET cpu=$1, mem_mb=$2, disk_gb=$3, updated_at=now() WHERE id=$4 AND cpu=$5 AND mem_mb=$6 AND disk_gb=$7"
 
 func TestUpdateSpecOptimisticLockSuccess(t *testing.T) {
 	mock := newMockPool(t)
-	// The WHERE clause carries the old values read by the caller, so a
-	// concurrent resize cannot silently overwrite it (asserted by the exact
-	// SQL match below).
+	// WHERE 子句携带调用方读到的旧值，因此并发扩容无法静默覆盖
+	// （由下面的精确 SQL 匹配断言）。
 	mock.ExpectExec(updateSpecSQL).
 		WithArgs(4, int64(4096), int64(20), int64(1), 2, int64(2048), int64(10)).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -29,8 +28,8 @@ func TestUpdateSpecOptimisticLockSuccess(t *testing.T) {
 	}
 }
 
-// TestUpdateSpecConcurrentModificationConflict pins down the 0-rows case: a
-// spec change committed in between (or the row was deleted) -> ErrSpecConflict.
+// TestUpdateSpecConcurrentModificationConflict 钉死 0 行命中的情况：
+// 期间有规格变更提交（或行被删除）-> ErrSpecConflict。
 func TestUpdateSpecConcurrentModificationConflict(t *testing.T) {
 	mock := newMockPool(t)
 	mock.ExpectExec(updateSpecSQL).

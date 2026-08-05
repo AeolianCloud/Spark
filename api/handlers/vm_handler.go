@@ -13,27 +13,24 @@ import (
 	"spark/service"
 )
 
-// Additional API error codes for the VM lifecycle domain, following the
-// naming style of the base codes in error.go.
+// VM 生命周期域补充的 API 错误码，沿用 error.go 中基础错误码的命名风格。
 const (
-	// CodeVMNotReady: the VM has no PVE counterpart yet (provisioning not
-	// finished) or its PVE VM is gone; lifecycle operations are refused
-	// (409 — the resource exists but is not in a usable state).
+	// CodeVMNotReady：VM 还没有对应的 PVE 实体（供给尚未完成）
+	// 或其 PVE VM 已不存在；生命周期操作被拒绝
+	// （409 —— 资源存在但不在可用状态）。
 	CodeVMNotReady = "vm_not_ready"
-	// CodeDiskShrinkNotAllowed: the requested disk size is below the
-	// current one (422 — well-formed request, refused by a domain rule).
+	// CodeDiskShrinkNotAllowed：请求的磁盘大小小于当前值
+	// （422 —— 请求格式合法，但被领域规则拒绝）。
 	CodeDiskShrinkNotAllowed = "disk_shrink_not_allowed"
-	// CodeImageNotAvailableInZone: the image cannot be used in the
-	// requested zone. 400 (not 422) was chosen because the request
-	// parameters are plainly not offerable: the client asked for an
-	// image/zone combination that cannot be served, i.e. an invalid
-	// parameter set.
+	// CodeImageNotAvailableInZone：该镜像无法在请求的 zone 中使用。
+	// 选择 400（而非 422）是因为请求参数明显无法满足：客户端请求的
+	// image/zone 组合无法被提供，即参数集非法。
 	CodeImageNotAvailableInZone = "image_not_available_in_zone"
 )
 
-// mapVMServiceError maps service errors onto the unified API error
-// contract. The shared and zone/IP-pool kinds are delegated to
-// mapServiceErrorExtended; the VM domain kinds are mapped here.
+// mapVMServiceError 将 service 层错误映射为统一的 API 错误契约。
+// 共享及 zone/IP-pool 类型委托给 mapServiceErrorExtended；
+// VM 域的错误类型在这里映射。
 func mapVMServiceError(err error) error {
 	var serr *service.Error
 	if !errors.As(err, &serr) {
@@ -51,22 +48,21 @@ func mapVMServiceError(err error) error {
 	}
 }
 
-// VMHandler serves the /vms routes.
+// VMHandler 提供 /vms 路由。
 type VMHandler struct {
 	svc *service.VMService
 }
 
-// NewVMHandler creates a VMHandler backed by svc.
+// NewVMHandler 创建一个由 svc 支撑的 VMHandler。
 func NewVMHandler(svc *service.VMService) *VMHandler {
 	return &VMHandler{svc: svc}
 }
 
-// RegisterVMsRoutes mounts the VM lifecycle routes on rg. It is called by
-// the router with the /vms group. GET /vms and GET /vms/:id coexist with the
-// POST/PATCH/DELETE routes without conflict (gin keeps separate trees per
-// HTTP method). The spec-change and destroy operations follow REST method
-// semantics: PATCH /vms/:id is the partial spec update, DELETE /vms/:id the
-// destroy.
+// RegisterVMsRoutes 在 rg 上挂载 VM 生命周期路由。由 router 以 /vms
+// 分组调用。GET /vms 与 GET /vms/:id 和 POST/PATCH/DELETE 路由
+// 共存而不冲突（gin 按 HTTP 方法分别维护路由树）。规格变更与销毁
+// 操作遵循 REST 方法语义：PATCH /vms/:id 是规格的部分更新，
+// DELETE /vms/:id 是销毁。
 func RegisterVMsRoutes(rg *gin.RouterGroup, svc *service.VMService) {
 	h := NewVMHandler(svc)
 	rg.POST("", Handler(h.Create))
@@ -79,9 +75,8 @@ func RegisterVMsRoutes(rg *gin.RouterGroup, svc *service.VMService) {
 	rg.DELETE("/:id", Handler(h.Destroy))
 }
 
-// vmResponse is the public VM payload. The password is never included;
-// provision_error is omitted while empty; pve_vmid is omitted while the VM
-// has not been created on PVE yet.
+// vmResponse 是公开的 VM 负载。password 永不包含在响应中；
+// provision_error 为空时省略；VM 尚未在 PVE 上创建时省略 pve_vmid。
 type vmResponse struct {
 	ID             int64     `json:"id"`
 	UUID           string    `json:"uuid"`
@@ -101,7 +96,7 @@ type vmResponse struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
-// toVMResponse converts a repository VM row into the public payload.
+// toVMResponse 将 repository 的 VM 行转换为公开负载。
 func toVMResponse(vm *repository.VMWithIP, status string) vmResponse {
 	return vmResponse{
 		ID:             vm.VM.ID,
@@ -123,10 +118,9 @@ func toVMResponse(vm *repository.VMWithIP, status string) vmResponse {
 	}
 }
 
-// localVMStatus derives the transitional status: "creating" while the PVE
-// VM does not exist yet, "failed" when the async chain failed, otherwise
-// "ready" — a stand-in for the create response only; the list/detail/resize
-// responses carry the pass-through status read live from PVE.
+// localVMStatus 推导过渡状态：PVE VM 尚不存在时为 "creating"，
+// 异步链路失败时为 "failed"，否则为 "ready" —— 仅作为 create
+// 响应的临时值；list/detail/resize 响应携带从 PVE 实时读取的透传状态。
 func localVMStatus(vm *repository.VMWithIP) string {
 	switch {
 	case vm.VM.ProvisionError != "":
@@ -138,12 +132,11 @@ func localVMStatus(vm *repository.VMWithIP) string {
 	}
 }
 
-// vmListItem is the public pass-through VM payload (tasks 8.1/8.2): the 7.x
-// vmResponse metadata plus the live runtime portion read from PVE (design
-// D1). The spec sizes (cpu/mem_mb/disk_gb) are the local DB values requested
-// at create time; the runtime metrics (cpu_usage, mem/maxmem, disk/maxdisk in
-// bytes, uptime) come from PVE and are omitted while the VM has no PVE
-// counterpart (creating/failed) or is stopped.
+// vmListItem 是公开的透传 VM 负载（task 8.1/8.2）：7.x 的
+// vmResponse 元数据加上从 PVE 读取的实时运行部分（设计 D1）。
+// 规格大小（cpu/mem_mb/disk_gb）是创建时请求的本地 DB 值；
+// 运行指标（cpu_usage、mem/maxmem、disk/maxdisk（字节）、uptime）
+// 来自 PVE，当 VM 没有 PVE 实体（creating/failed）或处于停止状态时省略。
 type vmListItem struct {
 	vmResponse
 	CPUUsage float64 `json:"cpu_usage,omitempty"`
@@ -154,14 +147,14 @@ type vmListItem struct {
 	Uptime   int64   `json:"uptime,omitempty"`
 }
 
-// nodeWarning is one partial-failure notice of GET /vms: a node whose live
-// query failed, so its VMs are absent from the list (task 8.3).
+// nodeWarning 是 GET /vms 的部分失败通知：实时查询失败的节点，
+// 其 VM 不会出现在列表中（task 8.3）。
 type nodeWarning struct {
 	Node  string `json:"node"`
 	Error string `json:"error"`
 }
 
-// toVMListItem converts a merged service item into the public payload.
+// toVMListItem 将合并后的 service 条目转换为公开负载。
 func toVMListItem(item *service.VMListItem) vmListItem {
 	out := vmListItem{vmResponse: toVMResponse(&item.VM, item.Status)}
 	if item.Live != nil {
@@ -175,11 +168,10 @@ func toVMListItem(item *service.VMListItem) vmListItem {
 	return out
 }
 
-// List handles GET /vms: one PVE call per enabled node merged with the
-// local metadata page (8.1). The page is selected by the shared limit/offset
-// query parameters and the X-Total-Count header reports the total number of
-// local VM rows. Failed nodes are reported in warnings (8.3); warnings is
-// always an array (empty when every node answered).
+// List 处理 GET /vms：对每个启用节点各发起一次 PVE 调用，并与
+// 本地元数据分页合并（8.1）。分页由共享的 limit/offset 查询参数
+// 选择，X-Total-Count 头报告本地 VM 行的总数。失败的节点在
+// warnings 中报告（8.3）；warnings 始终是数组（所有节点都响应时为空）。
 func (h *VMHandler) List(c *gin.Context) error {
 	limit, offset, err := parsePagination(c)
 	if err != nil {
@@ -202,9 +194,8 @@ func (h *VMHandler) List(c *gin.Context) error {
 	return nil
 }
 
-// Get handles GET /vms/:id: the local metadata plus the live status
-// pass-through (8.2). A node failure answers 503 node_unavailable instead of
-// a fake creating status (8.3).
+// Get 处理 GET /vms/:id：本地元数据加实时状态透传（8.2）。
+// 节点故障时返回 503 node_unavailable，而不是伪造 creating 状态（8.3）。
 func (h *VMHandler) Get(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -218,10 +209,9 @@ func (h *VMHandler) Get(c *gin.Context) error {
 	return nil
 }
 
-// Create handles POST /vms: validates the request, allocates an IP,
-// persists the record, triggers the detached provisioning chain and answers
-// 201 with the VM — the plaintext IP is included, the password is never
-// echoed.
+// Create 处理 POST /vms：校验请求、分配 IP、持久化记录、
+// 触发分离的供给链路，并以 201 返回 VM —— 包含明文 IP，
+// password 永不回显。
 func (h *VMHandler) Create(c *gin.Context) error {
 	var req service.CreateVMRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -232,17 +222,16 @@ func (h *VMHandler) Create(c *gin.Context) error {
 		return mapVMServiceError(err)
 	}
 	c.Header("Location", fmt.Sprintf("/vms/%d", vm.VM.ID))
-	// The chain runs detached and has not finished here, so the status is
-	// always "creating" — PVE does not have this VM yet.
+	// 供给链路是分离运行的，到这里还未完成，因此状态始终是
+	// "creating" —— PVE 还没有这个 VM。
 	c.JSON(http.StatusCreated, toVMResponse(vm, localVMStatus(vm)))
 	return nil
 }
 
-// Start handles POST /vms/:id/start. 202 + {accepted: true} was chosen over
-// returning the PVE task ID: the operation is dispatched asynchronously and
-// the client has no task-polling endpoint — the VM's real state is read
-// pass-through (batch 8). The Location header points at the pass-through
-// status endpoint GET /vms/:id, where the client can observe the outcome.
+// Start 处理 POST /vms/:id/start。选择 202 + {accepted: true} 而非
+// 返回 PVE 任务 ID：该操作是异步分发的，客户端没有任务轮询端点 ——
+// VM 的真实状态通过透传读取（batch 8）。Location 头指向透传状态端点
+// GET /vms/:id，客户端可在那里观察结果。
 func (h *VMHandler) Start(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -256,9 +245,8 @@ func (h *VMHandler) Start(c *gin.Context) error {
 	return nil
 }
 
-// Stop handles POST /vms/:id/stop (clean ACPI shutdown; see
-// VMService.Stop). The Location header points at the pass-through status
-// endpoint GET /vms/:id.
+// Stop 处理 POST /vms/:id/stop（干净的 ACPI 关机；见
+// VMService.Stop）。Location 头指向透传状态端点 GET /vms/:id。
 func (h *VMHandler) Stop(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -272,8 +260,8 @@ func (h *VMHandler) Stop(c *gin.Context) error {
 	return nil
 }
 
-// Restart handles POST /vms/:id/restart. The Location header points at the
-// pass-through status endpoint GET /vms/:id.
+// Restart 处理 POST /vms/:id/restart。Location 头指向透传状态
+// 端点 GET /vms/:id。
 func (h *VMHandler) Restart(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -287,12 +275,11 @@ func (h *VMHandler) Restart(c *gin.Context) error {
 	return nil
 }
 
-// Destroy handles DELETE /vms/:id. The operation is synchronous (the PVE
-// destroy task is waited on) and answers 204 with no body on success. The
-// DELETE idempotency semantics live in the service layer and are unchanged:
-// a VM row that does not exist yields 404 not_found before any PVE call,
-// while a PVE-side 404 (the VM was already removed on the node) is treated
-// as "already destroyed" and only the local cleanup runs.
+// Destroy 处理 DELETE /vms/:id。该操作是同步的（等待 PVE 销毁任务完成），
+// 成功时返回无响应体的 204。DELETE 的幂等语义位于 service 层且保持不变：
+// 不存在的 VM 行在任何 PVE 调用之前就返回 404 not_found；
+// 而 PVE 侧的 404（VM 已在节点上被移除）被视为"已销毁"，
+// 仅执行本地清理。
 func (h *VMHandler) Destroy(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -305,21 +292,20 @@ func (h *VMHandler) Destroy(c *gin.Context) error {
 	return nil
 }
 
-// resizeRequest is the body of PATCH /vms/:id; every field is optional, at
-// least one must be set. Absent fields keep their current values.
+// resizeRequest 是 PATCH /vms/:id 的请求体；每个字段都可选，
+// 至少一个必须设置。未出现的字段保持当前值。
 type resizeRequest struct {
 	CPU    *int   `json:"cpu"`
 	MemMB  *int64 `json:"mem_mb"`
 	DiskGB *int64 `json:"disk_gb"`
 }
 
-// Resize handles PATCH /vms/:id: a partial update of the VM spec. Only the
-// fields present in the {cpu?, mem_mb?, disk_gb?} body are applied; a
-// missing or null field keeps its current value (PVE first, then the local
-// row). It returns the VM with its real, pass-through status: after
-// the spec change is applied the live status is re-read from PVE (GetVM),
-// so the response reflects the actual VM state rather than a stand-in — the
-// same shape as GET /vms/:id.
+// Resize 处理 PATCH /vms/:id：对 VM 规格的部分更新。只应用请求体
+// {cpu?, mem_mb?, disk_gb?} 中出现的字段；缺失或为 null 的字段
+// 保持当前值（先改 PVE，再改本地行）。返回的 VM 携带真实透传状态：
+// 规格变更应用后，从 PVE 重新读取实时状态（GetVM），
+// 因此响应反映的是 VM 的实际状态而非临时值 ——
+// 与 GET /vms/:id 结构相同。
 func (h *VMHandler) Resize(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {

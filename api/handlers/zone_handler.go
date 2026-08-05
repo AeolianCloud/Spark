@@ -12,16 +12,15 @@ import (
 	"spark/service"
 )
 
-// Additional API error codes for the zone/node and IP pool domains, following
-// the naming style of the base codes in error.go.
+// zone/node 与 IP pool 域补充的 API 错误码，沿用 error.go 中基础错误码的命名风格。
 const (
 	CodeNodeUnavailable = "node_unavailable"
 	CodeIPExhausted     = "ip_exhausted"
 )
 
-// mapServiceErrorExtended maps service errors onto the unified API error
-// contract. The shared kinds (bad_request/not_found/conflict) are delegated
-// to mapServiceError; the zone/IP-pool domain kinds are mapped here.
+// mapServiceErrorExtended 将 service 层错误映射为统一的 API 错误契约。
+// 共享的错误类型（bad_request/not_found/conflict）委托给
+// mapServiceError；zone/IP-pool 域的错误类型在这里映射。
 func mapServiceErrorExtended(err error) error {
 	var serr *service.Error
 	if !errors.As(err, &serr) {
@@ -37,19 +36,19 @@ func mapServiceErrorExtended(err error) error {
 	}
 }
 
-// ZoneHandler serves the /zones and /nodes routes.
+// ZoneHandler 提供 /zones 和 /nodes 路由。
 type ZoneHandler struct {
 	svc *service.ZoneService
 }
 
-// NewZoneHandler creates a ZoneHandler backed by svc.
+// NewZoneHandler 创建一个由 svc 支撑的 ZoneHandler。
 func NewZoneHandler(svc *service.ZoneService) *ZoneHandler {
 	return &ZoneHandler{svc: svc}
 }
 
-// RegisterZonesRoutes mounts the zone and node routes. zonesGroup is the
-// /zones group; nodesGroup the /nodes group (PUT /nodes/:id lives outside
-// /zones). It is called by the router with both groups.
+// RegisterZonesRoutes 挂载 zone 和 node 路由。zonesGroup 是 /zones 分组；
+// nodesGroup 是 /nodes 分组（PUT /nodes/:id 位于 /zones 之外）。
+// 由 router 同时传入两个分组调用。
 func RegisterZonesRoutes(zonesGroup, nodesGroup *gin.RouterGroup, svc *service.ZoneService) {
 	h := NewZoneHandler(svc)
 	zonesGroup.POST("", Handler(h.CreateZone))
@@ -59,8 +58,7 @@ func RegisterZonesRoutes(zonesGroup, nodesGroup *gin.RouterGroup, svc *service.Z
 	nodesGroup.PUT("/:id", Handler(h.UpdateNode))
 }
 
-// zoneResponse is the public zone payload; nodes is never omitted so the
-// shape is stable between create and list.
+// zoneResponse 是公开的 zone 负载；nodes 永不省略，使 create 与 list 之间的结构保持稳定。
 type zoneResponse struct {
 	ID        int64          `json:"id"`
 	Name      string         `json:"name"`
@@ -68,9 +66,9 @@ type zoneResponse struct {
 	Nodes     []nodeResponse `json:"nodes"`
 }
 
-// nodeResponse is the public node payload. The API token is never included;
-// api_token_set reports whether a token is stored (always true after create,
-// and on update whether the token was replaced).
+// nodeResponse 是公开的 node 负载。API token 永不包含在响应中；
+// api_token_set 报告是否存有 token（create 之后恒为 true，
+// update 时则表示 token 是否被替换）。
 type nodeResponse struct {
 	ID          int64     `json:"id"`
 	ZoneID      int64     `json:"zone_id"`
@@ -98,7 +96,7 @@ func toNodeResponse(n model.PVENode, apiTokenSet bool) nodeResponse {
 	}
 }
 
-// CreateZone handles POST /zones.
+// CreateZone 处理 POST /zones。
 func (h *ZoneHandler) CreateZone(c *gin.Context) error {
 	var req struct {
 		Name string `json:"name"`
@@ -117,9 +115,9 @@ func (h *ZoneHandler) CreateZone(c *gin.Context) error {
 	return nil
 }
 
-// ListZones handles GET /zones: one page of zones (shared limit/offset
-// query parameters), each with its full node list; X-Total-Count carries
-// the total number of zones.
+// ListZones 处理 GET /zones：一页 zones（共享的 limit/offset
+// 查询参数），每个 zone 携带完整的 node 列表；X-Total-Count 携带
+// zone 的总数。
 func (h *ZoneHandler) ListZones(c *gin.Context) error {
 	limit, offset, err := parsePagination(c)
 	if err != nil {
@@ -138,8 +136,8 @@ func (h *ZoneHandler) ListZones(c *gin.Context) error {
 	return nil
 }
 
-// nodeRequest is the create/update node body. api_token is optional on
-// update (an empty value keeps the stored secret); enabled defaults to true.
+// nodeRequest 是创建/更新 node 的请求体。api_token 在更新时可选
+// （空值表示保留已存储的密钥）；enabled 默认为 true。
 type nodeRequest struct {
 	Name     string `json:"name"`
 	Host     string `json:"host"`
@@ -148,7 +146,7 @@ type nodeRequest struct {
 	Enabled  *bool  `json:"enabled"`
 }
 
-// CreateNode handles POST /zones/:zone_id/nodes.
+// CreateNode 处理 POST /zones/:zone_id/nodes。
 func (h *ZoneHandler) CreateNode(c *gin.Context) error {
 	zoneID, err := parseIDParam(c, "zone_id")
 	if err != nil {
@@ -167,7 +165,7 @@ func (h *ZoneHandler) CreateNode(c *gin.Context) error {
 	return nil
 }
 
-// ListNodesByZone handles GET /zones/:zone_id/nodes.
+// ListNodesByZone 处理 GET /zones/:zone_id/nodes。
 func (h *ZoneHandler) ListNodesByZone(c *gin.Context) error {
 	zoneID, err := parseIDParam(c, "zone_id")
 	if err != nil {
@@ -185,7 +183,7 @@ func (h *ZoneHandler) ListNodesByZone(c *gin.Context) error {
 	return nil
 }
 
-// UpdateNode handles PUT /nodes/:id.
+// UpdateNode 处理 PUT /nodes/:id。
 func (h *ZoneHandler) UpdateNode(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {

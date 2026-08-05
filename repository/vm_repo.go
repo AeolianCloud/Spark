@@ -8,44 +8,40 @@ import (
 	"spark/model"
 )
 
-// VMWithIP pairs a VM row with the plaintext IP of its allocated address
-// ("" when the VM has no address). The live status is never stored
-// (pass-through, design D1).
+// VMWithIP 将 VM 行与其已分配地址的明文 IP 配对
+// （VM 没有地址时为 ""）。实时状态从不落库（透传，设计 D1）。
 //
-// vms.pve_vmid is NOT NULL, so the zero value doubles as the "not created on
-// PVE yet" sentinel: the DB row is written before the provisioning chain
-// assigns the PVE VMID, and a zero pve_vmid means the VM is still creating
-// or failed provisioning.
+// vms.pve_vmid 为 NOT NULL，因此零值兼任"尚未在 PVE 上创建"的哨兵：
+// 数据库行在供给链路分配 PVE VMID 之前写入，pve_vmid 为零表示 VM
+// 仍在创建中或供给失败。
 type VMWithIP struct {
 	VM model.VM
 	IP string
 }
 
-// VMRepository persists model.VM rows. The IP-allocation transaction flow
-// (INSERT vms -> claim ip -> set vms.ip_id) is orchestrated by the VM
-// service; this repository provides the Tx-aware steps per the migration
-// 0002 header conventions.
+// VMRepository 负责持久化 model.VM 行。IP 分配事务流程
+// （INSERT vms -> 领取 ip -> 设置 vms.ip_id）由 VM 服务编排；
+// 本仓库按照 migration 0002 头部的约定提供基于事务的步骤。
 type VMRepository struct {
 	pool pgxQuerier
 }
 
-// NewVMRepository creates a VMRepository backed by pool.
+// NewVMRepository 创建由 pool 支撑的 VMRepository。
 func NewVMRepository(pool pgxQuerier) *VMRepository {
 	return &VMRepository{pool: pool}
 }
 
-// vmCols is the vms column list used by the insert RETURNING and the read
-// queries. Every column is table-qualified: GetVM/ListVMs join vms against
-// ips, and a bare "id" would be ambiguous (SQLSTATE 42702). provision_error
-// is nullable (migration 0004 added it without a default), so it is scanned
-// with COALESCE: a NULL row must read as "" and cannot fail the scan into a
-// plain string. Table-qualified names are valid in INSERT ... RETURNING.
+// vmCols 是 INSERT RETURNING 与读取查询使用的 vms 列清单。每一列
+// 都带表限定名：GetVM/ListVMs 会将 vms 与 ips 做 JOIN，裸的 "id"
+// 会产生歧义（SQLSTATE 42702）。provision_error 可为 NULL
+// （migration 0004 添加时未带默认值），因此使用 COALESCE 扫描：
+// NULL 行必须读作 "" 而不能让扫描到普通 string 失败。
+// 带表限定名的列在 INSERT ... RETURNING 中合法。
 const vmCols = "vms.id, vms.uuid, vms.name, vms.zone_id, vms.node_id, vms.pve_vmid, vms.image_id, vms.storage_type_id, vms.cpu, vms.mem_mb, vms.disk_gb, vms.ip_id, vms.password_encrypted, COALESCE(vms.provision_error, '') AS provision_error, vms.created_at, vms.updated_at"
 
-// CreateVMTx inserts the VM row inside the caller's transaction with ip_id
-// NULL and pve_vmid zero (step 1 of the migration 0002 allocation flow: the
-// FK cycle forces ip_id to be written after the ips claim). The created row
-// is returned with id and timestamps filled.
+// CreateVMTx 在调用方的事务内以 ip_id 为 NULL、pve_vmid 为零插入 VM 行
+// （migration 0002 分配流程的第 1 步：FK 环要求 ip_id 在 ips 领取之后
+// 写入）。返回创建的行，已填充 id 与时间戳。
 func (r *VMRepository) CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error) {
 	var created model.VM
 	err := tx.QueryRow(ctx,
@@ -63,8 +59,8 @@ func (r *VMRepository) CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (
 	return &created, nil
 }
 
-// SetVMIPIDTx links the claimed address to the VM row inside the caller's
-// transaction (step 3 of the migration 0002 allocation flow).
+// SetVMIPIDTx 在调用方的事务内把已领取的地址关联到 VM 行
+// （migration 0002 分配流程的第 3 步）。
 func (r *VMRepository) SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error {
 	if _, err := tx.Exec(ctx, "UPDATE vms SET ip_id=$1, updated_at=now() WHERE id=$2", ipID, id); err != nil {
 		return err
@@ -72,9 +68,9 @@ func (r *VMRepository) SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int6
 	return nil
 }
 
-// GetVM returns the VM with the given id joined with its plaintext IP, or
-// pgx.ErrNoRows when absent. The LEFT JOIN keeps VMs without an allocated
-// address readable (defensive; every v1 VM is created with an IP).
+// GetVM 返回指定 id 的 VM 及其明文 IP 的 JOIN 结果；不存在时返回
+// pgx.ErrNoRows。LEFT JOIN 保证没有分配地址的 VM 仍可读取
+// （防御性写法；v1 中每个 VM 创建时都会分配 IP）。
 func (r *VMRepository) GetVM(ctx context.Context, id int64) (*VMWithIP, error) {
 	var v model.VM
 	var ip string
@@ -89,10 +85,9 @@ func (r *VMRepository) GetVM(ctx context.Context, id int64) (*VMWithIP, error) {
 	return &VMWithIP{VM: v, IP: ip}, nil
 }
 
-// ListVMs returns every VM row with its plaintext IP ("" when the VM has no
-// address), ordered by id. It feeds the pass-through list query (task 8.1):
-// the merge with the live PVE state happens in the service layer and is
-// never stored (design D1).
+// ListVMs 返回带明文 IP 的每一行 VM（VM 没有地址时为 ""），按 id
+// 排序。它服务于透传式列表查询（任务 8.1）：与 PVE 实时状态的合并
+// 发生在服务层，永不落库（设计 D1）。
 func (r *VMRepository) ListVMs(ctx context.Context) ([]VMWithIP, error) {
 	rows, err := r.pool.Query(ctx,
 		"SELECT "+vmCols+", COALESCE(ips.ip, '') FROM vms LEFT JOIN ips ON ips.id = vms.ip_id ORDER BY vms.id")
@@ -118,10 +113,9 @@ func (r *VMRepository) ListVMs(ctx context.Context) ([]VMWithIP, error) {
 	return out, nil
 }
 
-// ListVMsPage returns one page of VM rows ordered by id. It feeds the
-// paginated pass-through list: LIMIT/OFFSET apply to the local metadata,
-// and the PVE merge only runs on the page's rows (at most maxPageLimit rows
-// per node call in the worst case).
+// ListVMsPage 返回按 id 排序的一页 VM 行。它服务于分页的透传式
+// 列表：LIMIT/OFFSET 作用于本地元数据，PVE 合并只在该页的行上执行
+// （最坏情况下每次节点调用最多 maxPageLimit 行）。
 func (r *VMRepository) ListVMsPage(ctx context.Context, limit, offset int) ([]VMWithIP, error) {
 	rows, err := r.pool.Query(ctx,
 		"SELECT "+vmCols+", COALESCE(ips.ip, '') FROM vms LEFT JOIN ips ON ips.id = vms.ip_id ORDER BY vms.id LIMIT $1 OFFSET $2",
@@ -148,10 +142,9 @@ func (r *VMRepository) ListVMsPage(ctx context.Context, limit, offset int) ([]VM
 	return out, nil
 }
 
-// CountVMs returns the total number of VM rows, backing the X-Total-Count
-// header of GET /vms. It counts local metadata only: the pass-through merge
-// can drop rows of failed nodes, so the total may exceed the page's item
-// count (the reported total is deliberately the full local count).
+// CountVMs 返回 VM 行总数，支撑 GET /vms 的 X-Total-Count 响应头。
+// 只统计本地元数据：透传式合并可能丢弃故障节点的行，因此总数可能
+// 超过该页的条目数（上报的总数刻意采用完整的本地统计）。
 func (r *VMRepository) CountVMs(ctx context.Context) (int, error) {
 	var n int
 	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM vms").Scan(&n); err != nil {
@@ -160,10 +153,9 @@ func (r *VMRepository) CountVMs(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// UpdateVMPVEVMID records the PVE VMID assigned by the provisioning chain
-// and syncs the actual disk size (which may be the imported image's size
-// when no resize was needed); a successful provision clears any
-// provision_error.
+// UpdateVMPVEVMID 记录供给链路分配的 PVE VMID，并同步实际磁盘大小
+// （无需扩容时可能为导入镜像的大小）；供给成功会清除任何
+// provision_error。
 func (r *VMRepository) UpdateVMPVEVMID(ctx context.Context, id, vmid, diskGB int64) error {
 	tag, err := r.pool.Exec(ctx,
 		"UPDATE vms SET pve_vmid=$1, disk_gb=$2, provision_error=NULL, updated_at=now() WHERE id=$3",
@@ -177,9 +169,8 @@ func (r *VMRepository) UpdateVMPVEVMID(ctx context.Context, id, vmid, diskGB int
 	return nil
 }
 
-// SetProvisionError persists the sanitized provisioning failure message. The
-// VM keeps its IP and its zero pve_vmid so operators can inspect the row
-// (design D5: no automatic retry or rollback in v1).
+// SetProvisionError 持久化经过净化的供给失败信息。VM 保留其 IP 与
+// 零值 pve_vmid，便于运维检查该行（设计 D5：v1 不做自动重试或回滚）。
 func (r *VMRepository) SetProvisionError(ctx context.Context, id int64, message string) error {
 	tag, err := r.pool.Exec(ctx,
 		"UPDATE vms SET provision_error=$1, updated_at=now() WHERE id=$2", message, id)
@@ -192,12 +183,10 @@ func (r *VMRepository) SetProvisionError(ctx context.Context, id int64, message 
 	return nil
 }
 
-// UpdateSpec applies a full spec change to the vms row with an optimistic
-// lock: the WHERE clause re-checks the spec values the caller read before
-// applying the change (old values), so a concurrent resize that committed in
-// between yields ErrSpecConflict and the caller can retry. A row that
-// vanished entirely (destroyed while the PVE-side change was applied) is
-// indistinguishable from a spec race and is also reported as ErrSpecConflict.
+// UpdateSpec 以乐观锁对 vms 行应用完整的规格变更：WHERE 子句重新检查
+// 调用方在变更前读到的规格值（旧值），因此期间并发提交的扩容会产生
+// ErrSpecConflict，调用方可重试。行整体消失的情况（在 PVE 侧变更应用
+// 期间被销毁）与规格竞争无法区分，同样报告为 ErrSpecConflict。
 func (r *VMRepository) UpdateSpec(ctx context.Context, id int64, newCPU int, newMemMB, newDiskGB int64, oldCPU int, oldMemMB, oldDiskGB int64) error {
 	tag, err := r.pool.Exec(ctx,
 		"UPDATE vms SET cpu=$1, mem_mb=$2, disk_gb=$3, updated_at=now() WHERE id=$4 AND cpu=$5 AND mem_mb=$6 AND disk_gb=$7",
@@ -211,10 +200,10 @@ func (r *VMRepository) UpdateSpec(ctx context.Context, id int64, newCPU int, new
 	return nil
 }
 
-// DeleteVMTx deletes the vms row inside the caller's transaction. Per the
-// migration 0002 conventions the caller must release the VM's IP (see
-// IPPoolRepository.ReleaseIPByVMTx) in the same transaction and BEFORE this
-// delete, so a freed address never ends up with status='used' and no owner.
+// DeleteVMTx 在调用方的事务内删除 vms 行。按照 migration 0002 的约定，
+// 调用方必须在此删除之前的同一事务内释放 VM 的 IP（见
+// IPPoolRepository.ReleaseIPByVMTx），这样被释放的地址永远不会以
+// status='used' 且无归属者的状态留存。
 func (r *VMRepository) DeleteVMTx(ctx context.Context, tx pgx.Tx, id int64) error {
 	tag, err := tx.Exec(ctx, "DELETE FROM vms WHERE id=$1", id)
 	if err != nil {

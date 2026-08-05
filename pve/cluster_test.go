@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// TestNextVMID verifies the request shape and the string->int conversion of
-// GET /cluster/nextid (PVE returns the candidate as a JSON string).
+// TestNextVMID 验证 GET /cluster/nextid 的请求形态以及 string->int 的
+// 转换（PVE 以 JSON 字符串返回候选值）。
 func TestNextVMID(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -28,7 +28,7 @@ func TestNextVMID(t *testing.T) {
 	}
 }
 
-// TestNextVMIDNonInteger surfaces PVE answering a non-numeric candidate.
+// TestNextVMIDNonInteger 呈现 PVE 返回非数字候选值的情况。
 func TestNextVMIDNonInteger(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": "not-a-vmid"}`)
@@ -38,7 +38,7 @@ func TestNextVMIDNonInteger(t *testing.T) {
 	}
 }
 
-// TestNextVMIDEmptyData covers a null/empty data payload.
+// TestNextVMIDEmptyData 覆盖 null/空的 data 负载。
 func TestNextVMIDEmptyData(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": null}`)

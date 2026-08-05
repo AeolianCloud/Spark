@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// newPaginationTestCtx builds a gin context carrying the given query string.
+// newPaginationTestCtx 构建一个携带给定查询字符串的 gin context。
 func newPaginationTestCtx(t *testing.T, query string) *gin.Context {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -18,8 +18,7 @@ func newPaginationTestCtx(t *testing.T, query string) *gin.Context {
 	return c
 }
 
-// TestParsePaginationDefaults covers the bare endpoint call: no query
-// parameters at all.
+// TestParsePaginationDefaults 覆盖裸端点调用：没有任何查询参数。
 func TestParsePaginationDefaults(t *testing.T) {
 	limit, offset, err := parsePagination(newPaginationTestCtx(t, ""))
 	if err != nil {
@@ -30,8 +29,8 @@ func TestParsePaginationDefaults(t *testing.T) {
 	}
 }
 
-// TestParsePaginationCap verifies the DoS cap: an oversized limit is
-// truncated to maxPageLimit instead of being rejected.
+// TestParsePaginationCap 验证 DoS 上限：过大的 limit 被截断为
+// maxPageLimit 而不是被拒绝。
 func TestParsePaginationCap(t *testing.T) {
 	limit, offset, err := parsePagination(newPaginationTestCtx(t, "limit=5000&offset=40"))
 	if err != nil {
@@ -42,8 +41,8 @@ func TestParsePaginationCap(t *testing.T) {
 	}
 }
 
-// TestParsePaginationRejectsInvalid pins down the 400 cases: negative or
-// non-numeric limit/offset values.
+// TestParsePaginationRejectsInvalid 固定 400 的情形：负数或
+// 非数值的 limit/offset。
 func TestParsePaginationRejectsInvalid(t *testing.T) {
 	for _, query := range []string{
 		"limit=-1",
@@ -56,7 +55,7 @@ func TestParsePaginationRejectsInvalid(t *testing.T) {
 			t.Errorf("query %q: want an error", query)
 		}
 	}
-	// A limit of 0 is a legal (empty) page, not an error.
+	// limit 为 0 是合法的（空）分页，而非错误。
 	if _, _, err := parsePagination(newPaginationTestCtx(t, "limit=0")); err != nil {
 		t.Fatalf("limit=0: %v, want nil", err)
 	}

@@ -18,26 +18,24 @@ import (
 )
 
 const (
-	// defaultPort is the Proxmox VE management API port.
+	// defaultPort 是 Proxmox VE 管理 API 端口。
 	defaultPort = 8006
-	// defaultBasePath is the API2 JSON endpoint prefix.
+	// defaultBasePath 是 API2 JSON 端点前缀。
 	defaultBasePath = "api2/json"
-	// defaultTimeout bounds a single HTTP request.
+	// defaultTimeout 限制单个 HTTP 请求的时长。
 	defaultTimeout = 30 * time.Second
-	// maxResponseSize caps how much of a PVE response body we read.
+	// maxResponseSize 限制我们读取的 PVE 响应体的最大字节数。
 	maxResponseSize = 1 << 20 // 1 MiB
 
-	// pveDefaultTLSInsecure documents the default TLS posture: PVE nodes
-	// ship with self-signed certificates out of the box, so the client
-	// skips certificate verification unless tightened via WithCAFile or
-	// WithInsecure(false).
+	// pveDefaultTLSInsecure 说明默认的 TLS 姿态：PVE 节点出厂自带自签名
+	// 证书，因此客户端默认跳过证书校验，除非通过 WithCAFile 或
+	// WithInsecure(false) 收紧。
 	pveDefaultTLSInsecure = true
 )
 
-// Client talks to a single Proxmox VE node over its JSON API2
-// (https://{host}:8006/api2/json). It authenticates with an API token and is
-// deliberately bound to one node: every higher-level operation addresses the
-// node explicitly, which matches the multi-node design of the service.
+// Client 通过 JSON API2 (https://{host}:8006/api2/json) 与单个 Proxmox VE
+// 节点通信。它使用 API 令牌认证，并有意地绑定到单个节点：所有上层操作都
+// 显式指定节点，这与服务的多节点设计相匹配。
 type Client struct {
 	baseURL    string
 	authHeader string
@@ -45,25 +43,23 @@ type Client struct {
 	initErr    error
 }
 
-// Option customizes a Client before it is first used. Options are applied in
-// order; an Option that fails (for example a missing CA file) is recorded and
-// surfaced as an error on the first request instead of being ignored.
+// Option 在 Client 首次使用前对其进行定制。Options 按顺序应用；失败的
+// Option（例如 CA 文件缺失）会被记录下来，并在首次请求时以错误形式呈现，
+// 而不是被忽略。
 type Option func(*Client) error
 
-// NewClient builds a PVE API client for host (IP or hostname, no scheme) with
-// the credentials stored on a pve_nodes row. A ":port" suffix on host is
-// stripped so the base URL never ends up with a duplicated port
-// ("https://host:8006:8006/..."); callers that need a custom port use
-// WithBaseURL. IPv6 literal hosts are not supported and fail explicitly. The
-// API token forms accepted for apiTokenSecret are:
+// NewClient 为 host（IP 或主机名，不带 scheme）构建 PVE API 客户端，凭证
+// 取自 pve_nodes 表的一行记录。host 上的 ":port" 后缀会被剥离，确保 base
+// URL 不会出现重复端口（"https://host:8006:8006/..."）；需要自定义端口的
+// 调用方请使用 WithBaseURL。不支持 IPv6 字面量主机，会显式报错。apiTokenSecret
+// 可接受的 API 令牌形式有：
 //
 //	"root@pam",            "spark=<secret>"         -> root@pam!spark=<secret>
 //	"root@pam",            "root@pam!spark=<secret>"-> root@pam!spark=<secret>
 //	"root@pam!spark",      "<secret>"               -> root@pam!spark=<secret>
 //
-// i.e. the token ID and secret may be split across the two arguments in any
-// of the three combinations; the Authorization header is always normalized to
-// the canonical form PVEAPIToken=<user>!<tokenid>=<secret>.
+// 即令牌 ID 与密钥可以三种组合方式拆分到两个参数中；Authorization 头始终
+// 规范化为 PVEAPIToken=<user>!<tokenid>=<secret> 形式。
 func NewClient(host, apiUser, apiTokenSecret string, opts ...Option) *Client {
 	host = strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(host), "https://"), "http://"), "/")
 	host, hostErr := stripHostPort(host)
@@ -83,9 +79,9 @@ func NewClient(host, apiUser, apiTokenSecret string, opts ...Option) *Client {
 		c.initErr = fmt.Errorf("pve: NewClient: empty host")
 	}
 	if !isValidAuthHeader(c.authHeader) {
-		// The error must never echo the raw credentials (apiUser or the
-		// token secret): it only carries the host and a redacted user
-		// prefix, so logs and client-visible errors cannot leak secrets.
+		// 该错误绝不能回显原始凭证（apiUser 或令牌密钥）：它只携带
+		// 主机名和一个脱敏后的用户前缀，这样日志和客户端可见的错误
+		// 就不会泄露机密。
 		c.initErr = fmt.Errorf("pve: NewClient(host=%q, api_user=%s): cannot build API token header: need a token ID and a secret", host, redactAPIUser(apiUser))
 	}
 	for _, opt := range opts {
@@ -96,9 +92,9 @@ func NewClient(host, apiUser, apiTokenSecret string, opts ...Option) *Client {
 	return c
 }
 
-// redactAPIUser returns a log-safe form of the API user for diagnostics: the
-// identity part before any "!tokenid" suffix is kept, the token ID is masked.
-// An empty input renders as "<empty>" so the message stays unambiguous.
+// redactAPIUser 返回用于诊断的 API 用户日志安全形式：保留任何
+// "!tokenid" 后缀之前的主体部分，令牌 ID 被掩码处理。空输入渲染为
+// "<empty>"，以保证消息无歧义。
 func redactAPIUser(apiUser string) string {
 	if i := strings.Index(apiUser, "!"); i >= 0 {
 		apiUser = apiUser[:i]
@@ -109,10 +105,10 @@ func redactAPIUser(apiUser string) string {
 	return apiUser + "!***"
 }
 
-// buildAuthHeader normalizes the credential to PVEAPIToken=<user>!<tokenid>=<secret>.
-// A secret is treated as the full "user!tokenid=secret" form only when it has
-// the three-segment structure (a "!" followed by a "="); a split-form secret
-// that merely contains "!" (e.g. "spark=uuid!x") is not misclassified.
+// buildAuthHeader 将凭证规范化为 PVEAPIToken=<user>!<tokenid>=<secret>。
+// 只有 secret 具有三段式结构（"!" 后跟 "="）时才被视为完整的
+// "user!tokenid=secret" 形式；仅包含 "!" 的拆分形式 secret
+// （例如 "spark=uuid!x"）不会被误判。
 func buildAuthHeader(apiUser, apiTokenSecret string) string {
 	user, tokenID := apiUser, ""
 	if i := strings.Index(apiUser, "!"); i >= 0 {
@@ -120,8 +116,8 @@ func buildAuthHeader(apiUser, apiTokenSecret string) string {
 	}
 	rest := apiTokenSecret
 	if i := strings.Index(rest, "!"); i >= 0 {
-		// Full "user!tokenid=secret" form already carries the user. The
-		// "=" must come after the "!", otherwise "!" is part of a secret.
+		// 完整的 "user!tokenid=secret" 形式已携带用户。"=" 必须位于 "!"
+		// 之后，否则 "!" 只是密钥的一部分。
 		if j := strings.Index(rest, "="); j > i {
 			return "PVEAPIToken=" + rest
 		}
@@ -133,13 +129,11 @@ func buildAuthHeader(apiUser, apiTokenSecret string) string {
 	return "PVEAPIToken=" + user + "!" + tokenID + "=" + rest
 }
 
-// stripHostPort removes a ":port" suffix from host. baseURL appends the
-// default port itself, so keeping the port would produce
-// "https://host:8006:8006/...". The single-colon "host:port" form is
-// stripped, including an empty port ("host:"); a non-numeric suffix (such as
-// a hostname in "host:name") passes through unchanged. Hosts with more than
-// one colon are IPv6 literals, which are not supported (the base URL is
-// always "https://{host}:8006"), so they fail with an explicit error.
+// stripHostPort 从 host 中移除 ":port" 后缀。baseURL 自身会拼接默认端口，
+// 因此保留端口会产生 "https://host:8006:8006/..."。单冒号的 "host:port"
+// 形式会被剥离，包括空端口（"host:"）；非数字后缀（例如 "host:name" 中的
+// 主机名）会原样保留。含多个冒号的主机是 IPv6 字面量，不受支持（base URL
+// 始终是 "https://{host}:8006"），因此会返回显式错误。
 func stripHostPort(host string) (string, error) {
 	if strings.Count(host, ":") > 1 {
 		return "", fmt.Errorf("pve: NewClient: IPv6 host %q is not supported", host)
@@ -157,8 +151,8 @@ func stripHostPort(host string) (string, error) {
 	return host[:i], nil
 }
 
-// isValidAuthHeader checks that the header has the shape
-// PVEAPIToken=<user>!<tokenid>=<secret> with a non-empty token ID and secret.
+// isValidAuthHeader 检查头部是否符合 PVEAPIToken=<user>!<tokenid>=<secret>
+// 的形式，且令牌 ID 与密钥均非空。
 func isValidAuthHeader(header string) bool {
 	rest, ok := strings.CutPrefix(header, "PVEAPIToken=")
 	if !ok {
@@ -172,7 +166,7 @@ func isValidAuthHeader(header string) bool {
 	return j > i+1 && j < len(rest)-1
 }
 
-// WithBaseURL overrides the API base URL (testing, reverse proxies).
+// WithBaseURL 覆盖 API base URL（用于测试、反向代理场景）。
 func WithBaseURL(baseURL string) Option {
 	return func(c *Client) error {
 		c.baseURL = strings.TrimSuffix(baseURL, "/")
@@ -180,7 +174,7 @@ func WithBaseURL(baseURL string) Option {
 	}
 }
 
-// WithHTTPClient replaces the underlying HTTP client (testing).
+// WithHTTPClient 替换底层 HTTP 客户端（用于测试）。
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) error {
 		if hc == nil {
@@ -191,8 +185,8 @@ func WithHTTPClient(hc *http.Client) Option {
 	}
 }
 
-// WithTimeout sets the per-request timeout. It has no effect when a custom
-// client was installed via WithHTTPClient.
+// WithTimeout 设置每个请求的超时时长。当已通过 WithHTTPClient 安装了
+// 自定义客户端时，此选项不生效。
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) error {
 		c.httpClient.Timeout = d
@@ -200,9 +194,8 @@ func WithTimeout(d time.Duration) Option {
 	}
 }
 
-// WithInsecure toggles TLS certificate verification. PVE nodes use
-// self-signed certificates, so the default is insecure=true; production
-// deployments can tighten this with WithCAFile.
+// WithInsecure 切换 TLS 证书校验。PVE 节点使用自签名证书，因此默认是
+// insecure=true；生产部署可通过 WithCAFile 收紧。
 func WithInsecure(insecure bool) Option {
 	return func(c *Client) error {
 		cfg := c.tlsConfig()
@@ -211,8 +204,8 @@ func WithInsecure(insecure bool) Option {
 	}
 }
 
-// WithCAFile verifies the node certificate against the CA bundle in path
-// (PEM) and disables the default insecure skip.
+// WithCAFile 使用 path（PEM 格式）中的 CA 证书包校验节点证书，并关闭
+// 默认的不安全跳过行为。
 func WithCAFile(path string) Option {
 	return func(c *Client) error {
 		pem, err := os.ReadFile(path)
@@ -230,7 +223,7 @@ func WithCAFile(path string) Option {
 	}
 }
 
-// tlsConfig lazily creates the transport TLS config of the default client.
+// tlsConfig 惰性创建默认客户端的传输层 TLS 配置。
 func (c *Client) tlsConfig() *tls.Config {
 	transport, ok := c.httpClient.Transport.(*http.Transport)
 	if !ok || transport == nil {
@@ -243,11 +236,10 @@ func (c *Client) tlsConfig() *tls.Config {
 	return transport.TLSClientConfig
 }
 
-// UpstreamError carries a PVE-reported failure: the HTTP status code and the
-// "errors" object from PVE's JSON envelope (param validation results,
-// permission denials, ...). Network-level failures (unreachable node, TLS,
-// timeout) are plain errors and can be distinguished from PVE rejections by
-// asserting on *UpstreamError.
+// UpstreamError 承载 PVE 报告的错误：HTTP 状态码以及 PVE JSON 封装中的
+// "errors" 对象（参数校验结果、权限拒绝等）。网络层故障（节点不可达、
+// TLS、超时）是普通 error，可以通过断言 *UpstreamError 与 PVE 拒绝
+// 区分开。
 type UpstreamError struct {
 	Method     string
 	Path       string
@@ -276,15 +268,15 @@ func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("pve: %s %s: status %d: %s", e.Method, e.Path, e.StatusCode, msg)
 }
 
-// pveEnvelope is the standard PVE JSON response: {"data": ..., "errors": ...}.
+// pveEnvelope 是标准的 PVE JSON 响应：{"data": ..., "errors": ...}。
 type pveEnvelope struct {
 	Data   json.RawMessage            `json:"data"`
 	Errors map[string]json.RawMessage `json:"errors"`
 }
 
-// doJSON performs a PVE API call and returns the raw "data" payload. Path is
-// relative to the base URL and starts with "/" (e.g. "/nodes/pve1/qemu").
-// Failures are reported as *UpstreamError; transport errors are plain errors.
+// doJSON 执行一次 PVE API 调用并返回原始 "data" 负载。Path 相对于 base
+// URL，以 "/" 开头（例如 "/nodes/pve1/qemu"）。失败以 *UpstreamError 报告；
+// 传输层错误是普通 error。
 func (c *Client) doJSON(ctx context.Context, method, path string, query url.Values, body any) (json.RawMessage, error) {
 	if c.initErr != nil {
 		return nil, c.initErr
@@ -348,14 +340,14 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query url.Valu
 	return env.Data, nil
 }
 
-// VersionInfo is the payload of GET /version.
+// VersionInfo 是 GET /version 的响应负载。
 type VersionInfo struct {
 	Release string `json:"release"`
 	RepoID  string `json:"repoid"`
 	Version string `json:"version"`
 }
 
-// ProbeVersion calls GET /version and returns the node's PVE version.
+// ProbeVersion 调用 GET /version 并返回节点的 PVE 版本。
 func (c *Client) ProbeVersion(ctx context.Context) (*VersionInfo, error) {
 	raw, err := c.doJSON(ctx, http.MethodGet, "/version", nil, nil)
 	if err != nil {
@@ -368,13 +360,13 @@ func (c *Client) ProbeVersion(ctx context.Context) (*VersionInfo, error) {
 	return &v, nil
 }
 
-// Ping checks node reachability and API-token validity with GET /version.
+// Ping 通过 GET /version 检查节点可达性与 API 令牌有效性。
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.ProbeVersion(ctx)
 	return err
 }
 
-// decodeData unmarshals the raw "data" payload into a concrete type.
+// decodeData 将原始 "data" 负载反序列化为具体类型。
 func decodeData[T any](raw json.RawMessage) (T, error) {
 	var v T
 	if err := json.Unmarshal(raw, &v); err != nil {
@@ -383,8 +375,7 @@ func decodeData[T any](raw json.RawMessage) (T, error) {
 	return v, nil
 }
 
-// decodeUPID unmarshals the "data" payload of an endpoint that returns a task
-// ID (UPID) string.
+// decodeUPID 反序列化返回任务 ID（UPID）字符串的端点的 "data" 负载。
 func decodeUPID(raw json.RawMessage) (string, error) {
 	upid, err := decodeData[string](raw)
 	if err != nil {
@@ -396,9 +387,9 @@ func decodeUPID(raw json.RawMessage) (string, error) {
 	return upid, nil
 }
 
-// isEmptyData reports whether the "data" payload is null or empty, which PVE
-// uses to signal a synchronous operation that produces no task ID (e.g. PUT
-// /nodes/{node}/qemu/{vmid}/config on PVE 7/8/9).
+// isEmptyData 报告 "data" 负载是否为 null 或空；PVE 用它来表示不产生
+// 任务 ID 的同步操作（例如 PVE 7/8/9 上的 PUT
+// /nodes/{node}/qemu/{vmid}/config）。
 func isEmptyData(raw json.RawMessage) bool {
 	s := strings.TrimSpace(string(raw))
 	return len(s) == 0 || s == "null" || s == `""`

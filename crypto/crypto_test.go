@@ -9,7 +9,7 @@ import (
 	"spark/config"
 )
 
-// testKey is a deterministic 32-byte AES key (bytes 0..31).
+// testKey 是确定性的 32 字节 AES 密钥（字节 0..31）。
 var testKey = func() []byte {
 	key := make([]byte, 32)
 	for i := range key {
@@ -60,7 +60,7 @@ func TestDecryptTamperedCiphertext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode ciphertext: %v", err)
 	}
-	raw[len(raw)-1] ^= 0x01 // flip one ciphertext byte, tag check must fail
+	raw[len(raw)-1] ^= 0x01 // 翻转一个密文字节，标签校验必须失败
 
 	tampered := base64.StdEncoding.EncodeToString(raw)
 	if _, err := Decrypt(tampered, testKey); !errors.Is(err, ErrDecryptFailed) {

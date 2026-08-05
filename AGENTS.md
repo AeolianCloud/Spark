@@ -2,3 +2,4 @@
 - 主要技术栈为go+gin
 - 主要功能包括虚拟机的全生命周期管理，对接前端实现公有云
 - 严格按照pve标准api实现(https://pve.proxmox.com/pve-docs/api-viewer/index.html)
+- 代码注释一律使用中文（含测试代码），专有名词与技术术语可保留英文原文

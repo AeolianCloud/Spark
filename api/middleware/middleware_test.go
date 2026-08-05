@@ -11,9 +11,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// echoRID builds a minimal router with RequestID() that reports the id seen
-// by the handler through a header, so tests can observe what was accepted
-// or generated.
+// echoRID 构建带 RequestID() 的最小路由，处理器通过一个响应头
+// 报告它看到的 id，使测试能观察到被接受或生成的 id。
 func echoRID(t *testing.T) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -27,7 +26,7 @@ func echoRID(t *testing.T) *gin.Engine {
 }
 
 func TestRequestIDAcceptsValidClientID(t *testing.T) {
-	// A well-formed client id is passed through untouched.
+	// 格式合法的客户端 id 被原样透传。
 	const rid = "req-123.abc_def"
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -59,9 +58,8 @@ func TestRequestIDAcceptsExactlyMaxLength(t *testing.T) {
 }
 
 func TestRequestIDRejectsInvalidClientID(t *testing.T) {
-	// Ids outside the documented charset or longer than maxRequestIDLen are
-	// discarded and replaced by a fresh uuid, keeping logs and the response
-	// header free of client-controlled garbage.
+	// 超出文档化字符集或长于 maxRequestIDLen 的 id 会被丢弃并替换为
+	// 全新的 uuid，使日志和响应头不包含客户端可控的垃圾数据。
 	tests := []struct {
 		name string
 		rid  string
@@ -97,7 +95,7 @@ func TestRequestIDRejectsInvalidClientID(t *testing.T) {
 }
 
 func TestRequestIDGeneratesWhenMissing(t *testing.T) {
-	// Without a client-supplied id a uuid is generated and echoed back.
+	// 没有客户端提供的 id 时生成 uuid 并回显。
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	echoRID(t).ServeHTTP(w, req)
@@ -121,8 +119,8 @@ func TestErrCodeInternalContract(t *testing.T) {
 }
 
 func TestRecoverySetsErrorCodeHeader(t *testing.T) {
-	// A panic must yield the unified 500 response including the
-	// x-ms-error-code header and the matching body code.
+	// panic 必须产生统一的 500 响应，包括
+	// x-ms-error-code 头及与之匹配的 body 错误码。
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(Recovery())

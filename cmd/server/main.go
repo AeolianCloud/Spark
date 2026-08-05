@@ -1,4 +1,4 @@
-// Command server is the spark API server entry point.
+// Command server 是 spark API 服务器的入口点。
 package main
 
 import (

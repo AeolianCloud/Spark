@@ -9,11 +9,10 @@ import (
 	"strconv"
 )
 
-// VMStatus is one entry of GET /nodes/{node}/qemu. Memory and disk values are
-// bytes; CPU is the fraction of the configured cores currently in use and
-// Cpus is the maximum usable CPU count of the configuration (sockets×cores,
-// capped at the host core count). Stopped VMs omit most fields, which decode
-// to zero values.
+// VMStatus 是 GET /nodes/{node}/qemu 返回的一项。内存和磁盘值以字节为
+// 单位；CPU 是当前使用的配置核数占比，Cpus 是配置中最大可用 CPU 数量
+// （sockets×cores，并以宿主机核数为上限）。已停止的 VM 会省略大多数字段，
+// 解码为零值。
 type VMStatus struct {
 	VMID    int64   `json:"vmid"`
 	Name    string  `json:"name,omitempty"`
@@ -27,32 +26,30 @@ type VMStatus struct {
 	Uptime  int64   `json:"uptime,omitempty"`
 }
 
-// CreateVMParams are the supported parameters of POST /nodes/{node}/qemu.
-// Zero-value fields are omitted and left to PVE defaults; Extra carries any
-// additional config keys (ostype, ...) verbatim.
+// CreateVMParams 是 POST /nodes/{node}/qemu 支持的参数。零值字段会被省略
+// 并交给 PVE 默认处理；Extra 原样携带额外的配置键（ostype 等）。
 //
-// CreateVM is a one-step provisioning call: image import, networking and
-// cloud-init are all applied in the single qmcreate task. Scsi0 accepts a
-// disk string built by DiskImportString (e.g. "local-lvm:0,import-from=...",
-// PVE 7.0+) to import a cloud image while the VM is created. IDE2 accepts a
-// cloud-init data disk string (e.g. "local-lvm:cloudinit"): without it PVE
-// ignores ciuser/cipassword/ipconfig0/nameserver.
+// CreateVM 是单步部署调用：镜像导入、网络和 cloud-init 都在单个 qmcreate
+// 任务中完成。Scsi0 接受由 DiskImportString 构建的磁盘字符串（例如
+// "local-lvm:0,import-from=..."，PVE 7.0+），用于在创建 VM 的同时导入
+// 云镜像。IDE2 接受 cloud-init 数据磁盘字符串（例如 "local-lvm:cloudinit"）：
+// 没有它，PVE 会忽略 ciuser/cipassword/ipconfig0/nameserver。
 type CreateVMParams struct {
 	VMID   int64
 	Name   string
 	Memory int64 // MiB
 	Cores  int
-	CPU    string // emulated CPU type, e.g. "x86-64-v2-AES"
+	CPU    string // 模拟的 CPU 类型，例如 "x86-64-v2-AES"
 
-	// One-step provisioning fields.
-	Scsi0        string // disk string, e.g. DiskImportString(storage, source)
-	IDE2         string // cloud-init data disk, e.g. "local-lvm:cloudinit"
-	Net0         string // e.g. "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0"
-	BootDisk     string // boot controller, e.g. "scsi0"
-	ScsiHW       string // e.g. "virtio-scsi-single" or "virtio-scsi-pci"
-	CIUser       string // cloud-init user, e.g. image default_user
-	CIPassword   string // cloud-init password
-	IPConfig0    string // static IP, e.g. "ip=10.0.0.5/24,gw=10.0.0.1"
+	// 单步部署字段。
+	Scsi0        string // 磁盘字符串，例如 DiskImportString(storage, source)
+	IDE2         string // cloud-init 数据磁盘，例如 "local-lvm:cloudinit"
+	Net0         string // 例如 "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0"
+	BootDisk     string // 启动控制器，例如 "scsi0"
+	ScsiHW       string // 例如 "virtio-scsi-single" 或 "virtio-scsi-pci"
+	CIUser       string // cloud-init 用户，例如镜像的 default_user
+	CIPassword   string // cloud-init 密码
+	IPConfig0    string // 静态 IP，例如 "ip=10.0.0.5/24,gw=10.0.0.1"
 	Nameserver   string
 	SearchDomain string
 
@@ -109,13 +106,12 @@ func (p CreateVMParams) body() map[string]any {
 	return b
 }
 
-// CreateVM creates a VM with POST /nodes/{node}/qemu and returns the task ID
-// (UPID) of the qmcreate task. The VMID is caller-assigned. One call covers
-// VM creation, disk provisioning — including image import via a scsi0 disk
-// string built with DiskImportString — the cloud-init data disk (IDE2,
-// e.g. "local-lvm:cloudinit"), networking (Net0) and cloud-init injection
-// (CIUser/CIPassword/IPConfig0/...); the import time is absorbed by the
-// qmcreate task, which callers typically wait on with WaitTask.
+// CreateVM 通过 POST /nodes/{node}/qemu 创建 VM 并返回 qmcreate 任务的
+// 任务 ID（UPID）。VMID 由调用方指定。一次调用覆盖 VM 创建、磁盘供给——
+// 包括通过 DiskImportString 构建的 scsi0 磁盘字符串进行镜像导入——
+// cloud-init 数据磁盘（IDE2，例如 "local-lvm:cloudinit"）、网络（Net0）
+// 与 cloud-init 注入（CIUser/CIPassword/IPConfig0/...）；导入时间包含在
+// qmcreate 任务内，调用方通常用 WaitTask 等待该任务。
 func (c *Client) CreateVM(ctx context.Context, node string, params CreateVMParams) (string, error) {
 	path := fmt.Sprintf("/nodes/%s/qemu", node)
 	raw, err := c.doJSON(ctx, http.MethodPost, path, nil, params.body())
@@ -125,8 +121,8 @@ func (c *Client) CreateVM(ctx context.Context, node string, params CreateVMParam
 	return decodeUPID(raw)
 }
 
-// StartVM starts a VM (POST /nodes/{node}/qemu/{vmid}/status/start) and
-// returns the task ID.
+// StartVM 启动一个 VM（POST /nodes/{node}/qemu/{vmid}/status/start）并
+// 返回任务 ID。
 func (c *Client) StartVM(ctx context.Context, node string, vmid int64) (string, error) {
 	raw, err := c.doJSON(ctx, http.MethodPost, vmStatusPath(node, vmid, "start"), nil, nil)
 	if err != nil {
@@ -135,10 +131,10 @@ func (c *Client) StartVM(ctx context.Context, node string, vmid int64) (string, 
 	return decodeUPID(raw)
 }
 
-// StopVM stops a VM (POST /nodes/{node}/qemu/{vmid}/status/stop) and returns
-// the task ID. Force stops abort an in-flight clean shutdown first: PVE's
-// QEMU stop endpoint has no literal "force" parameter (that exists only for
-// containers), so force maps to the overrule-shutdown flag of PVE 8.2+.
+// StopVM 停止一个 VM（POST /nodes/{node}/qemu/{vmid}/status/stop）并
+// 返回任务 ID。强制停止会先中止进行中的优雅关机：PVE 的 QEMU 停止端点
+// 没有字面上的 "force" 参数（该参数仅存在于容器），因此 force 映射到
+// PVE 8.2+ 的 overrule-shutdown 标志。
 func (c *Client) StopVM(ctx context.Context, node string, vmid int64, force bool) (string, error) {
 	var body any
 	if force {
@@ -151,8 +147,8 @@ func (c *Client) StopVM(ctx context.Context, node string, vmid int64, force bool
 	return decodeUPID(raw)
 }
 
-// RebootVM reboots a VM (POST /nodes/{node}/qemu/{vmid}/status/reboot) and
-// returns the task ID.
+// RebootVM 重启一个 VM（POST /nodes/{node}/qemu/{vmid}/status/reboot）并
+// 返回任务 ID。
 func (c *Client) RebootVM(ctx context.Context, node string, vmid int64) (string, error) {
 	raw, err := c.doJSON(ctx, http.MethodPost, vmStatusPath(node, vmid, "reboot"), nil, nil)
 	if err != nil {
@@ -161,7 +157,7 @@ func (c *Client) RebootVM(ctx context.Context, node string, vmid int64) (string,
 	return decodeUPID(raw)
 }
 
-// ListVMs returns all VMs on a node (GET /nodes/{node}/qemu).
+// ListVMs 返回节点上的全部 VM（GET /nodes/{node}/qemu）。
 func (c *Client) ListVMs(ctx context.Context, node string) ([]VMStatus, error) {
 	path := fmt.Sprintf("/nodes/%s/qemu", node)
 	raw, err := c.doJSON(ctx, http.MethodGet, path, nil, nil)
@@ -175,13 +171,12 @@ func (c *Client) ListVMs(ctx context.Context, node string) ([]VMStatus, error) {
 	return vms, nil
 }
 
-// VMConfig is the configuration map of a VM (GET
-// /nodes/{node}/qemu/{vmid}/config). PVE returns all values as strings;
-// numeric accessors parse them on demand.
+// VMConfig 是 VM 的配置映射（GET /nodes/{node}/qemu/{vmid}/config）。PVE
+// 以字符串形式返回所有值；数值访问器按需解析。
 type VMConfig map[string]string
 
-// parseConfig converts the config payload into a string map, tolerating
-// scalar values that arrive as JSON numbers or booleans.
+// parseConfig 将配置负载转换为字符串映射，容忍以 JSON 数字或布尔值
+// 形式到达的标量值。
 func parseConfig(raw json.RawMessage) (VMConfig, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
@@ -194,8 +189,8 @@ func parseConfig(raw json.RawMessage) (VMConfig, error) {
 	return cfg, nil
 }
 
-// String returns the value of a config key, unquoted when it is a JSON
-// string ("" if absent).
+// String 返回配置键的值；当它是 JSON 字符串时去掉引号（不存在时
+// 返回 ""）。
 func (c VMConfig) String(key string) string {
 	raw, ok := c[key]
 	if !ok {
@@ -204,7 +199,7 @@ func (c VMConfig) String(key string) string {
 	return unquoteJSONString(raw)
 }
 
-// Int parses a config key as an integer, unquoting JSON strings if needed.
+// Int 将配置键解析为整数，必要时去掉 JSON 字符串的引号。
 func (c VMConfig) Int(key string) (int, error) {
 	v, err := c.Int64(key)
 	if err != nil {
@@ -213,7 +208,7 @@ func (c VMConfig) Int(key string) (int, error) {
 	return int(v), nil
 }
 
-// Int64 parses a config key as an int64.
+// Int64 将配置键解析为 int64。
 func (c VMConfig) Int64(key string) (int64, error) {
 	raw, ok := c[key]
 	if !ok {
@@ -227,7 +222,7 @@ func (c VMConfig) Int64(key string) (int64, error) {
 	return v, nil
 }
 
-// unquoteJSONString strips the surrounding quotes of a JSON string value.
+// unquoteJSONString 去掉 JSON 字符串值两端的引号。
 func unquoteJSONString(raw string) string {
 	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
 		return raw[1 : len(raw)-1]
@@ -235,19 +230,19 @@ func unquoteJSONString(raw string) string {
 	return raw
 }
 
-// Cores returns the configured core count.
+// Cores 返回配置的核数。
 func (c VMConfig) Cores() (int, error) { return c.Int("cores") }
 
-// MemoryMB returns the configured memory in MiB.
+// MemoryMB 返回配置的内存（MiB）。
 func (c VMConfig) MemoryMB() (int64, error) { return c.Int64("memory") }
 
-// CPUType returns the emulated CPU type.
+// CPUType 返回模拟的 CPU 类型。
 func (c VMConfig) CPUType() string { return c.String("cpu") }
 
-// BootDisk returns the boot disk controller name (e.g. "scsi0").
+// BootDisk 返回启动磁盘控制器名称（例如 "scsi0"）。
 func (c VMConfig) BootDisk() string { return c.String("bootdisk") }
 
-// GetVMConfig reads the VM configuration (GET /nodes/{node}/qemu/{vmid}/config).
+// GetVMConfig 读取 VM 配置（GET /nodes/{node}/qemu/{vmid}/config）。
 func (c *Client) GetVMConfig(ctx context.Context, node string, vmid int64) (VMConfig, error) {
 	path := fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid)
 	raw, err := c.doJSON(ctx, http.MethodGet, path, nil, nil)
@@ -257,9 +252,9 @@ func (c *Client) GetVMConfig(ctx context.Context, node string, vmid int64) (VMCo
 	return parseConfig(raw)
 }
 
-// VMConfigParams are the supported fields of PUT /nodes/{node}/qemu/{vmid}/config.
-// Nil fields are left untouched; Extra carries additional config keys
-// (net0, bootdisk, ciuser, ipconfig, ...) verbatim.
+// VMConfigParams 是 PUT /nodes/{node}/qemu/{vmid}/config 支持的字段。
+// 为 nil 的字段保持不变；Extra 原样携带额外的配置键（net0、bootdisk、
+// ciuser、ipconfig 等）。
 type VMConfigParams struct {
 	Cores    *int
 	MemoryMB *int64
@@ -284,11 +279,10 @@ func (p VMConfigParams) body() map[string]any {
 	return b
 }
 
-// SetVMConfig updates VM options (PUT /nodes/{node}/qemu/{vmid}/config) and
-// returns the task ID. The endpoint is synchronous on PVE 7/8/9: PVE applies
-// the change to the running config or the pending changes (depending on the
-// VM state) and replies {"data": null} instead of a UPID, so the returned
-// task ID is always empty and nothing needs polling.
+// SetVMConfig 更新 VM 选项（PUT /nodes/{node}/qemu/{vmid}/config）并
+// 返回任务 ID。该端点在 PVE 7/8/9 上是同步的：PVE 会将变更应用到运行中
+// 的配置或待定变更（取决于 VM 状态），并回复 {"data": null} 而不是 UPID，
+// 因此返回的任务 ID 始终为空，无需轮询。
 func (c *Client) SetVMConfig(ctx context.Context, node string, vmid int64, params VMConfigParams) (string, error) {
 	path := fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid)
 	_, err := c.doJSON(ctx, http.MethodPut, path, nil, params.body())
@@ -298,15 +292,13 @@ func (c *Client) SetVMConfig(ctx context.Context, node string, vmid int64, param
 	return "", nil
 }
 
-// ResizeDisk grows a VM disk (PUT /nodes/{node}/qemu/{vmid}/resize, per the
-// standard API the endpoint is PUT, not POST). sizeGB is an absolute target
-// size in GiB and must exceed the current size; shrinking is rejected by PVE
-// server-side and by the caller's service layer.
+// ResizeDisk 扩容 VM 磁盘（PUT /nodes/{node}/qemu/{vmid}/resize，按标准
+// API 该端点为 PUT 而非 POST）。sizeGB 是 GiB 为单位的绝对目标大小，必须
+// 大于当前大小；收缩会被 PVE 服务端以及调用方的服务层拒绝。
 //
-// The response differs across PVE versions: PVE 7 applies the resize
-// synchronously and returns {"data": null} (empty task ID, nothing to poll),
-// while PVE 8/9 return a UPID for the asynchronous resize task. Both shapes
-// are handled; callers should only wait on a non-empty task ID.
+// 不同 PVE 版本的响应不同：PVE 7 同步应用扩容并返回 {"data": null}
+// （空任务 ID，无需轮询），而 PVE 8/9 为异步扩容任务返回 UPID。两种形态
+// 均已处理；调用方应仅对非空任务 ID 进行等待。
 func (c *Client) ResizeDisk(ctx context.Context, node string, vmid int64, disk string, sizeGB int64) (string, error) {
 	if disk == "" {
 		return "", fmt.Errorf("pve: resize: empty disk name")
@@ -321,15 +313,15 @@ func (c *Client) ResizeDisk(ctx context.Context, node string, vmid int64, disk s
 		return "", err
 	}
 	if isEmptyData(raw) {
-		// PVE 7 synchronous completion: the resize is already applied.
+		// PVE 7 同步完成：扩容已生效。
 		return "", nil
 	}
 	return decodeUPID(raw)
 }
 
-// DestroyVM deletes a VM (DELETE /nodes/{node}/qemu/{vmid}) and waits for the
-// destruction task to finish. purge removes the VMID from backup/replication
-// jobs and HA configurations. The returned UPID is the completed task's ID.
+// DestroyVM 删除一个 VM（DELETE /nodes/{node}/qemu/{vmid}）并等待销毁
+// 任务结束。purge 会将 VMID 从备份/复制任务及 HA 配置中移除。返回的
+// UPID 是已完成任务的 ID。
 func (c *Client) DestroyVM(ctx context.Context, node string, vmid int64, purge bool) (string, error) {
 	path := fmt.Sprintf("/nodes/%s/qemu/%d", node, vmid)
 	var query url.Values
@@ -350,7 +342,7 @@ func (c *Client) DestroyVM(ctx context.Context, node string, vmid int64, purge b
 	return upid, nil
 }
 
-// vmStatusPath builds /nodes/{node}/qemu/{vmid}/status/{action}.
+// vmStatusPath 构建 /nodes/{node}/qemu/{vmid}/status/{action}。
 func vmStatusPath(node string, vmid int64, action string) string {
 	return fmt.Sprintf("/nodes/%s/qemu/%d/status/%s", node, vmid, action)
 }

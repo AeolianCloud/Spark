@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-// newTestClient spins up an httptest server and a Client pointed at it via
-// WithBaseURL. The server's handler may inspect the request (auth header,
-// method, path, body) and must write a PVE-style response.
+// newTestClient 启动一个 httptest 服务器，并通过 WithBaseURL 创建一个指向
+// 它的 Client。服务器 handler 可以检查请求（认证头、方法、路径、请求体），
+// 且必须写出 PVE 风格的响应。
 func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -40,7 +40,7 @@ func mustJSON(t *testing.T, v any) []byte {
 	return data
 }
 
-// TestAuthHeaderNormalization covers the accepted credential storage forms.
+// TestAuthHeaderNormalization 覆盖可接受的凭证存储形式。
 func TestAuthHeaderNormalization(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -63,8 +63,8 @@ func TestAuthHeaderNormalization(t *testing.T) {
 				if c.initErr == nil {
 					t.Fatalf("NewClient(%q, %q) should fail to build a token header", tt.user, tt.secret)
 				}
-				// The failure message must not leak any part of the
-				// credentials (see the redaction in NewClient).
+				// 失败消息绝不能泄露凭证的任何部分
+				// （参见 NewClient 中的脱敏处理）。
 				msg := c.initErr.Error()
 				if strings.Contains(msg, tt.secret) {
 					t.Fatalf("initErr %q leaks the token secret %q", msg, tt.secret)
@@ -86,10 +86,9 @@ func TestAuthHeaderNormalization(t *testing.T) {
 	}
 }
 
-// TestNewClientRedactsCredentialsInInitErr pins down that NewClient failure
-// messages carry only the host and a masked user prefix, never the raw
-// api_user or the token secret, so logs and client-visible errors cannot leak
-// stored credentials.
+// TestNewClientRedactsCredentialsInInitErr 钉住 NewClient 失败消息仅携带
+// 主机名和一个被掩码的用户前缀，绝不携带原始 api_user 或令牌密钥，因此
+// 日志和客户端可见的错误不会泄露已存储的凭证。
 func TestNewClientRedactsCredentialsInInitErr(t *testing.T) {
 	c := NewClient("pve1", "root@pam", "supersecretvalue")
 	if c.initErr == nil {
@@ -109,8 +108,8 @@ func TestNewClientRedactsCredentialsInInitErr(t *testing.T) {
 	}
 }
 
-// TestNewClientStripsHostPort verifies that a ":port" suffix on host is
-// removed so the base URL does not carry the port twice.
+// TestNewClientStripsHostPort 验证 host 上的 ":port" 后缀会被移除，避免
+// base URL 携带两次端口。
 func TestNewClientStripsHostPort(t *testing.T) {
 	c := NewClient("pve1:8006", "root@pam", "spark=uuid")
 	if c.initErr != nil {
@@ -119,12 +118,12 @@ func TestNewClientStripsHostPort(t *testing.T) {
 	if want := "https://pve1:8006/api2/json"; c.baseURL != want {
 		t.Fatalf("baseURL = %q, want %q", c.baseURL, want)
 	}
-	// A non-numeric suffix is not a port and must be left untouched.
+	// 非数字后缀不是端口，必须原样保留。
 	c2 := NewClient("pve1:host", "root@pam", "spark=uuid")
 	if c2.baseURL != "https://pve1:host:8006/api2/json" {
 		t.Fatalf("baseURL = %q", c2.baseURL)
 	}
-	// An empty port suffix is stripped too.
+	// 空的端口后缀也会被剥离。
 	c3 := NewClient("pve1:", "root@pam", "spark=uuid")
 	if c3.initErr != nil {
 		t.Fatalf("NewClient(pve1:): %v", c3.initErr)
@@ -132,7 +131,7 @@ func TestNewClientStripsHostPort(t *testing.T) {
 	if c3.baseURL != "https://pve1:8006/api2/json" {
 		t.Fatalf("baseURL = %q, want %q", c3.baseURL, "https://pve1:8006/api2/json")
 	}
-	// IPv6 literals are not supported and must fail explicitly.
+	// IPv6 字面量不受支持，必须显式失败。
 	for _, h := range []string{"::1", "2001:db8::1"} {
 		c4 := NewClient(h, "root@pam", "spark=uuid")
 		if c4.initErr == nil || !strings.Contains(c4.initErr.Error(), "IPv6") {
@@ -141,7 +140,7 @@ func TestNewClientStripsHostPort(t *testing.T) {
 	}
 }
 
-// TestDoJSONSuccess verifies a 2xx response returns the data payload.
+// TestDoJSONSuccess 验证 2xx 响应返回 data 负载。
 func TestDoJSONSuccess(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "PVEAPIToken=root@pam!spark=uuid" {
@@ -159,8 +158,8 @@ func TestDoJSONSuccess(t *testing.T) {
 	}
 }
 
-// TestUpstreamErrorHTTP200Errors covers PVE's HTTP 200 + errors envelope
-// (e.g. validation failures on POST /nodes/{node}/qemu).
+// TestUpstreamErrorHTTP200Errors 覆盖 PVE 的 HTTP 200 + errors 封装
+// （例如 POST /nodes/{node}/qemu 的校验失败）。
 func TestUpstreamErrorHTTP200Errors(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": null, "errors": {"vmid": "VMID 100 already exists"}}`)
@@ -181,7 +180,7 @@ func TestUpstreamErrorHTTP200Errors(t *testing.T) {
 	}
 }
 
-// TestUpstreamErrorHTTP400 covers HTTP 400-500 + errors envelope.
+// TestUpstreamErrorHTTP400 覆盖 HTTP 400-500 + errors 封装。
 func TestUpstreamErrorHTTP400(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -200,7 +199,7 @@ func TestUpstreamErrorHTTP400(t *testing.T) {
 	}
 }
 
-// TestUpstreamErrorNonJSONBody covers 500 responses with a non-JSON body.
+// TestUpstreamErrorNonJSONBody 覆盖带非 JSON 响应体的 500 响应。
 func TestUpstreamErrorNonJSONBody(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -219,8 +218,8 @@ func TestUpstreamErrorNonJSONBody(t *testing.T) {
 	}
 }
 
-// TestCreateVM verifies the request shape of POST /nodes/{node}/qemu and the
-// UPID parsing of the response.
+// TestCreateVM 验证 POST /nodes/{node}/qemu 的请求形态以及响应的
+// UPID 解析。
 func TestCreateVM(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -278,7 +277,7 @@ func TestCreateVM(t *testing.T) {
 	}
 }
 
-// TestListVMs verifies field mapping of the VM index response.
+// TestListVMs 验证 VM 列表响应的字段映射。
 func TestListVMs(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": [
@@ -312,7 +311,7 @@ func TestListVMs(t *testing.T) {
 	}
 }
 
-// TestGetVMConfig verifies config parsing and the typed accessors.
+// TestGetVMConfig 验证配置解析及类型化访问器。
 func TestGetVMConfig(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": {
@@ -347,8 +346,8 @@ func TestGetVMConfig(t *testing.T) {
 	}
 }
 
-// TestResizeDisk verifies the resize request uses PUT (the standard API
-// method) with an absolute size in GB and parses the UPID returned by PVE 8/9.
+// TestResizeDisk 验证扩容请求使用 PUT（标准 API 方法），携带以 GB 计的
+// 绝对大小，并解析 PVE 8/9 返回的 UPID。
 func TestResizeDisk(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
@@ -376,8 +375,8 @@ func TestResizeDisk(t *testing.T) {
 	}
 }
 
-// TestResizeDiskSynchronousNull covers PVE 7, which applies the resize
-// synchronously and replies {"data": null} instead of a UPID.
+// TestResizeDiskSynchronousNull 覆盖 PVE 7：它同步应用扩容并回复
+// {"data": null} 而不是 UPID。
 func TestResizeDiskSynchronousNull(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": null}`)
@@ -391,8 +390,8 @@ func TestResizeDiskSynchronousNull(t *testing.T) {
 	}
 }
 
-// TestSetVMConfig verifies PUT /config: PVE 7/8/9 reply {"data": null}
-// (synchronous), so success returns an empty task ID.
+// TestSetVMConfig 验证 PUT /config：PVE 7/8/9 回复 {"data": null}
+// （同步），因此成功时返回空任务 ID。
 func TestSetVMConfig(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
@@ -427,8 +426,8 @@ func TestSetVMConfig(t *testing.T) {
 	}
 }
 
-// TestDestroyVMVerifiesPurgeAndWait makes sure DELETE sends purge as a query
-// parameter and the destruction task is waited on.
+// TestDestroyVMVerifiesPurgeAndWait 确保 DELETE 以查询参数发送 purge，
+// 并且会等待销毁任务结束。
 func TestDestroyVMVerifiesPurgeAndWait(t *testing.T) {
 	var calls atomic.Int32
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -465,7 +464,7 @@ func TestDestroyVMVerifiesPurgeAndWait(t *testing.T) {
 	}
 }
 
-// TestWaitTaskEmptyUPID rejects an empty task ID before any polling.
+// TestWaitTaskEmptyUPID 在任何轮询开始前拒绝空任务 ID。
 func TestWaitTaskEmptyUPID(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("no request expected for empty upid, got %s %s", r.Method, r.URL.Path)
@@ -476,11 +475,11 @@ func TestWaitTaskEmptyUPID(t *testing.T) {
 	}
 }
 
-// TestWaitTaskSuccess polls until the task stops and returns the final status.
+// TestWaitTaskSuccess 轮询直至任务停止并返回最终状态。
 func TestWaitTaskSuccess(t *testing.T) {
 	var polls atomic.Int32
-	// The caller passes "pve1", but the UPID carries pve2; WaitTask must
-	// poll the node from the UPID.
+	// 调用方传入 "pve1"，但 UPID 携带的是 pve2；WaitTask 必须轮询
+	// UPID 中的节点。
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		polls.Add(1)
 		if !strings.HasPrefix(r.URL.Path, "/nodes/pve2/tasks/") {
@@ -501,7 +500,7 @@ func TestWaitTaskSuccess(t *testing.T) {
 	}
 }
 
-// TestWaitTaskFailure surfaces the PVE exit status in the error.
+// TestWaitTaskFailure 在错误中呈现 PVE 的退出状态。
 func TestWaitTaskFailure(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": {"status": "stopped", "exitstatus": "qmstart failed: no such VM", "upid": "UPID:pve1:0:0:0:qmstart:100:root@pam:"}}`)
@@ -515,7 +514,7 @@ func TestWaitTaskFailure(t *testing.T) {
 	}
 }
 
-// TestWaitTaskTimeout verifies the timeout path.
+// TestWaitTaskTimeout 验证超时路径。
 func TestWaitTaskTimeout(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": {"status": "running", "upid": "UPID:pve1:0:0:0:qmstart:100:root@pam:"}}`)
@@ -533,8 +532,8 @@ func TestWaitTaskTimeout(t *testing.T) {
 	}
 }
 
-// TestDiskImportString verifies the scsi0 disk string that imports a cloud
-// image during create (there is no REST importdisk endpoint in PVE 7/8/9).
+// TestDiskImportString 验证在创建期间导入云镜像的 scsi0 磁盘字符串
+// （PVE 7/8/9 没有 REST 形式的 importdisk 端点）。
 func TestDiskImportString(t *testing.T) {
 	got := DiskImportString("local-lvm", "/var/lib/vz/template/iso/debian-12-cloud.qcow2")
 	if want := "local-lvm:0,import-from=/var/lib/vz/template/iso/debian-12-cloud.qcow2"; got != want {
@@ -542,7 +541,7 @@ func TestDiskImportString(t *testing.T) {
 	}
 }
 
-// TestClientOptionErrors checks that failing options surface on first use.
+// TestClientOptionErrors 检查失败的 Option 会在首次使用时浮现。
 func TestClientOptionErrors(t *testing.T) {
 	c := NewClient("pve1", "root@pam", "spark=uuid", WithCAFile("/nonexistent/ca.pem"))
 	if c.initErr == nil {

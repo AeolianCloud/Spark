@@ -1,7 +1,6 @@
-// Package crypto provides application-layer symmetric encryption
-// (AES-256-GCM) for sensitive fields such as VM cloud-init passwords.
-// The key is loaded from config.Crypto.EncryptionKey (base64-encoded 32
-// bytes). Ciphertext format: base64(nonce || ciphertext).
+// Package crypto 提供应用层对称加密（AES-256-GCM），用于加密敏感字段
+// （如虚拟机 cloud-init 密码）。密钥从 config.Crypto.EncryptionKey 加载
+// （base64 编码的 32 字节）。密文格式：base64(nonce || ciphertext)。
 package crypto
 
 import (
@@ -15,24 +14,24 @@ import (
 	"spark/config"
 )
 
-// Errors returned by Decrypt. ErrInvalidCiphertext means the payload is not
-// well-formed (bad base64 or shorter than the nonce); ErrDecryptFailed means
-// the GCM authentication tag did not match (wrong key or corrupted data).
+// Decrypt 返回的错误。ErrInvalidCiphertext 表示载荷格式不正确（base64 无效
+// 或长度小于 nonce）；ErrDecryptFailed 表示 GCM 认证标签不匹配（密钥错误
+// 或数据损坏）。
 var (
 	ErrInvalidCiphertext = errors.New("crypto: invalid ciphertext")
 	ErrDecryptFailed     = errors.New("crypto: decryption failed: wrong key or corrupted data")
 )
 
-// aesKeySize is the required AES-256 key length in bytes.
+// aesKeySize 是 AES-256 要求的密钥长度（字节）。
 const aesKeySize = 32
 
-// Cipher encrypts and decrypts values with a single AES-256-GCM key.
+// Cipher 使用单个 AES-256-GCM 密钥加密和解密值。
 type Cipher struct {
 	key []byte
 }
 
-// NewCipher builds a Cipher from the configured encryption key. The key is
-// decoded from base64 and must decode to exactly 32 bytes.
+// NewCipher 根据配置的加密密钥构建 Cipher。密钥从 base64 解码，
+// 且必须正好解码为 32 字节。
 func NewCipher(cfg *config.Config) (*Cipher, error) {
 	if cfg == nil {
 		return nil, errors.New("crypto: nil config")
@@ -47,18 +46,18 @@ func NewCipher(cfg *config.Config) (*Cipher, error) {
 	return &Cipher{key: key}, nil
 }
 
-// Encrypt encrypts plaintext and returns base64(nonce || ciphertext).
+// Encrypt 加密明文并返回 base64(nonce || ciphertext)。
 func (c *Cipher) Encrypt(plaintext string) (string, error) {
 	return Encrypt(plaintext, c.key)
 }
 
-// Decrypt reverses Encrypt.
+// Decrypt 是 Encrypt 的逆操作。
 func (c *Cipher) Decrypt(ciphertext string) (string, error) {
 	return Decrypt(ciphertext, c.key)
 }
 
-// Encrypt encrypts plaintext with key (exactly 32 bytes) and returns
-// base64(nonce || ciphertext). A fresh random nonce is used per call.
+// Encrypt 使用密钥（恰好 32 字节）加密明文并返回 base64(nonce || ciphertext)。
+// 每次调用都会生成全新的随机 nonce。
 func Encrypt(plaintext string, key []byte) (string, error) {
 	gcm, err := newGCM(key)
 	if err != nil {
@@ -72,8 +71,8 @@ func Encrypt(plaintext string, key []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(sealed), nil
 }
 
-// Decrypt reverses Encrypt. It returns ErrInvalidCiphertext for malformed
-// payloads and ErrDecryptFailed when the authentication check fails.
+// Decrypt 是 Encrypt 的逆操作。对格式错误的载荷返回 ErrInvalidCiphertext，
+// 认证检查失败时返回 ErrDecryptFailed。
 func Decrypt(ciphertext string, key []byte) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(ciphertext)
 	if err != nil {
@@ -95,7 +94,7 @@ func Decrypt(ciphertext string, key []byte) (string, error) {
 	return string(plain), nil
 }
 
-// newGCM builds an AES-256-GCM AEAD from a 32-byte key.
+// newGCM 从 32 字节的密钥构建 AES-256-GCM AEAD。
 func newGCM(key []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {

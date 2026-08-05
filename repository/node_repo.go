@@ -7,20 +7,20 @@ import (
 	"spark/model"
 )
 
-// NodeRepository persists model.PVENode rows.
+// NodeRepository 负责持久化 model.PVENode 行。
 type NodeRepository struct {
 	pool pgxQuerier
 }
 
-// NewNodeRepository creates a NodeRepository backed by pool.
+// NewNodeRepository 创建由 pool 支撑的 NodeRepository。
 func NewNodeRepository(pool pgxQuerier) *NodeRepository {
 	return &NodeRepository{pool: pool}
 }
 
 const nodeCols = "id, zone_id, name, host, api_user, api_token_secret, enabled, created_at"
 
-// CreateNode inserts a node. Credentials are stored in plain text by design
-// (password_encrypted on vms is the only encrypted field).
+// CreateNode 插入一个节点。凭据按设计以明文存储
+// （vms 上的 password_encrypted 是唯一的加密字段）。
 func (r *NodeRepository) CreateNode(ctx context.Context, node model.PVENode) (*model.PVENode, error) {
 	created := node
 	err := r.pool.QueryRow(ctx,
@@ -33,7 +33,7 @@ func (r *NodeRepository) CreateNode(ctx context.Context, node model.PVENode) (*m
 	return &created, nil
 }
 
-// GetNode returns the node with the given id, or pgx.ErrNoRows when absent.
+// GetNode 返回指定 id 的节点；不存在时返回 pgx.ErrNoRows。
 func (r *NodeRepository) GetNode(ctx context.Context, id int64) (*model.PVENode, error) {
 	var n model.PVENode
 	err := r.pool.QueryRow(ctx, "SELECT "+nodeCols+" FROM pve_nodes WHERE id=$1", id).
@@ -44,12 +44,12 @@ func (r *NodeRepository) GetNode(ctx context.Context, id int64) (*model.PVENode,
 	return &n, nil
 }
 
-// ListNodesByZone returns the nodes of a zone ordered by id.
+// ListNodesByZone 返回指定区域的节点，按 id 排序。
 func (r *NodeRepository) ListNodesByZone(ctx context.Context, zoneID int64) ([]model.PVENode, error) {
 	return r.listNodes(ctx, "SELECT "+nodeCols+" FROM pve_nodes WHERE zone_id=$1 ORDER BY id", zoneID)
 }
 
-// ListEnabledNodesByZone returns the enabled nodes of a zone ordered by id.
+// ListEnabledNodesByZone 返回指定区域内已启用的节点，按 id 排序。
 func (r *NodeRepository) ListEnabledNodesByZone(ctx context.Context, zoneID int64) ([]model.PVENode, error) {
 	return r.listNodes(ctx, "SELECT "+nodeCols+" FROM pve_nodes WHERE zone_id=$1 AND enabled ORDER BY id", zoneID)
 }
@@ -75,8 +75,8 @@ func (r *NodeRepository) listNodes(ctx context.Context, sql string, args ...any)
 	return nodes, nil
 }
 
-// UpdateNode replaces all fields of the node with the given id and returns
-// the updated row. It returns pgx.ErrNoRows when absent.
+// UpdateNode 替换指定 id 节点的全部字段并返回更新后的行。
+// 节点不存在时返回 pgx.ErrNoRows。
 func (r *NodeRepository) UpdateNode(ctx context.Context, node model.PVENode) (*model.PVENode, error) {
 	var n model.PVENode
 	err := r.pool.QueryRow(ctx,

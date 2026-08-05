@@ -1,22 +1,20 @@
 //go:build pg
 
-// Integration tests for the IP allocation concurrency contract against a
-// real PostgreSQL instance (task 9.1). They are excluded from the default
-// build and run only with -tags=pg:
+// 针对真实 PostgreSQL 实例的 IP 分配并发契约集成测试（任务 9.1）。
+// 它们被排除在默认构建之外，仅通过 -tags=pg 运行：
 //
 //	SPARK_TEST_DSN='postgres://spark:spark@127.0.0.1:5432/spark_test' \
 //	  go test -tags=pg ./repository/ -count=1 -run TestPG
 //
-// The suite connects to the DSN from SPARK_TEST_DSN (default
-// postgres://spark:spark@127.0.0.1:5432/spark_test), applies the embedded
-// migrations and then exercises ClaimFreeIP under real concurrency: N
-// independent transactions race for a pool with only two free addresses.
+// 测试套件从 SPARK_TEST_DSN（默认
+// postgres://spark:spark@127.0.0.1:5432/spark_test）连接数据库，
+// 应用内嵌 migration，然后在真实并发下演练 ClaimFreeIP：N 个独立
+// 事务竞争一个只有两个空闲地址的池。
 //
-// Data hygiene: the tests DELETE from ips/ip_pool_nodes/ip_pools (in FK
-// order; vms.ip_id has ON DELETE SET NULL, so leftover vms rows cannot
-// block the cleanup) before every round. The business tables are shared
-// with the e2e suite, which truncates everything at its own start/end, so
-// a leftover zone row here is harmless.
+// 数据卫生：每轮测试前按 FK 顺序从 ips/ip_pool_nodes/ip_pools 中
+// DELETE（vms.ip_id 为 ON DELETE SET NULL，因此遗留的 vms 行不会
+// 阻塞清理）。业务表与 e2e 套件共享，后者会在自己的开始/结束时
+// TRUNCATE 全部内容，因此此处遗留的区域行无害。
 package repository
 
 import (
@@ -34,8 +32,8 @@ import (
 	"spark/model"
 )
 
-// pgTestDSN returns the test database DSN, defaulting to the local spark
-// test database when SPARK_TEST_DSN is unset.
+// pgTestDSN 返回测试数据库 DSN；当 SPARK_TEST_DSN 未设置时默认
+// 使用本地 spark 测试数据库。
 func pgTestDSN() string {
 	if dsn := os.Getenv("SPARK_TEST_DSN"); dsn != "" {
 		return dsn
@@ -43,10 +41,9 @@ func pgTestDSN() string {
 	return "postgres://spark:spark@127.0.0.1:5432/spark_test"
 }
 
-// pgTestCleanIPData removes every row of the IP tables in FK order: ips
-// first (its vm_id references vms with ON DELETE SET NULL and vms.ip_id
-// references ips with ON DELETE SET NULL, so the delete always succeeds),
-// then the pool-node whitelist, then the pools themselves.
+// pgTestCleanIPData 按 FK 顺序删除 IP 表的每一行：先删 ips（其 vm_id
+// 引用 vms 且为 ON DELETE SET NULL，vms.ip_id 引用 ips 且为 ON DELETE
+// SET NULL，因此删除总能成功），再删池-节点白名单，最后删池本身。
 func pgTestCleanIPData(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 	for _, stmt := range []string{
@@ -60,16 +57,13 @@ func pgTestCleanIPData(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	}
 }
 
-// TestPGConcurrentIPClaim is the real-PostgreSQL concurrency case of
-// task 9.1: a /30 pool with exactly two free addresses (direct repository
-// insert, deliberately bypassing the service-level gateway/broadcast
-// exclusion — the pool row keeps the /30 shape but the two ip rows are what
-// the test needs) is raced by 20 goroutines, each claiming inside its own
-// transaction. Exactly two claims may succeed; the two winners must hold
-// different addresses; every loser must fail with ErrAllocationRetry (lost
-// the conditional-update race) or pgx.ErrNoRows (pool exhausted). The
-// scenario runs three rounds with the IP tables cleaned in between, so a
-// fluke cannot pass.
+// TestPGConcurrentIPClaim 是任务 9.1 的真实 PostgreSQL 并发用例：
+// 一个恰好含两个空闲地址的 /30 池（直接仓库插入，刻意绕过服务层的
+// 网关/广播地址排除——池行保留 /30 形态，但测试需要的是那两条 ip
+// 行）被 20 个 goroutine 竞争，每个都在自己的事务内领取。恰好两次
+// 领取可成功；两个获胜者必须持有不同的地址；每个败者必须以
+// ErrAllocationRetry（输掉条件式更新竞争）或 pgx.ErrNoRows（池耗尽）
+// 失败。该场景运行三轮，轮次之间清理 IP 表，因此侥幸无法通过。
 func TestPGConcurrentIPClaim(t *testing.T) {
 	ctx := context.Background()
 
@@ -102,11 +96,9 @@ func TestPGConcurrentIPClaim(t *testing.T) {
 		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
 			pgTestCleanIPData(t, ctx, pool)
 
-			// The /30 has two host addresses (10.0.0.1/10.0.0.2); the
-			// gateway takes one of them, so the service-level expansion
-			// would leave a single usable address. The repository is
-			// inserted directly on purpose: it accepts an explicit address
-			// list, giving the test exactly two free rows to race for.
+			// /30 有两个主机地址（10.0.0.1/10.0.0.2）；网关占用其中之一，
+			// 因此服务层的展开只会留下一个可用地址。这里刻意直接调用
+			// 仓库插入：它接受显式地址列表，给测试恰好两条可竞争的空闲行。
 			p, err := ipPoolRepo.CreatePoolWithIPs(ctx, model.IPPool{
 				ZoneID: zone.ID, Name: fmt.Sprintf("c30-round%d", round),
 				NetworkCIDR: networkCIDR, Gateway: gateway, DNS: "1.1.1.1",
@@ -124,11 +116,9 @@ func TestPGConcurrentIPClaim(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					// Every worker claims inside its own transaction: the
-					// SELECT-then-UPDATE pair must be atomic against the
-					// other workers, which is exactly what the conditional
-					// claim relies on (and what this test verifies for
-					// real).
+					// 每个 worker 都在自己的事务内领取：SELECT 后紧跟
+					// UPDATE 的组合必须对其他 worker 具有原子性，这正是
+					// 条件式领取所依赖的（也是本测试要真实验证的）。
 					tx, err := pool.Begin(ctx)
 					if err != nil {
 						mu.Lock()
@@ -170,15 +160,14 @@ func TestPGConcurrentIPClaim(t *testing.T) {
 					t.Fatalf("failure %d = %v, want ErrAllocationRetry or pgx.ErrNoRows", i, f)
 				}
 			}
-			// The two losers that lost the race on a still-free address
-			// must have been told to retry; the pool must now be empty.
+			// 在仍空闲的地址上输掉竞争的两个败者必须被告知重试；
+			// 此时池内必须已经为空。
 			if _, err := ipPoolRepo.AllocateFreeIP(ctx, p.ID, nil); !errors.Is(err, pgx.ErrNoRows) {
 				t.Fatalf("claim after exhaustion = %v, want pgx.ErrNoRows", err)
 			}
 		})
 	}
 
-	// Leave the shared test database tidy: the IP tables are cleaned after
-	// the last round too.
+	// 保持共享测试数据库整洁：最后一轮结束后同样清理 IP 表。
 	pgTestCleanIPData(t, ctx, pool)
 }

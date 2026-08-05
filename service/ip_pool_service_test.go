@@ -15,11 +15,10 @@ import (
 	"spark/repository"
 )
 
-// fakeIPPoolRepository simulates the IP pool repository. For allocation it
-// models the real SELECT-then-conditional-UPDATE behavior: a candidate is
-// picked without holding the claim, other goroutines may claim it first, and
-// the claim is only granted when the address is still free (otherwise
-// ErrAllocationRetry, mirroring the conditional UPDATE's 0 affected rows).
+// fakeIPPoolRepository 模拟 IP 池仓库。对于分配，它模拟真实的先 SELECT 后
+// 条件 UPDATE 行为：先挑选候选但不持有抢占，其他 goroutine 可能先抢到，只有
+// 在地址仍为空闲时抢占才被授予（否则返回 ErrAllocationRetry，镜像条件 UPDATE
+// 影响 0 行的情形）。
 type fakeIPPoolRepository struct {
 	mu          sync.Mutex
 	free        []string
@@ -95,8 +94,8 @@ func (f *fakeIPPoolRepository) AllocateFreeIP(ctx context.Context, poolID int64,
 	cand := f.free[i]
 	f.mu.Unlock()
 
-	// Simulate the window between the random SELECT and the conditional
-	// UPDATE in which another transaction may claim the same address.
+	// 模拟随机 SELECT 与条件 UPDATE 之间的窗口期，期间另一个事务可能抢占
+	// 同一地址。
 	time.Sleep(200 * time.Microsecond)
 
 	f.mu.Lock()
@@ -121,14 +120,14 @@ func (f *fakeIPPoolRepository) ReleaseIPByVM(ctx context.Context, vmID int64) er
 	return nil
 }
 
-// scriptedIPPoolRepository serves the deterministic retry-loop tests: it
-// returns a scripted result for the first calls and then a success.
+// scriptedIPPoolRepository 服务于确定性的重试循环测试：前几次调用返回脚本
+// 化的结果，之后返回成功。
 type scriptedIPPoolRepository struct {
 	pool        *model.IPPool
 	poolErr     error
-	retryCount  int  // number of initial ErrAllocationRetry results
-	alwaysRetry bool // every call fails with ErrAllocationRetry
-	noRows      bool // every call fails with pgx.ErrNoRows
+	retryCount  int  // 初始 ErrAllocationRetry 结果的数量
+	alwaysRetry bool // 每次调用都以 ErrAllocationRetry 失败
+	noRows      bool // 每次调用都以 pgx.ErrNoRows 失败
 	calls       int
 	successIP   model.IP
 }
@@ -253,11 +252,11 @@ func TestAllocateIPInZone(t *testing.T) {
 	}
 	svc := NewIPPoolService(repo, nil, nil)
 
-	// Wrong zone -> conflict.
+	// 错误的区域 -> conflict。
 	if _, err := svc.AllocateIPInZone(context.Background(), 3, 1); !isKind(err, KindConflict) {
 		t.Fatalf("cross-zone err = %v, want KindConflict", err)
 	}
-	// Right zone -> allocated.
+	// 正确的区域 -> 成功分配。
 	ip, err := svc.AllocateIPInZone(context.Background(), 5, 1)
 	if err != nil {
 		t.Fatalf("AllocateIPInZone: %v", err)
@@ -267,10 +266,9 @@ func TestAllocateIPInZone(t *testing.T) {
 	}
 }
 
-// TestConcurrentAllocateIP runs N concurrent allocations against a pool of M
-// free addresses with the repository's lost-update window simulated: no
-// address may ever be handed out twice, and requests beyond the pool's
-// capacity must come back as ip_exhausted.
+// TestConcurrentAllocateIP 在模拟了仓库丢失更新窗口的情况下，对含 M 个空闲
+// 地址的池执行 N 次并发分配：任何地址都绝不能发放两次，超出池容量的请求
+// 必须以 ip_exhausted 返回。
 func TestConcurrentAllocateIP(t *testing.T) {
 	const (
 		poolSize = 3
@@ -326,12 +324,12 @@ func TestConcurrentAllocateIP(t *testing.T) {
 	if len(allocated) > poolSize {
 		t.Fatalf("allocated %d addresses, pool has only %d", len(allocated), poolSize)
 	}
-	// At most poolSize addresses exist, so at least requestN-poolSize
-	// requests must have been rejected as exhausted.
+	// 最多存在 poolSize 个地址，因此至少有 requestN-poolSize 个请求必须以
+	// 耗尽为由被拒绝。
 	if exhausted < requestN-poolSize {
 		t.Fatalf("exhausted = %d, want >= %d", exhausted, requestN-poolSize)
 	}
-	// Every allocated address must come from the pool.
+	// 每个已分配的地址都必须来自该池。
 	poolAddrs := map[string]bool{"10.0.0.2": true, "10.0.0.3": true, "10.0.0.4": true}
 	for _, ip := range allocated {
 		if !poolAddrs[ip] {
@@ -425,7 +423,7 @@ func TestSetPoolNodesValidation(t *testing.T) {
 		{ID: 20, ZoneID: 2, Name: "other-zone", Host: "h2"},
 	}}
 
-	// Unknown pool -> not_found.
+	// 未知池 -> not_found。
 	missing := newFakeIPPoolRepository(nil)
 	missing.poolErr = pgx.ErrNoRows
 	svc := NewIPPoolService(missing, zoneRepo, nodeRepo)
@@ -434,15 +432,15 @@ func TestSetPoolNodesValidation(t *testing.T) {
 	}
 
 	svc = NewIPPoolService(newFakeIPPoolRepository(nil), zoneRepo, nodeRepo)
-	// Unknown node -> not_found.
+	// 未知节点 -> not_found。
 	if err := svc.SetPoolNodes(context.Background(), 1, []int64{99}); !isKind(err, KindNotFound) {
 		t.Fatalf("unknown node err = %v, want KindNotFound", err)
 	}
-	// Cross-zone node -> conflict.
+	// 跨区域节点 -> conflict。
 	if err := svc.SetPoolNodes(context.Background(), 1, []int64{20}); !isKind(err, KindConflict) {
 		t.Fatalf("cross-zone err = %v, want KindConflict", err)
 	}
-	// Duplicate ids are collapsed.
+	// 重复的 id 会被去重。
 	if err := svc.SetPoolNodes(context.Background(), 1, []int64{10, 10, 10}); err != nil {
 		t.Fatalf("set pool nodes: %v", err)
 	}
@@ -456,14 +454,12 @@ func TestExpandPoolIPs(t *testing.T) {
 	}{
 		{"10.0.0.0/30", "10.0.0.1", []string{"10.0.0.2"}},
 		{"10.0.0.0/29", "10.0.0.1", []string{"10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6"}},
-		// gateway on the network address: only the network address itself is
-		// dropped, 10.0.0.1 stays usable
+		// 网关位于网络地址上：只丢弃网络地址本身，10.0.0.1 仍然可用
 		{"10.0.0.0/30", "10.0.0.0", []string{"10.0.0.1", "10.0.0.2"}},
-		// gateway on the broadcast address: only the broadcast is dropped,
-		// 10.0.0.1 stays usable
+		// 网关位于广播地址上：只丢弃广播地址，10.0.0.1 仍然可用
 		{"10.0.0.0/30", "10.0.0.3", []string{"10.0.0.1", "10.0.0.2"}},
-		// /24 keeps the full range minus network/broadcast/gateway
-		{"10.0.0.0/24", "10.0.0.1", nil}, // length asserted below
+		// /24 保留完整范围减去网络/广播/网关地址
+		{"10.0.0.0/24", "10.0.0.1", nil}, // 长度在下方断言
 	}
 	for _, tc := range cases {
 		prefix := mustParsePrefix(t, tc.cidr)

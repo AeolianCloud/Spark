@@ -57,8 +57,8 @@ func TestParseSize(t *testing.T) {
 	}
 }
 
-// TestParseSizeRoundTrip keeps FormatSizeGB and ParseSize consistent for the
-// sizes the service layer emits (whole GiB).
+// TestParseSizeRoundTrip 保证 FormatSizeGB 与 ParseSize 对服务层产出的
+// 大小（整 GiB）保持一致性。
 func TestParseSizeRoundTrip(t *testing.T) {
 	for _, gb := range []int64{1, 4, 10, 32, 100} {
 		bytes, err := ParseSize(FormatSizeGB(gb))

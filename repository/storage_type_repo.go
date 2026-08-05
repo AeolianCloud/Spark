@@ -12,20 +12,20 @@ import (
 	"spark/model"
 )
 
-// StorageTypeRepository persists model.StorageType rows.
+// StorageTypeRepository 负责持久化 model.StorageType 行。
 type StorageTypeRepository struct {
 	pool *pgxpool.Pool
 }
 
-// NewStorageTypeRepository creates a StorageTypeRepository backed by pool.
+// NewStorageTypeRepository 创建由 pool 支撑的 StorageTypeRepository。
 func NewStorageTypeRepository(pool *pgxpool.Pool) *StorageTypeRepository {
 	return &StorageTypeRepository{pool: pool}
 }
 
 const storageTypeCols = "id, name, display_name, pve_storage, created_at"
 
-// Create inserts a storage type and returns it with id and created_at filled.
-// A duplicate name yields ErrConflict.
+// Create 插入一个存储类型并返回它，且已填充 id 与 created_at。
+// 名称重复时产生 ErrConflict。
 func (r *StorageTypeRepository) Create(ctx context.Context, name, displayName, pveStorage string) (*model.StorageType, error) {
 	st := &model.StorageType{Name: name, DisplayName: displayName, PVEStorage: pveStorage}
 	err := r.pool.QueryRow(ctx,
@@ -38,7 +38,7 @@ func (r *StorageTypeRepository) Create(ctx context.Context, name, displayName, p
 	return st, nil
 }
 
-// List returns all storage types ordered by id.
+// List 返回按 id 排序的全部存储类型。
 func (r *StorageTypeRepository) List(ctx context.Context) ([]model.StorageType, error) {
 	rows, err := r.pool.Query(ctx, "SELECT "+storageTypeCols+" FROM storage_types ORDER BY id")
 	if err != nil {
@@ -60,8 +60,7 @@ func (r *StorageTypeRepository) List(ctx context.Context) ([]model.StorageType, 
 	return types, nil
 }
 
-// ListPage returns one page of storage types ordered by id. It feeds the
-// paginated GET /storage-types endpoint.
+// ListPage 返回按 id 排序的一页存储类型。它服务于分页的 GET /storage-types 端点。
 func (r *StorageTypeRepository) ListPage(ctx context.Context, limit, offset int) ([]model.StorageType, error) {
 	rows, err := r.pool.Query(ctx,
 		"SELECT "+storageTypeCols+" FROM storage_types ORDER BY id LIMIT $1 OFFSET $2", limit, offset)
@@ -84,8 +83,7 @@ func (r *StorageTypeRepository) ListPage(ctx context.Context, limit, offset int)
 	return types, nil
 }
 
-// Count returns the total number of storage types, backing the
-// X-Total-Count header of GET /storage-types.
+// Count 返回存储类型总数，支撑 GET /storage-types 的 X-Total-Count 响应头。
 func (r *StorageTypeRepository) Count(ctx context.Context) (int, error) {
 	var n int
 	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM storage_types").Scan(&n); err != nil {
@@ -94,8 +92,7 @@ func (r *StorageTypeRepository) Count(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// Get returns the storage type with the given id, or pgx.ErrNoRows when
-// absent.
+// Get 返回指定 id 的存储类型；不存在时返回 pgx.ErrNoRows。
 func (r *StorageTypeRepository) Get(ctx context.Context, id int64) (*model.StorageType, error) {
 	var st model.StorageType
 	err := r.pool.QueryRow(ctx, "SELECT "+storageTypeCols+" FROM storage_types WHERE id=$1", id).
@@ -106,10 +103,9 @@ func (r *StorageTypeRepository) Get(ctx context.Context, id int64) (*model.Stora
 	return &st, nil
 }
 
-// Update replaces the metadata of the storage type with the given id and
-// returns the updated row. It returns pgx.ErrNoRows when absent and
-// ErrConflict on a duplicate name. Existing VMs keep referencing the row by
-// id, so updating the mapping never rewrites them (pure metadata).
+// Update 替换指定 id 存储类型的元数据并返回更新后的行。存储类型
+// 不存在时返回 pgx.ErrNoRows，名称重复时返回 ErrConflict。既有 VM
+// 始终按 id 引用该行，因此更新映射不会改写它们（纯元数据）。
 func (r *StorageTypeRepository) Update(ctx context.Context, id int64, name, displayName, pveStorage string) (*model.StorageType, error) {
 	var st model.StorageType
 	err := r.pool.QueryRow(ctx,
@@ -122,10 +118,9 @@ func (r *StorageTypeRepository) Update(ctx context.Context, id int64, name, disp
 	return &st, nil
 }
 
-// Delete removes the storage type with the given id. In the same transaction
-// it refuses the delete when any VM still references the row (ErrInUse), so
-// existing VMs keep their storage mapping. It returns pgx.ErrNoRows when the
-// id does not exist.
+// Delete 删除指定 id 的存储类型。在同一事务中，当仍有 VM 引用该行时
+// 拒绝删除（ErrInUse），以保证既有 VM 保留其存储映射。
+// id 不存在时返回 pgx.ErrNoRows。
 func (r *StorageTypeRepository) Delete(ctx context.Context, id int64) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -154,10 +149,9 @@ func (r *StorageTypeRepository) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
-// classifyDBError maps well-known database errors onto repository sentinels.
-// Everything else (including pgx.ErrNoRows) is returned unchanged so callers
-// can match on it directly. Shared by every repository (storage types,
-// images, zones, nodes, IP pools) via the package-level helper.
+// classifyDBError 将已知的数据库错误映射到仓库的哨兵错误上。
+// 其余错误（包括 pgx.ErrNoRows）原样返回，调用方可以直接进行匹配。
+// 通过包级助手被每个仓库共享（存储类型、镜像、区域、节点、IP 池）。
 func classifyDBError(err error) error {
 	if err == nil {
 		return nil
@@ -165,9 +159,9 @@ func classifyDBError(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
-		case "23505": // unique_violation
+		case "23505": // 唯一约束冲突
 			return ErrConflict
-		case "23503": // foreign_key_violation
+		case "23503": // 外键约束冲突
 			return ErrInUse
 		}
 	}

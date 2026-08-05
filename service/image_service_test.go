@@ -74,11 +74,10 @@ func TestFilterImagesAvailableByNodes(t *testing.T) {
 	}
 }
 
-// TestSlicePage pins down the shared Go-side page slicing used by the zone
-// image list: the slice never runs past the end, an offset past the end
-// yields an empty result, and a limit of 0 yields an empty page. Negative
-// limit/offset are clamped to 0 (the HTTP layer rejects them, but the shared
-// helper must not panic or mis-slice for callers that pass them).
+// TestSlicePage 固定区域镜像列表使用的共享 Go 侧页切片行为：切片绝不会越出
+// 末尾，越界的 offset 产生空结果，limit 为 0 产生空页。负的 limit/offset 会
+// 被钳制为 0（HTTP 层会拒绝它们，但共享辅助函数不能因调用方传入负值而 panic
+// 或错误切片）。
 func TestSlicePage(t *testing.T) {
 	items := []int{1, 2, 3, 4, 5}
 	cases := []struct {

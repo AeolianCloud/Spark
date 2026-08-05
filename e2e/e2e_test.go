@@ -1,20 +1,17 @@
 //go:build e2e
 
-// End-to-end verification of the full VM lifecycle against a real PostgreSQL
-// database and a fake PVE server (task 9.2): every step goes through the
-// complete HTTP stack — gin router, handlers, services, repositories,
-// real database, and an in-memory fake of the PVE JSON API pointed at via
-// api.WithVMClientFactory (the pve client's base URL is injected with
-// pve.WithBaseURL).
+// 针对真实 PostgreSQL 数据库和 fake PVE 服务器（任务 9.2）的完整虚拟机生命周期端到端验证：
+// 每个步骤都会走完完整的 HTTP 链路——gin 路由、处理器、服务层、仓储层、
+// 真实数据库，以及通过 api.WithVMClientFactory 注入的内存版 PVE JSON API 模拟
+// （pve 客户端的 base URL 通过 pve.WithBaseURL 注入）。
 //
-// Run with:
+// 运行方式：
 //
 //	SPARK_E2E_DSN='postgres://spark:spark@127.0.0.1:5432/spark_test' \
 //	  go test -tags=e2e ./e2e/ -count=1 -v
 //
-// The suite TRUNCATEs every business table (zones, nodes, ip pools, ips,
-// storage types, images, vms) before and after itself, so it can share the
-// database with the -tags=pg repository tests.
+// 该测试套件会在运行前后 TRUNCATE 所有业务表（zones、nodes、ip pools、ips、
+// storage types、images、vms），因此它可以与 -tags=pg 仓储测试共享同一个数据库。
 package e2e
 
 import (
@@ -42,11 +39,11 @@ import (
 	"spark/pve"
 )
 
-// ---------- fake PVE server ----------
+// ---------- fake PVE 服务器 ----------
 
-// fakePVEVM is one VM as registered on the fake node. createBody keeps the
-// raw POST /qemu payload so the test can assert the one-step create chain
-// (scsi0 import-from, ide2 cloud-init, net0 vmbr0, cloud-init injection).
+// fakePVEVM 是注册在 fake 节点上的一台虚拟机。createBody 保留了
+// POST /qemu 的原始请求体，以便测试可以断言一步式创建链路
+// （scsi0 import-from、ide2 cloud-init、net0 vmbr0、cloud-init 注入）。
 type fakePVEVM struct {
 	vmid       int64
 	name       string
@@ -55,9 +52,8 @@ type fakePVEVM struct {
 	createBody map[string]any
 }
 
-// fakePVE is an in-memory implementation of the PVE JSON API endpoints the
-// service uses. All state is guarded by mu: the app's detached provisioning
-// goroutine and the test goroutine hit it concurrently.
+// fakePVE 是服务所依赖的 PVE JSON API 端点的内存实现。
+// 所有状态都由 mu 保护：应用的后台配置 goroutine 与测试 goroutine 会并发访问它。
 type fakePVE struct {
 	t *testing.T
 
@@ -70,13 +66,13 @@ func newFakePVE(t *testing.T) *fakePVE {
 	return &fakePVE{t: t, nextVMID: 100, vms: map[int64]*fakePVEVM{}}
 }
 
-// upid builds a parseable UPID whose node segment is the requesting node, so
-// WaitTask polls /nodes/{node}/tasks/{upid}/status on the same fake.
+// upid 构造一个可解析的 UPID，其节点段为发起请求的节点，这样
+// WaitTask 会在同一个 fake 上轮询 /nodes/{node}/tasks/{upid}/status。
 func (f *fakePVE) upid(node, taskType string, vmid int64) string {
 	return fmt.Sprintf("UPID:%s:00000E5B:01C9EC9E:5FAB1EC4:%s:%d:root@pam:", node, taskType, vmid)
 }
 
-// get returns a copy-safe pointer to the VM with the given vmid, or nil.
+// get 返回指定 vmid 对应虚拟机的拷贝安全指针，若不存在则返回 nil。
 func (f *fakePVE) get(vmid int64) *fakePVEVM {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -92,7 +88,7 @@ func (f *fakePVE) get(vmid int64) *fakePVEVM {
 	return &cp
 }
 
-// writeJSON answers the standard PVE envelope {"data": ...}.
+// writeJSON 以标准的 PVE 信封格式 {"data": ...} 返回响应。
 func (f *fakePVE) writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]any{"data": data}); err != nil {
@@ -101,8 +97,8 @@ func (f *fakePVE) writeJSON(w http.ResponseWriter, data any) {
 }
 
 func (f *fakePVE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// The pve client is pointed at http://{host}:{port}/api2/json, so every
-	// request path carries the /api2/json prefix; strip it and dispatch.
+	// pve 客户端指向 http://{host}:{port}/api2/json，因此每个
+	// 请求路径都带有 /api2/json 前缀；去掉该前缀后再进行分发。
 	p := strings.TrimPrefix(r.URL.Path, "/api2/json")
 	parts := strings.Split(strings.Trim(p, "/"), "/")
 
@@ -130,7 +126,7 @@ func (f *fakePVE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 4 && parts[0] == "nodes" && parts[2] == "qemu" && r.Method == http.MethodDelete:
 		f.handleDelete(w, parts[1], parts[3])
 	case len(parts) == 5 && parts[0] == "nodes" && parts[2] == "tasks" && parts[4] == "status" && r.Method == http.MethodGet:
-		// Every fake task completes immediately with exitstatus OK.
+		// 所有 fake 任务都会立即以 exitstatus OK 完成。
 		f.writeJSON(w, map[string]any{
 			"upid": parts[3], "node": parts[1], "type": "fake", "id": "0",
 			"user": "root@pam", "status": "stopped", "exitstatus": "OK",
@@ -142,11 +138,11 @@ func (f *fakePVE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleCreate implements POST /nodes/{node}/qemu: it records the create
-// parameters verbatim (scsi0/net0/ide2/ciuser/cipassword/ipconfig0/
-// nameserver/bootdisk/scsihw), registers the VM as stopped and returns a
-// qmcreate UPID. The scsi0 disk string gets a "size=10G" matching the test
-// VM's requested disk_gb, so provisioning needs no resize.
+// handleCreate 实现 POST /nodes/{node}/qemu：它会原样记录创建
+// 参数（scsi0/net0/ide2/ciuser/cipassword/ipconfig0/
+// nameserver/bootdisk/scsihw），将虚拟机注册为 stopped 状态并返回一个
+// qmcreate UPID。scsi0 磁盘字符串带有与测试虚拟机请求的 disk_gb
+// 匹配的 "size=10G"，因此配置过程无需执行 resize。
 func (f *fakePVE) handleCreate(w http.ResponseWriter, r *http.Request, node string) {
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -186,8 +182,8 @@ func (f *fakePVE) handleCreate(w http.ResponseWriter, r *http.Request, node stri
 	f.writeJSON(w, f.upid(node, "qmcreate", vmid))
 }
 
-// handleList implements GET /nodes/{node}/qemu: the registered VMs with
-// their live status fields.
+// handleList 实现 GET /nodes/{node}/qemu：返回已注册的虚拟机及其
+// 实时状态字段。
 func (f *fakePVE) handleList(w http.ResponseWriter, node string) {
 	f.mu.Lock()
 	list := make([]map[string]any, 0, len(f.vms))
@@ -220,8 +216,8 @@ func (f *fakePVE) handleGetConfig(w http.ResponseWriter, vmid string) {
 	f.writeJSON(w, vm.config)
 }
 
-// handlePutConfig implements PUT .../qemu/{vmid}/config: the endpoint is
-// synchronous on PVE 7/8/9, so the reply is {"data": null}.
+// handlePutConfig 实现 PUT .../qemu/{vmid}/config：在 PVE 7/8/9 上该端点是
+// 同步的，因此响应为 {"data": null}。
 func (f *fakePVE) handlePutConfig(w http.ResponseWriter, r *http.Request, vmid string) {
 	id, _ := strconv.ParseInt(vmid, 10, 64)
 	var body map[string]any
@@ -243,8 +239,8 @@ func (f *fakePVE) handlePutConfig(w http.ResponseWriter, r *http.Request, vmid s
 	f.writeJSON(w, nil)
 }
 
-// handleResize implements PUT .../qemu/{vmid}/resize: the disk string's size
-// is replaced and a resize UPID is returned (PVE 8/9 semantics).
+// handleResize 实现 PUT .../qemu/{vmid}/resize：磁盘字符串的 size 部分
+// 会被替换，并返回一个 resize UPID（PVE 8/9 语义）。
 func (f *fakePVE) handleResize(w http.ResponseWriter, r *http.Request, node, vmid string) {
 	id, _ := strconv.ParseInt(vmid, 10, 64)
 	var body map[string]any
@@ -289,7 +285,7 @@ func (f *fakePVE) handleDelete(w http.ResponseWriter, node, vmid string) {
 	f.writeJSON(w, f.upid(node, "qmdestroy", id))
 }
 
-// ---------- helpers ----------
+// ---------- 辅助函数 ----------
 
 func e2eDSN() string {
 	if dsn := os.Getenv("SPARK_E2E_DSN"); dsn != "" {
@@ -298,8 +294,8 @@ func e2eDSN() string {
 	return "postgres://spark:spark@127.0.0.1:5432/spark_test"
 }
 
-// e2eCipher builds a cipher from a deterministic 32-byte key (same pattern
-// as the api/service unit tests).
+// e2eCipher 使用确定的 32 字节密钥构造 cipher（与 api/service 单元测试
+// 相同的模式）。
 func e2eCipher(t *testing.T) *crypto.Cipher {
 	t.Helper()
 	key := make([]byte, 32)
@@ -315,11 +311,11 @@ func e2eCipher(t *testing.T) *crypto.Cipher {
 	return c
 }
 
-// truncateBusinessTables wipes every business table in one statement.
-// CASCADE follows the FK chain (zones -> ip_pools/pve_nodes/vms -> ips/
-// ip_pool_nodes) and the statement lists the FK-root tables that vms
-// references (storage_types, images); schema_migrations and schema_probe
-// are untouched.
+// truncateBusinessTables 用一条语句清空所有业务表。
+// CASCADE 会顺着外键链（zones -> ip_pools/pve_nodes/vms -> ips/
+// ip_pool_nodes）级联删除，语句中还列出了 vms 所引用的外键根表
+// （storage_types、images）；schema_migrations 和 schema_probe
+// 不会被触碰。
 func truncateBusinessTables(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 	if _, err := pool.Exec(ctx, "TRUNCATE zones, storage_types, images CASCADE"); err != nil {
@@ -327,12 +323,12 @@ func truncateBusinessTables(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 	}
 }
 
-// e2eDo performs one HTTP call against the test server and asserts the
-// status code; the decoded JSON body is returned as any.
+// e2eDo 对测试服务器执行一次 HTTP 调用并断言
+// 状态码；解码后的 JSON body 以 any 类型返回。
 func e2eDo(t *testing.T, client *http.Client, base, method, path string, body any, want int) any {
 	t.Helper()
-	// io.Reader (not *strings.Reader): a typed nil would be non-nil to
-	// http.NewRequest, which calls Len() on the strings.Reader and panics.
+	// 使用 io.Reader（而非 *strings.Reader）：类型化的 nil 对 http.NewRequest
+	// 来说是非 nil 的，它会调用 strings.Reader 的 Len() 从而引发 panic。
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -360,7 +356,7 @@ func e2eDo(t *testing.T, client *http.Client, base, method, path string, body an
 	}
 	var out any
 	if resp.StatusCode == http.StatusNoContent {
-		// 204 carries no body by contract; the caller gets nil.
+		// 按约定 204 无响应体；调用方将得到 nil。
 		return nil
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -369,8 +365,7 @@ func e2eDo(t *testing.T, client *http.Client, base, method, path string, body an
 	return out
 }
 
-// e2eObj asserts that a decoded JSON body is an object and returns it as a
-// map.
+// e2eObj 断言解码后的 JSON body 是一个对象，并以 map 形式返回。
 func e2eObj(t *testing.T, v any) map[string]any {
 	t.Helper()
 	m, ok := v.(map[string]any)
@@ -380,13 +375,12 @@ func e2eObj(t *testing.T, v any) map[string]any {
 	return m
 }
 
-// ---------- the end-to-end scenario ----------
+// ---------- 端到端场景 ----------
 
-// TestE2EVMFullLifecycle runs the whole scenario of task 9.2 through the
-// real HTTP stack: register zone/node/IP pool/storage type/image, create a
-// VM (async provisioning against the fake PVE), exercise start/stop/restart,
-// resize (shrink rejected, grow applied), verify the pass-through list and
-// detail, destroy, and assert the IP was released and the row deleted.
+// TestE2EVMFullLifecycle 通过完整的 HTTP 链路运行任务 9.2 的整个场景：
+// 注册 zone/node/IP 池/存储类型/镜像，创建虚拟机（在 fake PVE 上异步配置），
+// 执行 start/stop/restart，resize（缩小被 422 拒绝、扩容生效），
+// 验证透传的列表与详情，销毁，并断言 IP 已被释放、数据库行已被删除。
 func TestE2EVMFullLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
@@ -401,13 +395,13 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	// Clean slate for a re-run after an aborted run, and again at the end.
+	// 为中断后的重跑清空数据，结束时再清空一次。
 	truncateBusinessTables(t, ctx, pool)
 	defer truncateBusinessTables(t, ctx, pool)
 
-	// The fake PVE server; the pve client's base URL is injected per node
-	// via api.WithVMClientFactory + pve.WithBaseURL (the router otherwise
-	// has no way to know the fake's address).
+	// fake PVE 服务器；pve 客户端的 base URL 通过
+	// api.WithVMClientFactory + pve.WithBaseURL 逐节点注入（否则路由
+	// 无从得知 fake 的地址）。
 	fakePVE := newFakePVE(t)
 	pveServer := httptest.NewServer(fakePVE)
 	defer pveServer.Close()
@@ -425,9 +419,8 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	client := app.Client()
 	base := app.URL
 
-	// 1. Register the deployment: zone, node (host is only stored; the
-	// client factory ignores it), IP pool + node whitelist, storage type,
-	// image (present on the node).
+	// 1. 注册部署环境：zone、node（host 仅被存储；客户端工厂会忽略它）、
+	// IP 池 + 节点白名单、存储类型、镜像（在节点上存在）。
 	zone := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/zones", map[string]any{"name": "e2e-zone"}, http.StatusCreated))
 	zoneID := int64(zone["id"].(float64))
 
@@ -457,8 +450,8 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	}, http.StatusCreated))
 	imgID := int64(img["id"].(float64))
 
-	// 2. Create the VM: 201, IP assigned, transitional "creating" status
-	// (the PVE side does not exist yet).
+	// 2. 创建虚拟机：201、已分配 IP、过渡状态 "creating"
+	// （PVE 侧此时还不存在）。
 	const (
 		vmName  = "e2e-vm-1"
 		vmPW    = "s3cret-pw"
@@ -479,9 +472,8 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 		t.Fatalf("create status = %v, want creating", created["status"])
 	}
 
-	// 3. Poll until the detached provisioning chain finishes (status leaves
-	// creating/failed, 15s budget); a failed provision is a test failure
-	// with the recorded error printed.
+	// 3. 轮询直至后台配置链路完成（状态离开 creating/failed，
+	// 预算 15 秒）；配置失败即为测试失败，并打印记录的错误。
 	var detail map[string]any
 	deadline := time.Now().Add(15 * time.Second)
 	for {
@@ -506,10 +498,10 @@ provisioned:
 		t.Fatalf("status = %v, want stopped (freshly created)", detail["status"])
 	}
 
-	// 4. Assert the PVE-side create parameters recorded by the fake: the
-	// one-step chain (scsi0 import-from + storage, ide2 cloudinit, net0
-	// vmbr0, cloud-init injection with the image's default_user, the
-	// allocated IP and the pool's gateway/DNS, bootdisk/scsihw).
+	// 4. 断言 fake 记录下来的 PVE 侧创建参数：一步式链路
+	// （scsi0 import-from + 存储、ide2 cloudinit、net0 vmbr0、
+	// 使用镜像 default_user 的 cloud-init 注入、分配的 IP 及池的
+	// gateway/DNS、bootdisk/scsihw）。
 	registered := fakePVE.get(100)
 	if registered == nil {
 		t.Fatal("fake pve has no VM 100")
@@ -539,8 +531,8 @@ provisioned:
 	assertCreate("bootdisk", "scsi0")
 	assertCreate("scsihw", "virtio-scsi-pci")
 
-	// 5. Lifecycle: start -> PVE running, stop -> stopped, restart ->
-	// running.
+	// 5. 生命周期：start -> PVE running、stop -> stopped、restart ->
+	// running。
 	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/start", vmID), nil, http.StatusAccepted)
 	if s := fakePVE.get(100); s == nil || s.status != "running" {
 		t.Fatalf("fake pve status after start = %+v, want running", s)
@@ -554,10 +546,10 @@ provisioned:
 		t.Fatalf("fake pve status after restart = %+v, want running", s)
 	}
 
-	// 6. Resize: shrinking the disk is refused with 422; growing cpu/mem/
-	// disk succeeds and is applied on the PVE side (config + resize). The
-	// operation is a PATCH of the VM resource (JSON Merge Patch semantics:
-	// absent fields keep their current values).
+	// 6. Resize：缩小磁盘会被 422 拒绝；增大 cpu/mem/
+	// disk 会成功，并在 PVE 侧生效（config + resize）。
+	// 该操作是对虚拟机资源的 PATCH（JSON Merge Patch 语义：
+	// 未出现的字段保持当前值）。
 	e2eDo(t, client, base, http.MethodPatch, fmt.Sprintf("/vms/%d", vmID),
 		map[string]any{"disk_gb": 5}, http.StatusUnprocessableEntity)
 
@@ -577,8 +569,8 @@ provisioned:
 		t.Fatalf("pve scsi0 after resize = %q, want size=20G", cfg["scsi0"])
 	}
 
-	// 7. Pass-through list and detail: the VM appears with the live PVE
-	// status (running after the restart).
+	// 7. 透传的列表与详情：虚拟机以实时 PVE
+	// 状态出现（restart 后为 running）。
 	list := e2eObj(t, e2eDo(t, client, base, http.MethodGet, "/vms", nil, http.StatusOK))
 	found := false
 	for _, raw := range list["vms"].([]any) {
@@ -598,9 +590,9 @@ provisioned:
 		t.Fatalf("detail status = %v, want running", detail["status"])
 	}
 
-	// 7b. Pagination: GET /vms?limit=1&offset=0 must return at most one
-	// item and carry the X-Total-Count header with the real total (>= 1 at
-	// this point of the scenario, the created VM is in the database).
+	// 7b. 分页：GET /vms?limit=1&offset=0 最多返回一个
+	// 条目，并携带 X-Total-Count 响应头，其值为真实总数（在当前场景
+	// 阶段 >= 1，因为已创建的虚拟机在数据库中）。
 	pagedReq, err := http.NewRequest(http.MethodGet, base+"/vms?limit=1&offset=0", nil)
 	if err != nil {
 		t.Fatalf("build paginated list request: %v", err)
@@ -636,8 +628,8 @@ provisioned:
 		}
 	}
 
-	// 8. Destroy: DELETE /vms/:id answers 204 with no body; the PVE VM is
-	// removed, the IP released back to free, the vms row gone.
+	// 8. 销毁：DELETE /vms/:id 返回 204 且无响应体；PVE 虚拟机被
+	// 删除，IP 释放回 free，vms 数据行消失。
 	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusNoContent)
 	if got := fakePVE.get(100); got != nil {
 		t.Fatalf("fake pve still has VM 100 after destroy: %+v", got)

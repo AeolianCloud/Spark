@@ -15,7 +15,7 @@ import (
 	"spark/repository"
 )
 
-// ---------- pure merge tests (task 8.1/8.3) ----------
+// ---------- 纯合并测试（任务 8.1/8.3） ----------
 
 func vw(id, nodeID, vmid int64, name string) repository.VMWithIP {
 	return repository.VMWithIP{
@@ -25,8 +25,8 @@ func vw(id, nodeID, vmid int64, name string) repository.VMWithIP {
 	}
 }
 
-// TestMergeVMListItemsDownNode verifies task 8.3: a failed node contributes a
-// warning and none of its VMs; the other node's VMs still appear.
+// TestMergeVMListItemsDownNode 验证任务 8.3：失败的节点贡献一条警告且其
+// VM 全部缺席；另一节点的 VM 仍然出现。
 func TestMergeVMListItemsDownNode(t *testing.T) {
 	local := []repository.VMWithIP{vw(1, 1, 100, "vm1"), vw(2, 2, 200, "vm2"), vw(3, 1, 101, "vm3")}
 	nodes := map[int64]nodeQueryResult{
@@ -46,19 +46,19 @@ func TestMergeVMListItemsDownNode(t *testing.T) {
 	}
 }
 
-// TestMergeVMListItemsStatuses covers the full status matrix of task 8.1:
-// creating (pve_vmid=0), failed (provision_error), merged live status,
-// PVE-only skipped, and VM gone from a reachable node (design D5 -> creating).
+// TestMergeVMListItemsStatuses 覆盖任务 8.1 的完整状态矩阵：creating
+// （pve_vmid=0）、failed（provision_error）、合并的实时状态、仅存在于 PVE
+// 的被跳过，以及 VM 从可达节点消失（设计 D5 -> creating）。
 func TestMergeVMListItemsStatuses(t *testing.T) {
 	local := []repository.VMWithIP{
-		vw(1, 1, 0, "creating-vm"), // creating
+		vw(1, 1, 0, "creating-vm"), // 创建中
 		{VM: model.VM{ID: 2, UUID: "u", Name: "failed-vm", ZoneID: 1, NodeID: 1,
 			CPU: 2, MemMB: 2048, DiskGB: 10, ProvisionError: "create (vmid=100) failed: no space"}, IP: "10.0.0.6"},
-		vw(3, 1, 100, "live-vm"), // merged with the PVE status
-		vw(4, 1, 101, "gone-vm"), // PVE reachable but the VM vanished
+		vw(3, 1, 100, "live-vm"), // 与 PVE 状态合并
+		vw(4, 1, 101, "gone-vm"), // PVE 可达但 VM 已消失
 	}
 	nodes := map[int64]nodeQueryResult{
-		// 999 is a PVE-only VM: it must be skipped (no local metadata).
+		// 999 是仅存在于 PVE 的 VM：它必须被跳过（没有本地元数据）。
 		1: {Name: "pve1", VMs: []pve.VMStatus{
 			{VMID: 100, Name: "live-vm", Status: "running", CPU: 0.25, Cpus: 2,
 				Mem: 1073741824, MaxMem: 2147483648, Disk: 5368709120, MaxDisk: 10737418240, Uptime: 12345},
@@ -93,7 +93,7 @@ func TestMergeVMListItemsStatuses(t *testing.T) {
 		live.Live.Disk != 5368709120 || live.Live.MaxDisk != 10737418240 || live.Live.Uptime != 12345 {
 		t.Fatalf("live metrics = %+v, want the PVE values", live.Live)
 	}
-	// Spec sizes stay local (design D1): merged item keeps the DB values.
+	// 规格大小保持本地值（设计 D1）：合并项保留数据库中的值。
 	if live.VM.VM.CPU != 2 || live.VM.VM.MemMB != 2048 || live.VM.VM.DiskGB != 10 {
 		t.Fatalf("merged spec = %+v, want the local DB values", live.VM.VM)
 	}
@@ -103,8 +103,8 @@ func TestMergeVMListItemsStatuses(t *testing.T) {
 	}
 }
 
-// TestMergeVMListItemsWarningOrder checks deterministic output: warnings are
-// sorted by node name regardless of map iteration order.
+// TestMergeVMListItemsWarningOrder 检查输出的确定性：无论 map 迭代顺序
+// 如何，警告都按节点名排序。
 func TestMergeVMListItemsWarningOrder(t *testing.T) {
 	nodes := map[int64]nodeQueryResult{
 		3: {Name: "pve-c", Err: errors.New("c down")},
@@ -123,9 +123,8 @@ func TestMergeVMListItemsWarningOrder(t *testing.T) {
 	}
 }
 
-// TestMergeVMListItemsUnknownNode covers the disabled/unknown-node branch: a
-// local VM whose node is not among the queried enabled nodes is omitted and
-// produces a warning, with the same semantics as a failed node query.
+// TestMergeVMListItemsUnknownNode 覆盖禁用/未知节点分支：节点不在被查询
+// 启用节点之列的本地 VM 会被省略并产生警告，语义与节点查询失败相同。
 func TestMergeVMListItemsUnknownNode(t *testing.T) {
 	local := []repository.VMWithIP{
 		vw(1, 1, 100, "vm1"),
@@ -143,7 +142,7 @@ func TestMergeVMListItemsUnknownNode(t *testing.T) {
 	if len(warnings) != 2 {
 		t.Fatalf("warnings = %+v, want 2", warnings)
 	}
-	// Sorted by node key (the id string): "3" before "4".
+	// 按节点键（id 字符串）排序："3" 在 "4" 之前。
 	if warnings[0].Node != "3" || warnings[1].Node != "4" {
 		t.Fatalf("warnings = %+v, want nodes 3 then 4", warnings)
 	}
@@ -154,11 +153,11 @@ func TestMergeVMListItemsUnknownNode(t *testing.T) {
 	}
 }
 
-// ---------- service-level list test (task 8.1/8.3) ----------
+// ---------- 服务级列表测试（任务 8.1/8.3） ----------
 
-// TestVMServiceListVMs drives the full list path: two zones/nodes, one PVE
-// server per node, one node failing. The merged output must contain the
-// reachable node's VMs (live + creating) and a warning for the dead node.
+// TestVMServiceListVMs 驱动完整列表路径：两个区域/节点，每个节点一个 PVE
+// 服务器，其中一个节点失败。合并输出必须包含可达节点的 VM（live +
+// creating）以及针对死节点的警告。
 func TestVMServiceListVMs(t *testing.T) {
 	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/nodes/pve1/qemu" {
@@ -216,10 +215,9 @@ func TestVMServiceListVMs(t *testing.T) {
 	}
 }
 
-// TestVMServiceListVMsRepoErrors pins down the hard-failure paths of the
-// list: the zone / enabled-node / local-metadata reads are prerequisites, so
-// their errors fail the whole request instead of degrading into warnings
-// (warnings are reserved for the per-node PVE failures, task 8.3).
+// TestVMServiceListVMsRepoErrors 固定列表的硬失败路径：区域/启用节点/本地
+// 元数据读取是前置条件，因此它们的错误会让整个请求失败，而不是降级为警告
+// （警告仅保留给每节点的 PVE 失败，任务 8.3）。
 func TestVMServiceListVMsRepoErrors(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{},
 		&fakeVMZoneRepository{}, &fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
@@ -242,10 +240,9 @@ func TestVMServiceListVMsRepoErrors(t *testing.T) {
 	}
 }
 
-// TestVMServiceListVMsPagination verifies the paging contract of GET /vms:
-// limit/offset select the page of local metadata rows (the PVE merge only
-// sees that page), and total is the full local VM count even when a node is
-// down and its VMs are dropped from the page.
+// TestVMServiceListVMsPagination 验证 GET /vms 的分页契约：limit/offset
+// 选择本地元数据行的页（PVE 合并只看到该页），total 始终是本地 VM 总数，
+// 即使某节点宕机且其 VM 从该页被丢弃。
 func TestVMServiceListVMsPagination(t *testing.T) {
 	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/nodes/pve1/qemu" {
@@ -273,7 +270,7 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 			pve.WithBaseURL(clients[host].URL), pve.WithHTTPClient(clients[host].Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	// Page 1 (offset 0, limit 2): the first two local rows by id order.
+	// 第 1 页（offset 0，limit 2）：按 id 顺序的前两行本地记录。
 	items, warnings, total, err := svc.ListVMs(context.Background(), 2, 0)
 	if err != nil {
 		t.Fatalf("ListVMs: %v", err)
@@ -288,7 +285,7 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 		t.Fatalf("warnings = %+v, want none", warnings)
 	}
 
-	// Page 2 (offset 2, limit 2): the last row, merged live.
+	// 第 2 页（offset 2，limit 2）：最后一行，实时合并。
 	items, _, total, err = svc.ListVMs(context.Background(), 2, 2)
 	if err != nil {
 		t.Fatalf("ListVMs page 2: %v", err)
@@ -300,7 +297,7 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 		t.Fatalf("items = %+v, want local row 3", items)
 	}
 
-	// Offset past the end: empty page, total unchanged.
+	// offset 越界：空页，total 不变。
 	items, _, total, err = svc.ListVMs(context.Background(), 2, 10)
 	if err != nil {
 		t.Fatalf("ListVMs past the end: %v", err)
@@ -310,10 +307,10 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 	}
 }
 
-// ---------- detail tests (task 8.2/8.3) ----------
+// ---------- 详情测试（任务 8.2/8.3） ----------
 
-// TestGetVMDetailStatuses covers the local branches: not_found, creating
-// (pve_vmid=0) and failed (provision_error) — none of them touches PVE.
+// TestGetVMDetailStatuses 覆盖本地分支：not_found、creating（pve_vmid=0）
+// 和 failed（provision_error）——它们都不接触 PVE。
 func TestGetVMDetailStatuses(t *testing.T) {
 	ts := noCallServer(t)
 	defer ts.Close()
@@ -363,9 +360,9 @@ func TestGetVMDetailStatuses(t *testing.T) {
 	}
 }
 
-// TestGetVMDetailMergesLive drives the PVE branches with a fake node server:
-// found -> merged live status; absent -> creating (design D5); node failure
-// -> node_unavailable (task 8.3, never a fake creating).
+// TestGetVMDetailMergesLive 用假节点服务器驱动 PVE 分支：找到 -> 合并实时
+// 状态；不存在 -> creating（设计 D5）；节点失败 -> node_unavailable（任务
+// 8.3，绝不是伪造的 creating）。
 func TestGetVMDetailMergesLive(t *testing.T) {
 	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": [{"vmid": 100, "name": "vm1", "status": "running", "cpu": 0.75, "mem": 2048, "maxmem": 4096, "disk": 512, "maxdisk": 1024, "uptime": 99}]}`)
@@ -389,7 +386,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 		}
 	}
 
-	// PVE reachable, VM present -> merged live status.
+	// PVE 可达、VM 存在 -> 合并实时状态。
 	vm := &repository.VMWithIP{VM: model.VM{ID: 1, NodeID: 1, PVEVmid: 100, CPU: 2, MemMB: 2048, DiskGB: 10}, IP: "10.0.0.5"}
 	svc := newVMService(t, &fakeVMRepository{get: vm}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
@@ -405,7 +402,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 		t.Fatalf("spec = %+v, want the local DB values", item.VM.VM)
 	}
 
-	// PVE reachable, VM absent -> creating (D5), no error.
+	// PVE 可达、VM 不存在 -> creating（D5），无错误。
 	gone := &repository.VMWithIP{VM: model.VM{ID: 1, NodeID: 1, PVEVmid: 500}}
 	svc2 := newVMService(t, &fakeVMRepository{get: gone}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
@@ -418,7 +415,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 		t.Fatalf("item = %+v, want creating", item)
 	}
 
-	// Node failure -> node_unavailable (8.3), never disguised as creating.
+	// 节点失败 -> node_unavailable（8.3），绝不伪装成 creating。
 	vm2 := &repository.VMWithIP{VM: model.VM{ID: 1, NodeID: 2, PVEVmid: 100}}
 	svc3 := newVMService(t, &fakeVMRepository{get: vm2}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
@@ -432,10 +429,9 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 	}
 }
 
-// TestGetVMDetailGetNodeFails covers the node-lookup branches of the detail
-// path: a missing node row (disabled/removed independently of the vms rows)
-// is a node_unavailable — never a fake creating — and any other repository
-// failure stays a plain error.
+// TestGetVMDetailGetNodeFails 覆盖详情路径的节点查找分支：缺失的节点行
+// （与 vms 行相互独立地被禁用/移除）是 node_unavailable——绝不是伪造的
+// creating——其他任何仓库失败保持普通错误。
 func TestGetVMDetailGetNodeFails(t *testing.T) {
 	ts := noCallServer(t)
 	defer ts.Close()
@@ -444,7 +440,7 @@ func TestGetVMDetailGetNodeFails(t *testing.T) {
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	// Node row absent (pgx.ErrNoRows) -> node_unavailable.
+	// 节点行缺失（pgx.ErrNoRows）-> node_unavailable。
 	vm := &repository.VMWithIP{VM: model.VM{ID: 1, NodeID: 99, PVEVmid: 100}}
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, Name: "pve1"}}}
 	svc := newVMService(t, &fakeVMRepository{get: vm}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
@@ -455,7 +451,7 @@ func TestGetVMDetailGetNodeFails(t *testing.T) {
 		t.Fatalf("err = %v, want KindNodeUnavailable for a missing node row", err)
 	}
 
-	// Other DB error -> plain error (rendered as a generic 500 by the handler).
+	// 其他数据库错误 -> 普通错误（由处理器呈现为通用的 500）。
 	vm2 := &repository.VMWithIP{VM: model.VM{ID: 1, NodeID: 1, PVEVmid: 100}}
 	nodeRepo2 := &fakeVMNodeRepository{err: errors.New("node db down")}
 	svc2 := newVMService(t, &fakeVMRepository{get: vm2}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},

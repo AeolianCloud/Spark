@@ -15,17 +15,14 @@ import (
 //go:embed migration/*.sql
 var migrationFS embed.FS
 
-// MigrationFS exposes the embedded SQL migrations for testing.
-// The embed root is this file's directory, so the SQL files live under the
-// migration/ subdirectory.
+// MigrationFS 暴露内嵌的 SQL 迁移，供测试使用。
+// embed 根目录是本文件所在目录，因此 SQL 文件位于 migration/ 子目录下。
 var MigrationFS fs.FS = migrationFS
 
-// Migrate applies all pending SQL migrations embedded in fsys, in ascending
-// filename order. Applied versions are tracked in schema_migrations.
-// The transaction-level advisory lock, schema_migrations bookkeeping and the
-// migration statements all run inside a single transaction: concurrent
-// instances serialize on the lock, and it is released automatically when the
-// transaction ends (commit or rollback), so it can never leak.
+// Migrate 按文件名升序应用内嵌在 fsys 中所有待执行的 SQL 迁移。
+// 已应用的版本记录在 schema_migrations 中。事务级 advisory lock、
+// schema_migrations 记账和迁移语句都在同一个事务内执行：并发实例在锁上
+// 串行化，锁会在事务结束（提交或回滚）时自动释放，因此永远不会泄漏。
 func Migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) error {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
@@ -96,8 +93,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) error {
 	return nil
 }
 
-// migrationFiles returns the names of the *.sql files under the migration/
-// directory of fsys, sorted in ascending filename (numeric) order.
+// migrationFiles 返回 fsys 的 migration/ 目录下所有 *.sql 文件名，
+// 按文件名（数字）升序排序。
 func migrationFiles(fsys fs.FS) ([]string, error) {
 	files, err := fs.ReadDir(fsys, "migration")
 	if err != nil {
@@ -113,9 +110,9 @@ func migrationFiles(fsys fs.FS) ([]string, error) {
 	return names, nil
 }
 
-// pendingMigrations returns the migration file names from fsys that are not
-// present in the applied set, in ascending execution order. It is pure logic
-// (no DB access), so it can be unit tested without a PostgreSQL connection.
+// pendingMigrations 返回 fsys 中不在已应用集合内的迁移文件名，
+// 按升序执行顺序排列。它是纯逻辑（不访问数据库），因此无需
+// PostgreSQL 连接即可进行单元测试。
 func pendingMigrations(fsys fs.FS, applied map[string]bool) ([]string, error) {
 	names, err := migrationFiles(fsys)
 	if err != nil {

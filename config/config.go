@@ -1,5 +1,5 @@
-// Package config loads service configuration from defaults, an optional
-// YAML file and environment variables (in that order of precedence).
+// Package config 从默认值、可选的 YAML 文件和环境变量加载服务配置
+// （按此优先级顺序）。
 package config
 
 import (
@@ -13,7 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the root application configuration.
+// Config 是应用根配置。
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	Database DatabaseConfig `yaml:"database"`
@@ -21,23 +21,23 @@ type Config struct {
 	Log      LogConfig      `yaml:"log"`
 }
 
-// ServerConfig holds HTTP server settings.
+// ServerConfig 保存 HTTP 服务器设置。
 type ServerConfig struct {
 	Port int `yaml:"port"`
 }
 
-// DatabaseConfig holds the PostgreSQL connection settings.
+// DatabaseConfig 保存 PostgreSQL 连接设置。
 type DatabaseConfig struct {
 	DSN string `yaml:"dsn"`
 }
 
-// CryptoConfig holds application-layer encryption settings.
-// EncryptionKey is a base64-encoded 32-byte AES key.
+// CryptoConfig 保存应用层加密设置。
+// EncryptionKey 是 base64 编码的 32 字节 AES 密钥。
 type CryptoConfig struct {
 	EncryptionKey string `yaml:"encryption_key"`
 }
 
-// LogConfig holds logging settings.
+// LogConfig 保存日志设置。
 type LogConfig struct {
 	Level string `yaml:"level"`
 }
@@ -47,12 +47,12 @@ const (
 	defaultPort       = 8080
 	defaultLogLevel   = "info"
 
-	// exampleEncryptionKey is the base64 of "0123456789abcdef0123456789abcdef",
-	// used in the sample config; it is not a secret.
+	// exampleEncryptionKey 是 "0123456789abcdef0123456789abcdef" 的 base64 编码，
+	// 用于示例配置；它不是机密。
 	exampleEncryptionKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 )
 
-// Default returns a Config populated with built-in defaults.
+// Default 返回一个填充了内置默认值的 Config。
 func Default() *Config {
 	return &Config{
 		Server:   ServerConfig{Port: defaultPort},
@@ -62,9 +62,8 @@ func Default() *Config {
 	}
 }
 
-// Load builds a Config by merging defaults, an optional YAML file and
-// environment variables (SPARK_*). If path is empty, config/config.yaml is
-// used when it exists; a missing file is not an error.
+// Load 通过合并默认值、可选的 YAML 文件和环境变量（SPARK_*）构建 Config。
+// 如果 path 为空，当 config/config.yaml 存在时使用它；文件缺失不算错误。
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
@@ -90,7 +89,7 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// applyEnv overrides config fields from SPARK_* environment variables.
+// applyEnv 使用 SPARK_* 环境变量覆盖配置字段。
 func applyEnv(cfg *Config) error {
 	if v, ok := os.LookupEnv("SPARK_SERVER_PORT"); ok {
 		port, err := strconv.Atoi(v)

@@ -91,7 +91,7 @@ func TestParseUPIDNodeExtraction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseUPID: %v", err)
 	}
-	// WaitTask must prefer the node carried by the UPID over the caller's.
+	// WaitTask 必须优先使用 UPID 携带的节点而非调用方的节点。
 	if parsed.Node != "pve2" {
 		t.Fatalf("node = %q, want pve2", parsed.Node)
 	}

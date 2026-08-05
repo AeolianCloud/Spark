@@ -15,9 +15,9 @@ import (
 
 var testTime = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
-// newMockPool returns a pgxmock pool whose SQL expectations must match the
-// actual statements exactly (no whitespace/regex slack), so these tests also
-// pin down the shape of the concurrency-critical allocation SQL.
+// newMockPool 返回一个 SQL 期望必须与实际语句完全一致的 pgxmock 池
+// （不允许空白/正则松弛），因此这些测试同时也钉死了并发关键
+// 分配 SQL 的形态。
 func newMockPool(t *testing.T) pgxmock.PgxPoolIface {
 	t.Helper()
 	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
@@ -33,9 +33,8 @@ func TestAllocateFreeIPClaimsAtomically(t *testing.T) {
 	mock.ExpectQuery(selectFreeIPSQL).WithArgs(int64(1)).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "pool_id", "ip", "status", "vm_id", "updated_at"}).
 			AddRow(int64(10), int64(1), "10.0.0.5", "free", nil, testTime))
-	// The claim must re-check status='free' (asserted by claimFreeIPSQL
-	// itself, matched exactly by the mock) — this WHERE guard is what makes
-	// concurrent allocations safe.
+	// 领取必须重新检查 status='free'（由 claimFreeIPSQL 本身断言，
+	// 并被 mock 精确匹配）——正是这个 WHERE 守卫保证了并发分配的安全。
 	mock.ExpectExec(claimFreeIPSQL).WithArgs(int64(10), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectCommit()
@@ -102,7 +101,7 @@ func TestAllocateFreeIPLostRaceReturnsRetry(t *testing.T) {
 	mock.ExpectQuery(selectFreeIPSQL).WithArgs(int64(1)).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "pool_id", "ip", "status", "vm_id", "updated_at"}).
 			AddRow(int64(10), int64(1), "10.0.0.5", "free", nil, testTime))
-	// 0 affected rows: a concurrent transaction claimed the address first.
+	// 0 行受影响：并发事务抢先领取了该地址。
 	mock.ExpectExec(claimFreeIPSQL).WithArgs(int64(10), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	mock.ExpectRollback()
@@ -149,7 +148,7 @@ func TestCreatePoolWithIPsOverlappingCIDRConflict(t *testing.T) {
 	mock.ExpectQuery("INSERT INTO ip_pools (zone_id, name, network_cidr, gateway, dns) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at").
 		WithArgs(int64(1), "default", "10.0.0.0/30", "10.0.0.1", "").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), testTime))
-	// A globally unique address is already used by another pool.
+	// 一个全局唯一的地址已被其他池占用。
 	mock.ExpectExec("INSERT INTO ips (pool_id, ip) VALUES ($1, $2)").
 		WithArgs(int64(7), "10.0.0.2").
 		WillReturnError(&pgconn.PgError{Code: "23505", Message: "duplicate key value violates unique constraint"})

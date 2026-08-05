@@ -10,9 +10,8 @@ import (
 	"testing/fstest"
 )
 
-// TestMigrationFilesOrder ensures migrations are discovered under the
-// migration/ directory and run in ascending numeric filename order, while
-// non-SQL files and subdirectories are ignored.
+// TestMigrationFilesOrder 确保迁移在 migration/ 目录下被发现，
+// 并按文件名数字升序执行，同时忽略非 SQL 文件和子目录。
 func TestMigrationFilesOrder(t *testing.T) {
 	fsys := fstest.MapFS{
 		"migration/0001_init.sql":   {Data: []byte("-- one")},
@@ -34,8 +33,8 @@ func TestMigrationFilesOrder(t *testing.T) {
 	}
 }
 
-// TestMigrationFilesDirFS exercises the same discovery against a real
-// directory tree (t.TempDir + os.DirFS) instead of an in-memory FS.
+// TestMigrationFilesDirFS 针对真实的目录树（t.TempDir + os.DirFS）
+// 而非内存 FS 验证相同的发现逻辑。
 func TestMigrationFilesDirFS(t *testing.T) {
 	dir := t.TempDir()
 	migDir := filepath.Join(dir, "migration")
@@ -58,9 +57,9 @@ func TestMigrationFilesDirFS(t *testing.T) {
 	}
 }
 
-// TestEmbeddedMigrationsDiscovered is a regression test for the go:embed
-// layout: the embedded FS root is database/, so migrations must be read from
-// the migration/ subdirectory (not the FS root), exactly as Migrate does.
+// TestEmbeddedMigrationsDiscovered 是 go:embed 布局的回归测试：内嵌 FS 的
+// 根目录是 database/，因此必须像 Migrate 一样从 migration/ 子目录
+// （而非 FS 根目录）读取迁移。
 func TestEmbeddedMigrationsDiscovered(t *testing.T) {
 	names, err := migrationFiles(MigrationFS)
 	if err != nil {
@@ -77,9 +76,9 @@ func TestEmbeddedMigrationsDiscovered(t *testing.T) {
 	}
 }
 
-// TestPendingMigrationsIdempotent simulates a full migrate cycle without a
-// database: the first pass reports every migration as pending, and once they
-// are marked as applied a second pass reports nothing (no-op re-run).
+// TestPendingMigrationsIdempotent 在不使用数据库的情况下模拟完整的迁移周期：
+// 第一次执行将所有迁移报告为待执行，一旦它们被标记为已应用，
+// 第二次执行将不报告任何内容（空操作的重复运行）。
 func TestPendingMigrationsIdempotent(t *testing.T) {
 	fsys := fstest.MapFS{
 		"migration/0001_init.sql":   {Data: []byte("-- one")},

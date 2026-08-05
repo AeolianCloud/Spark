@@ -1,19 +1,16 @@
 //go:build pg
 
-// Integration test for the repository-level pagination contract against a
-// real PostgreSQL instance (review batch B, minor fix): the LIMIT/OFFSET
-// page slicing and the Count backing the X-Total-Count header. Excluded
-// from the default build; run with -tags=pg:
+// 针对真实 PostgreSQL 实例的仓库层分页契约集成测试（评审批次 B，
+// 次要修复）：LIMIT/OFFSET 分页切片以及支撑 X-Total-Count 响应头的
+// Count。排除在默认构建之外；通过 -tags=pg 运行：
 //
 //	SPARK_TEST_DSN='postgres://spark:spark@127.0.0.1:5432/spark_test' \
 //	  go test -tags=pg ./repository/ -count=1 -run TestPGStorageTypeListPage
 //
-// The suite connects to the DSN from SPARK_TEST_DSN (shared helper
-// pgTestDSN, same default as the IP concurrency tests), applies the
-// migrations, then inserts five storage types and asserts two pages plus
-// the total. Data hygiene: storage_types is TRUNCATEd (CASCADE, so a
-// leftover vms row referencing a storage type cannot block the cleanup)
-// before and after the test.
+// 测试套件从 SPARK_TEST_DSN 连接数据库（共享助手 pgTestDSN，默认值与
+// IP 并发测试相同），应用 migration，然后插入五个存储类型并断言两页
+// 结果与总数。数据卫生：storage_types 在测试前后都执行 TRUNCATE
+// （CASCADE，因此引用存储类型的遗留 vms 行不会阻塞清理）。
 package repository
 
 import (
@@ -25,11 +22,11 @@ import (
 	"spark/model"
 )
 
-// TestPGStorageTypeListPage verifies StorageTypeRepository.ListPage/Count
-// against real PostgreSQL: after inserting five rows (ids ascending with
-// creation order) a limit/offset pair must slice exactly that window of the
-// id-ordered table and Count must report the full five rows, independent of
-// the page. A page past the end yields an empty, non-nil slice.
+// TestPGStorageTypeListPage 在真实 PostgreSQL 上验证
+// StorageTypeRepository.ListPage/Count：插入五行后（id 随创建顺序
+// 递增），一个 limit/offset 组合必须精确切出按 id 排序表的对应窗口，
+// 而 Count 必须报告完整的五行，与分页无关。越过末尾的页返回空且
+// 非 nil 的切片。
 func TestPGStorageTypeListPage(t *testing.T) {
 	ctx := context.Background()
 
@@ -43,8 +40,8 @@ func TestPGStorageTypeListPage(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	// Clean slate (also on failure via defer): CASCADE follows the vms FK
-	// so a leftover reference cannot block the truncate.
+	// 干净起点（失败时也通过 defer 清理）：CASCADE 会跟随 vms 外键，
+	// 因此遗留引用不会阻塞 TRUNCATE。
 	clean := func() {
 		if _, err := pool.Exec(ctx, "TRUNCATE storage_types CASCADE"); err != nil {
 			t.Fatalf("truncate storage_types: %v", err)
@@ -87,7 +84,7 @@ func TestPGStorageTypeListPage(t *testing.T) {
 	assertPage(t, 2, 2, []string{"pg-page-3", "pg-page-4"})
 	assertPage(t, 2, 4, []string{"pg-page-5"})
 	assertPage(t, 10, 0, []string{"pg-page-1", "pg-page-2", "pg-page-3", "pg-page-4", "pg-page-5"})
-	assertPage(t, 2, 10, nil) // offset past the end -> empty page
+	assertPage(t, 2, 10, nil) // offset 越过末尾 -> 空页
 
 	total, err := repo.Count(ctx)
 	if err != nil {
@@ -97,7 +94,7 @@ func TestPGStorageTypeListPage(t *testing.T) {
 		t.Fatalf("Count = %d, want 5 (independent of the page)", total)
 	}
 
-	// The storage type rows must look like real entities, not placeholders.
+	// 存储类型行必须像真实实体，而不是占位符。
 	firstID := ids[0]
 	st, err := repo.Get(ctx, firstID)
 	if err != nil {

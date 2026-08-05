@@ -1,4 +1,4 @@
-// Package database manages the PostgreSQL connection pool and schema migrations.
+// Package database 管理 PostgreSQL 连接池和 schema 迁移。
 package database
 
 import (
@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// New creates a pgx connection pool with sane defaults.
+// New 使用合理的默认值创建 pgx 连接池。
 func New(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -32,7 +32,7 @@ func New(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// Ping checks database connectivity with a bounded timeout.
+// Ping 使用有界超时检查数据库连通性。
 func Ping(ctx context.Context, pool *pgxpool.Pool) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()

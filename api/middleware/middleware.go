@@ -1,4 +1,4 @@
-// Package middleware provides gin middleware shared by all routes.
+// Package middleware 提供所有路由共享的 gin 中间件。
 package middleware
 
 import (
@@ -11,40 +11,38 @@ import (
 	"github.com/google/uuid"
 )
 
-// RequestIDKey is the gin context key holding the request id.
+// RequestIDKey 是存放 request id 的 gin context 键。
 const RequestIDKey = "request_id"
 
-// XRequestIDHeader is the header used to propagate the request id.
+// XRequestIDHeader 是用于传播 request id 的头。
 const XRequestIDHeader = "X-Request-ID"
 
-// XMSErrorCodeHeader is the response header mirroring the error code of an
-// error response body (see docs/api-errors.md). It lives in middleware, not
-// in the handlers package, because middleware must stay independent of
-// handlers: handlers already import middleware, so placing the constant in
-// handlers would create an import cycle.
+// XMSErrorCodeHeader 是镜像错误响应体错误码的响应头
+// （见 docs/api-errors.md）。它位于 middleware 而非 handlers 包，
+// 因为 middleware 必须保持独立于 handlers：handlers 已经 import
+// middleware，把常量放在 handlers 会造成 import 环。
 const XMSErrorCodeHeader = "x-ms-error-code"
 
-// maxRequestIDLen caps client-supplied request ids; longer values are
-// rejected so an attacker cannot inflate log lines or the propagated header.
+// maxRequestIDLen 限制客户端提供的 request id 长度；更长的值被拒绝，
+// 防止攻击者膨胀日志行或传播的头。
 const maxRequestIDLen = 64
 
-// requestIDPattern is the accepted charset of client-supplied request ids.
-// The charset is deliberately narrow: whitespace, control characters and
-// shell/header separators are excluded so a client cannot smuggle log
-// injection or header-splitting payloads into access logs and responses.
+// requestIDPattern 是客户端提供的 request id 的合法字符集。
+// 该字符集刻意收窄：排除空白、控制字符及 shell/header 分隔符，
+// 防止客户端把日志注入或 header 拆分负载混入访问日志和响应中。
 var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-// validRequestID reports whether a client-supplied request id is acceptable:
-// non-empty, at most maxRequestIDLen characters and matching requestIDPattern.
-// Invalid ids are discarded and replaced by a generated one (see RequestID).
+// validRequestID 报告客户端提供的 request id 是否可接受：
+// 非空、不超过 maxRequestIDLen 字符且匹配 requestIDPattern。
+// 非法的 id 被丢弃并替换为生成的 id（见 RequestID）。
 func validRequestID(rid string) bool {
 	return rid != "" && len(rid) <= maxRequestIDLen && requestIDPattern.MatchString(rid)
 }
 
-// RequestID generates or forwards a request id and stores it in the context.
-// A client-supplied id is passed through only when validRequestID accepts it;
-// otherwise a fresh uuid is generated. The accepted id is always echoed back
-// in the response header, so both sides agree on the id to correlate with.
+// RequestID 生成或转发 request id 并存入 context。
+// 仅当 validRequestID 接受时客户端提供的 id 才会被透传；
+// 否则生成全新的 uuid。被接受的 id 总是回显在响应头中，
+// 使双方对所关联的 id 达成一致。
 func RequestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		rid := c.GetHeader(XRequestIDHeader)
@@ -57,7 +55,7 @@ func RequestID() gin.HandlerFunc {
 	}
 }
 
-// Logger logs one line per request with method, path, status and latency.
+// Logger 每个请求记录一行日志，包含 method、path、status 与 latency。
 func Logger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -72,7 +70,7 @@ func Logger() gin.HandlerFunc {
 			"latency", time.Since(start),
 			"client_ip", c.ClientIP(),
 		}
-		// Avoid filling normal logs with healthcheck noise.
+		// 避免健康检查噪声填满常规日志。
 		switch {
 		case status >= 500:
 			slog.Error("request", attrs...)
@@ -86,14 +84,13 @@ func Logger() gin.HandlerFunc {
 	}
 }
 
-// errCodeInternal is the error code of the generic panic response. It
-// duplicates CodeInternal from the handlers package because middleware must
-// not import handlers (handlers import middleware, so sharing the constant
-// would create an import cycle). The code is part of the documented API
-// contract (docs/api-errors.md).
+// errCodeInternal 是通用 panic 响应的错误码。它复制自 handlers 包的
+// CodeInternal，因为 middleware 不能 import handlers（handlers import
+// middleware，共享该常量会造成 import 环）。该错误码是文档化 API
+// 契约的一部分（docs/api-errors.md）。
 const errCodeInternal = "internal_error"
 
-// Recovery converts panics into a unified 500 error response.
+// Recovery 将 panic 转换为统一的 500 错误响应。
 func Recovery() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
