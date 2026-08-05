@@ -1,0 +1,11 @@
+-- Adds the async-provisioning failure marker to vms. Applied after
+-- 0003_indexes_and_unique.sql.
+--
+-- The migration runner tracks applied versions in schema_migrations and
+-- applies each file exactly once, so no IF NOT EXISTS guard is required here.
+--
+-- provision_error is written by the detached provisioning goroutine when the
+-- PVE create chain fails (design D5): the request has already returned to the
+-- client, so the failure cannot be surfaced synchronously and is persisted
+-- for the detail/list queries of batch 8 to expose.
+ALTER TABLE vms ADD COLUMN provision_error TEXT;
