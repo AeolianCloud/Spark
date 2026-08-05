@@ -143,6 +143,20 @@ func (f *fakeVMRepository) ListVMs(ctx context.Context) ([]repository.VMWithIP, 
 	return f.vms, nil
 }
 
+func (f *fakeVMRepository) ListVMsPage(ctx context.Context, limit, offset int) ([]repository.VMWithIP, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return slicePage(f.vms, limit, offset), nil
+}
+
+func (f *fakeVMRepository) CountVMs(ctx context.Context) (int, error) {
+	if f.listErr != nil {
+		return 0, f.listErr
+	}
+	return len(f.vms), nil
+}
+
 func (f *fakeVMRepository) SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error {
 	f.linkedIPID = ipID
 	return nil

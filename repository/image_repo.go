@@ -86,6 +86,40 @@ func (r *ImageRepository) List(ctx context.Context) ([]model.Image, error) {
 	return images, nil
 }
 
+// ListPage returns one page of images ordered by id. It feeds the paginated
+// GET /images endpoint (without a zone filter).
+func (r *ImageRepository) ListPage(ctx context.Context, limit, offset int) ([]model.Image, error) {
+	rows, err := r.pool.Query(ctx,
+		"SELECT "+imageCols+" FROM images ORDER BY id LIMIT $1 OFFSET $2", limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("images: list page: %w", err)
+	}
+	defer rows.Close()
+
+	images := make([]model.Image, 0)
+	for rows.Next() {
+		var img model.Image
+		if err := rows.Scan(&img.ID, &img.Name, &img.DefaultUser, &img.NodeImages, &img.CreatedAt); err != nil {
+			return nil, fmt.Errorf("images: scan: %w", err)
+		}
+		images = append(images, img)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("images: iterate: %w", err)
+	}
+	return images, nil
+}
+
+// Count returns the total number of images, backing the X-Total-Count
+// header of GET /images.
+func (r *ImageRepository) Count(ctx context.Context) (int, error) {
+	var n int
+	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM images").Scan(&n); err != nil {
+		return 0, fmt.Errorf("images: count: %w", err)
+	}
+	return n, nil
+}
+
 // ZoneExists reports whether a zone with the given id exists. It backs
 // ImageService.ListImagesByZone.
 func (r *ImageRepository) ZoneExists(ctx context.Context, id int64) (bool, error) {

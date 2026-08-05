@@ -19,6 +19,8 @@ type IPPoolRepository interface {
 	CreatePoolWithIPs(ctx context.Context, pool model.IPPool, ips []model.IP) (*model.IPPool, error)
 	GetPool(ctx context.Context, id int64) (*model.IPPool, error)
 	ListPools(ctx context.Context) ([]model.IPPool, error)
+	ListPoolsPage(ctx context.Context, limit, offset int) ([]model.IPPool, error)
+	CountPools(ctx context.Context) (int, error)
 	ListPoolsByZone(ctx context.Context, zoneID int64) ([]model.IPPool, error)
 	GetPoolNodes(ctx context.Context, poolID int64) ([]model.PVENode, error)
 	SetPoolNodes(ctx context.Context, poolID int64, nodeIDs []int64) error
@@ -170,27 +172,34 @@ func lastAddr4(prefix netip.Prefix) netip.Addr {
 	return netip.AddrFrom4(a)
 }
 
-// ListPools returns all pools, or only the pools of a zone when zoneID is
-// set. The zone must exist.
-func (s *IPPoolService) ListPools(ctx context.Context, zoneID *int64) ([]model.IPPool, error) {
+// ListPools returns the pools of GET /ip-pools. With zoneID set the zone's
+// pools are returned in full — a zone embeds few pools, so the zone-filtered
+// list is deliberately not paginated (total is the zone's pool count).
+// Without zoneID the pools are paged by limit/offset and total is the
+// overall pool count. The zone must exist.
+func (s *IPPoolService) ListPools(ctx context.Context, zoneID *int64, limit, offset int) ([]model.IPPool, int, error) {
 	if zoneID == nil {
-		pools, err := s.poolRepo.ListPools(ctx)
+		pools, err := s.poolRepo.ListPoolsPage(ctx, limit, offset)
 		if err != nil {
-			return nil, fmt.Errorf("list pools: %w", err)
+			return nil, 0, fmt.Errorf("list pools: %w", err)
 		}
-		return pools, nil
+		total, err := s.poolRepo.CountPools(ctx)
+		if err != nil {
+			return nil, 0, fmt.Errorf("list pools: count: %w", err)
+		}
+		return pools, total, nil
 	}
 	if _, err := s.zoneRepo.GetZone(ctx, *zoneID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, notFoundf("zone %d not found", *zoneID)
+			return nil, 0, notFoundf("zone %d not found", *zoneID)
 		}
-		return nil, fmt.Errorf("list pools: check zone: %w", err)
+		return nil, 0, fmt.Errorf("list pools: check zone: %w", err)
 	}
 	pools, err := s.poolRepo.ListPoolsByZone(ctx, *zoneID)
 	if err != nil {
-		return nil, fmt.Errorf("list pools: %w", err)
+		return nil, 0, fmt.Errorf("list pools: %w", err)
 	}
-	return pools, nil
+	return pools, len(pools), nil
 }
 
 // GetPoolNodes returns the nodes whitelisted for the pool; the pool must

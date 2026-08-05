@@ -76,38 +76,70 @@ func (s *ImageService) GetByName(ctx context.Context, name string) (*model.Image
 	return img, nil
 }
 
-// List returns all registered images with their full node_images map.
-func (s *ImageService) List(ctx context.Context) ([]model.Image, error) {
-	images, err := s.repo.List(ctx)
+// List returns one page of all registered images with their full node_images
+// map; total is the total number of images, independent of the page.
+func (s *ImageService) List(ctx context.Context, limit, offset int) ([]model.Image, int, error) {
+	images, err := s.repo.ListPage(ctx, limit, offset)
 	if err != nil {
-		return nil, fmt.Errorf("list images: %w", err)
+		return nil, 0, fmt.Errorf("list images: %w", err)
 	}
-	return images, nil
+	total, err := s.repo.Count(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list images: count: %w", err)
+	}
+	return images, total, nil
 }
 
-// ListImagesByZone returns the images available in a zone. The zone must
-// exist; an image is available only when its node_images map contains every
-// enabled node of the zone (intersection semantics). A zone without enabled
-// nodes yields an empty list, not an error.
-func (s *ImageService) ListImagesByZone(ctx context.Context, zoneID int64) ([]model.Image, error) {
+// ListImagesByZone returns one page of the images available in a zone. The
+// zone must exist; an image is available only when its node_images map
+// contains every enabled node of the zone (intersection semantics). A zone
+// without enabled nodes yields an empty list, not an error.
+//
+// Pagination is applied AFTER the availability filter: the intersection is a
+// service-level rule that SQL LIMIT/OFFSET cannot express (it would slice
+// before filtering and produce short or empty pages), so the full registered
+// list is scanned and the available slice is paged in Go. The images table
+// is a small metadata set, so the full scan is cheap. total is the number of
+// available images, independent of the page.
+func (s *ImageService) ListImagesByZone(ctx context.Context, zoneID int64, limit, offset int) ([]model.Image, int, error) {
 	exists, err := s.repo.ZoneExists(ctx, zoneID)
 	if err != nil {
-		return nil, fmt.Errorf("zone existence check: %w", err)
+		return nil, 0, fmt.Errorf("zone existence check: %w", err)
 	}
 	if !exists {
-		return nil, notFoundf("zone %d not found", zoneID)
+		return nil, 0, notFoundf("zone %d not found", zoneID)
 	}
 
 	nodes, err := s.repo.EnabledNodeNamesByZone(ctx, zoneID)
 	if err != nil {
-		return nil, fmt.Errorf("enabled nodes by zone: %w", err)
+		return nil, 0, fmt.Errorf("enabled nodes by zone: %w", err)
 	}
 
 	images, err := s.repo.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list images: %w", err)
+		return nil, 0, fmt.Errorf("list images: %w", err)
 	}
-	return filterImagesAvailableByNodes(images, nodes), nil
+	available := filterImagesAvailableByNodes(images, nodes)
+	return slicePage(available, limit, offset), len(available), nil
+}
+
+// slicePage returns the limit/offset slice of items (offset past the end
+// yields an empty slice, never nil). Shared by the paginated list paths that
+// page in Go instead of SQL. Negative limit/offset are clamped to 0 — the
+// HTTP layer rejects negative values via parsePagination and the service
+// callers always pass non-negative values, but this package-level helper is
+// reused by VM/zone/IP-pool test doubles and repo callers must not panic on
+// the slice arithmetic or silently turn LIMIT -1 into "no limit" downstream.
+func slicePage[T any](items []T, limit, offset int) []T {
+	if limit < 0 {
+		limit = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	start := min(offset, len(items))
+	end := min(start+limit, len(items))
+	return items[start:end]
 }
 
 // filterImagesAvailableByNodes keeps the images whose node_images map

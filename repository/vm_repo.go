@@ -118,6 +118,48 @@ func (r *VMRepository) ListVMs(ctx context.Context) ([]VMWithIP, error) {
 	return out, nil
 }
 
+// ListVMsPage returns one page of VM rows ordered by id. It feeds the
+// paginated pass-through list: LIMIT/OFFSET apply to the local metadata,
+// and the PVE merge only runs on the page's rows (at most maxPageLimit rows
+// per node call in the worst case).
+func (r *VMRepository) ListVMsPage(ctx context.Context, limit, offset int) ([]VMWithIP, error) {
+	rows, err := r.pool.Query(ctx,
+		"SELECT "+vmCols+", COALESCE(ips.ip, '') FROM vms LEFT JOIN ips ON ips.id = vms.ip_id ORDER BY vms.id LIMIT $1 OFFSET $2",
+		limit, offset)
+	if err != nil {
+		return nil, classifyDBError(err)
+	}
+	defer rows.Close()
+
+	out := make([]VMWithIP, 0)
+	for rows.Next() {
+		var v model.VM
+		var ip string
+		if err := rows.Scan(&v.ID, &v.UUID, &v.Name, &v.ZoneID, &v.NodeID, &v.PVEVmid, &v.ImageID,
+			&v.StorageTypeID, &v.CPU, &v.MemMB, &v.DiskGB, &v.IPID, &v.PasswordEncrypted,
+			&v.ProvisionError, &v.CreatedAt, &v.UpdatedAt, &ip); err != nil {
+			return nil, classifyDBError(err)
+		}
+		out = append(out, VMWithIP{VM: v, IP: ip})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifyDBError(err)
+	}
+	return out, nil
+}
+
+// CountVMs returns the total number of VM rows, backing the X-Total-Count
+// header of GET /vms. It counts local metadata only: the pass-through merge
+// can drop rows of failed nodes, so the total may exceed the page's item
+// count (the reported total is deliberately the full local count).
+func (r *VMRepository) CountVMs(ctx context.Context) (int, error) {
+	var n int
+	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM vms").Scan(&n); err != nil {
+		return 0, classifyDBError(err)
+	}
+	return n, nil
+}
+
 // UpdateVMPVEVMID records the PVE VMID assigned by the provisioning chain
 // and syncs the actual disk size (which may be the imported image's size
 // when no resize was needed); a successful provision clears any

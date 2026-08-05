@@ -169,13 +169,20 @@ func findVM(vms []pve.VMStatus, vmid int64) (pve.VMStatus, bool) {
 
 // ListVMs implements the pass-through list (task 8.1, design D1): the enabled
 // nodes of every zone are queried with exactly one PVE list call per node
-// (design D1), the full local metadata is read (with IPs), and both are
-// merged. The whole query runs under a request-level budget (listVMsTimeout).
+// (design D1), one page of the local metadata is read (with IPs), and both
+// are merged. The whole query runs under a request-level budget (listVMsTimeout).
 // The node queries run in parallel so the total latency is bounded by the
 // slowest node, not by the sum of all nodes; a node whose list call fails —
 // including the shared deadline firing — contributes a warning instead of its
 // VMs (task 8.3) and never fails the whole request.
-func (s *VMService) ListVMs(ctx context.Context) ([]VMListItem, []NodeWarning, error) {
+//
+// Pagination (limit/offset) applies to the local vms metadata query: the
+// SQL LIMIT/OFFSET runs on the vms table and the PVE merge only sees the
+// page's rows, so the worst case is maxPageLimit rows merged per node. total
+// is the total local VM count (CountVMs): the merge can drop rows of failed
+// or disabled nodes, so total may exceed the item count of the page. The
+// warnings logic is unchanged: only the page's local rows are considered.
+func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListItem, []NodeWarning, int, error) {
 	// Request-level total timeout: bounds DB reads plus all parallel node
 	// calls together, so a slow or hanging node cannot stretch the request.
 	// The same deadline is shared by every node goroutine below; when it
@@ -186,13 +193,13 @@ func (s *VMService) ListVMs(ctx context.Context) ([]VMListItem, []NodeWarning, e
 
 	zones, err := s.zoneRepo.ListZones(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list vms: list zones: %w", err)
+		return nil, nil, 0, fmt.Errorf("list vms: list zones: %w", err)
 	}
 	nodes := make([]model.PVENode, 0)
 	for _, z := range zones {
 		zn, err := s.nodeRepo.ListEnabledNodesByZone(ctx, z.ID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("list vms: enabled nodes of zone %d: %w", z.ID, err)
+			return nil, nil, 0, fmt.Errorf("list vms: enabled nodes of zone %d: %w", z.ID, err)
 		}
 		nodes = append(nodes, zn...)
 	}
@@ -228,12 +235,16 @@ func (s *VMService) ListVMs(ctx context.Context) ([]VMListItem, []NodeWarning, e
 		perNode[nodes[i].ID] = results[i]
 	}
 
-	local, err := s.vmRepo.ListVMs(ctx)
+	local, err := s.vmRepo.ListVMsPage(ctx, limit, offset)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list vms: local metadata: %w", err)
+		return nil, nil, 0, fmt.Errorf("list vms: local metadata: %w", err)
+	}
+	total, err := s.vmRepo.CountVMs(ctx)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("list vms: count: %w", err)
 	}
 	items, warnings := mergeVMListItems(local, perNode)
-	return items, warnings, nil
+	return items, warnings, total, nil
 }
 
 // GetVM implements the pass-through detail (task 8.2, design D5/D6): the

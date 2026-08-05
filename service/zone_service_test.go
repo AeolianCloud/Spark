@@ -50,6 +50,20 @@ func (f *fakeZoneRepository) ListZones(ctx context.Context) ([]model.Zone, error
 	return f.zones, nil
 }
 
+func (f *fakeZoneRepository) ListZonesPage(ctx context.Context, limit, offset int) ([]model.Zone, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return slicePage(f.zones, limit, offset), nil
+}
+
+func (f *fakeZoneRepository) CountZones(ctx context.Context) (int, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	return len(f.zones), nil
+}
+
 // fakeNodeRepository is a scriptable NodeRepository for tests.
 type fakeNodeRepository struct {
 	nodes []model.PVENode
@@ -152,12 +166,52 @@ func TestListZonesIncludesNodes(t *testing.T) {
 	}}
 	svc := NewZoneService(zoneRepo, nodeRepo)
 
-	zones, err := svc.ListZones(context.Background())
+	zones, total, err := svc.ListZones(context.Background(), 25, 0)
 	if err != nil {
 		t.Fatalf("ListZones: %v", err)
 	}
 	if len(zones) != 1 || len(zones[0].Nodes) != 2 {
 		t.Fatalf("unexpected result: %+v", zones)
+	}
+	if total != 1 {
+		t.Fatalf("total = %d, want 1", total)
+	}
+}
+
+// TestListZonesPagination verifies the page slicing: limit/offset select the
+// zone page (the node lists inside stay complete), and total is the full
+// zone count regardless of the page.
+func TestListZonesPagination(t *testing.T) {
+	zoneRepo := &fakeZoneRepository{zones: []model.Zone{
+		{ID: 1, Name: "z1"}, {ID: 2, Name: "z2"}, {ID: 3, Name: "z3"},
+	}}
+	nodeRepo := &fakeNodeRepository{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 1, Name: "pve1", Enabled: true},
+		{ID: 2, ZoneID: 2, Name: "pve2", Enabled: true},
+		{ID: 3, ZoneID: 3, Name: "pve3", Enabled: true},
+	}}
+	svc := NewZoneService(zoneRepo, nodeRepo)
+
+	page, total, err := svc.ListZones(context.Background(), 2, 1)
+	if err != nil {
+		t.Fatalf("ListZones: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+	if len(page) != 2 || page[0].Zone.ID != 2 || page[1].Zone.ID != 3 {
+		t.Fatalf("page = %+v, want zones 2 and 3", page)
+	}
+	if len(page[0].Nodes) != 1 || page[0].Nodes[0].Name != "pve2" {
+		t.Fatalf("page zone 2 nodes = %+v, want the complete node list", page[0].Nodes)
+	}
+
+	empty, _, err := svc.ListZones(context.Background(), 25, 10)
+	if err != nil {
+		t.Fatalf("ListZones past the end: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("page past the end = %+v, want empty", empty)
 	}
 }
 

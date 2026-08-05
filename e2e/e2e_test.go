@@ -359,6 +359,10 @@ func e2eDo(t *testing.T, client *http.Client, base, method, path string, body an
 		t.Fatalf("%s %s: status %d, want %d (body: %s)", method, path, resp.StatusCode, want, strings.TrimSpace(string(raw[:n])))
 	}
 	var out any
+	if resp.StatusCode == http.StatusNoContent {
+		// 204 carries no body by contract; the caller gets nil.
+		return nil
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("%s %s: decode body: %v", method, path, err)
 	}
@@ -551,11 +555,13 @@ provisioned:
 	}
 
 	// 6. Resize: shrinking the disk is refused with 422; growing cpu/mem/
-	// disk succeeds and is applied on the PVE side (config + resize).
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/resize", vmID),
+	// disk succeeds and is applied on the PVE side (config + resize). The
+	// operation is a PATCH of the VM resource (JSON Merge Patch semantics:
+	// absent fields keep their current values).
+	e2eDo(t, client, base, http.MethodPatch, fmt.Sprintf("/vms/%d", vmID),
 		map[string]any{"disk_gb": 5}, http.StatusUnprocessableEntity)
 
-	resized := e2eObj(t, e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/resize", vmID),
+	resized := e2eObj(t, e2eDo(t, client, base, http.MethodPatch, fmt.Sprintf("/vms/%d", vmID),
 		map[string]any{"cpu": 4, "mem_mb": 4096, "disk_gb": 20}, http.StatusOK))
 	if resized["cpu"] != float64(4) || resized["mem_mb"] != float64(4096) || resized["disk_gb"] != float64(20) {
 		t.Fatalf("resized vm = %+v, want cpu=4 mem=4096 disk=20", resized)
@@ -592,8 +598,47 @@ provisioned:
 		t.Fatalf("detail status = %v, want running", detail["status"])
 	}
 
-	// 8. Destroy: PVE VM removed, IP released back to free, vms row gone.
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/destroy", vmID), nil, http.StatusOK)
+	// 7b. Pagination: GET /vms?limit=1&offset=0 must return at most one
+	// item and carry the X-Total-Count header with the real total (>= 1 at
+	// this point of the scenario, the created VM is in the database).
+	pagedReq, err := http.NewRequest(http.MethodGet, base+"/vms?limit=1&offset=0", nil)
+	if err != nil {
+		t.Fatalf("build paginated list request: %v", err)
+	}
+	pagedResp, err := client.Do(pagedReq)
+	if err != nil {
+		t.Fatalf("GET /vms?limit=1&offset=0: %v", err)
+	}
+	defer pagedResp.Body.Close()
+	if pagedResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /vms?limit=1&offset=0: status %d, want 200", pagedResp.StatusCode)
+	}
+	totalRaw := pagedResp.Header.Get("X-Total-Count")
+	total, err := strconv.Atoi(totalRaw)
+	if err != nil || total < 1 {
+		t.Fatalf("X-Total-Count = %q, want an integer >= 1", totalRaw)
+	}
+	var paged map[string]any
+	if err := json.NewDecoder(pagedResp.Body).Decode(&paged); err != nil {
+		t.Fatalf("decode paginated list: %v", err)
+	}
+	pagedItems, ok := paged["vms"].([]any)
+	if !ok {
+		t.Fatalf("paginated list response = %+v, want a vms array", paged)
+	}
+	if len(pagedItems) > 1 {
+		t.Fatalf("GET /vms?limit=1&offset=0 returned %d items, want <= 1", len(pagedItems))
+	}
+	if len(pagedItems) == 1 {
+		item := pagedItems[0].(map[string]any)
+		if int64(item["id"].(float64)) != vmID {
+			t.Fatalf("paginated page contains vm %v, want %d", item["id"], vmID)
+		}
+	}
+
+	// 8. Destroy: DELETE /vms/:id answers 204 with no body; the PVE VM is
+	// removed, the IP released back to free, the vms row gone.
+	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusNoContent)
 	if got := fakePVE.get(100); got != nil {
 		t.Fatalf("fake pve still has VM 100 after destroy: %+v", got)
 	}

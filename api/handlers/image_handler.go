@@ -52,25 +52,34 @@ func (h *ImageHandler) Create(c *gin.Context) error {
 
 // List handles GET /images. With a zone_id query parameter it returns only
 // the images available on every enabled node of that zone; without it, all
-// images including their full node_images map.
+// images including their full node_images map. Both branches honor the
+// shared limit/offset query parameters and set X-Total-Count to the total
+// count of the branch's result set (all images, or the zone's available
+// images).
 func (h *ImageHandler) List(c *gin.Context) error {
 	ctx := c.Request.Context()
+	limit, offset, err := parsePagination(c)
+	if err != nil {
+		return err
+	}
 	if raw := c.Query("zone_id"); raw != "" {
 		zoneID, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || zoneID <= 0 {
 			return ErrBadRequest("invalid zone_id query parameter")
 		}
-		images, err := h.svc.ListImagesByZone(ctx, zoneID)
+		images, total, err := h.svc.ListImagesByZone(ctx, zoneID, limit, offset)
 		if err != nil {
 			return mapServiceError(err)
 		}
+		setTotalCount(c, total)
 		c.JSON(http.StatusOK, images)
 		return nil
 	}
-	images, err := h.svc.List(ctx)
+	images, total, err := h.svc.List(ctx, limit, offset)
 	if err != nil {
 		return mapServiceError(err)
 	}
+	setTotalCount(c, total)
 	c.JSON(http.StatusOK, images)
 	return nil
 }

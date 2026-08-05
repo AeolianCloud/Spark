@@ -78,6 +78,8 @@ type VMRepository interface {
 	CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error)
 	GetVM(ctx context.Context, id int64) (*repository.VMWithIP, error)
 	ListVMs(ctx context.Context) ([]repository.VMWithIP, error)
+	ListVMsPage(ctx context.Context, limit, offset int) ([]repository.VMWithIP, error)
+	CountVMs(ctx context.Context) (int, error)
 	SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error
 	UpdateVMPVEVMID(ctx context.Context, id, vmid, diskGB int64) error
 	SetProvisionError(ctx context.Context, id int64, message string) error
@@ -764,8 +766,11 @@ func validateResizeSpec(cpu *int, memMB, diskGB *int64, current model.VM) error 
 // applied to PVE first and only then persisted to the vms row. The persist
 // step uses the spec read at the start as an optimistic lock (UpdateSpec
 // re-checks it in the WHERE clause): when a concurrent resize committed in
-// between, the caller gets KindConflict and can retry. It returns the fresh
-// VM record on success.
+// between, the caller gets KindConflict and can retry. The returned record
+// carries the spec applied by this call (the requested fields, the others as
+// read at the start); it is NOT a fresh read from the database — callers
+// that need the latest persisted row or a live pass-through status must
+// fetch it themselves via GetVM.
 func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskGB *int64) (*repository.VMWithIP, error) {
 	vm, node, err := s.vmAndNode(ctx, id)
 	if err != nil {
@@ -840,5 +845,10 @@ func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskG
 		}
 		return nil, fmt.Errorf("resize vm %d: persist spec: %w", id, err)
 	}
-	return s.vmRepo.GetVM(ctx, id)
+	// The persisted spec equals next (UpdateSpec succeeded with it), so the
+	// pre-built record is returned instead of re-reading the row: the
+	// handler that needs a live pass-through status re-reads via GetVM
+	// anyway, and skipping the extra query keeps the PATCH path at a single
+	// DB round-trip after the PVE-side changes.
+	return &repository.VMWithIP{VM: next, IP: vm.IP}, nil
 }

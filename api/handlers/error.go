@@ -16,6 +16,7 @@ import (
 const (
 	CodeBadRequest       = "bad_request"
 	CodeNotFound         = "not_found"
+	CodeMethodNotAllowed = "method_not_allowed"
 	CodeConflict         = "conflict"
 	CodeUnprocessable    = "unprocessable_entity"
 	CodeInternal         = "internal_error"
@@ -79,12 +80,15 @@ func ErrServiceDown(message string) *APIError {
 
 // Handler adapts a handler returning an error into a gin.HandlerFunc.
 // Any error that is an *APIError is rendered as-is; other errors are logged
-// and rendered as a generic 500 so internal details never leak.
+// and rendered as a generic 500 so internal details never leak. Every error
+// response carries the x-ms-error-code header mirroring the body code (the
+// constant lives in middleware to keep the dependency direction acyclic).
 func Handler(fn func(c *gin.Context) error) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if err := fn(c); err != nil {
 			var apiErr *APIError
 			if errors.As(err, &apiErr) {
+				c.Header(middleware.XMSErrorCodeHeader, apiErr.Code)
 				c.AbortWithStatusJSON(apiErr.Status, gin.H{"error": apiErr})
 				return
 			}
@@ -94,6 +98,7 @@ func Handler(fn func(c *gin.Context) error) gin.HandlerFunc {
 				"path", c.Request.URL.Path,
 				"error", err,
 			)
+			c.Header(middleware.XMSErrorCodeHeader, CodeInternal)
 			c.AbortWithStatusJSON(http.StatusInternalServerError,
 				gin.H{"error": ErrInternal("internal server error")})
 		}

@@ -19,6 +19,8 @@ type ZoneRepository interface {
 	CreateZone(ctx context.Context, name string) (*model.Zone, error)
 	GetZone(ctx context.Context, id int64) (*model.Zone, error)
 	ListZones(ctx context.Context) ([]model.Zone, error)
+	ListZonesPage(ctx context.Context, limit, offset int) ([]model.Zone, error)
+	CountZones(ctx context.Context) (int, error)
 }
 
 // NodeRepository is the node data access the ZoneService depends on.
@@ -89,22 +91,30 @@ type ZoneWithNodes struct {
 	Nodes []model.PVENode
 }
 
-// ListZones returns every zone together with its nodes, satisfying the zones
-// spec's "return all zones and their node information".
-func (s *ZoneService) ListZones(ctx context.Context) ([]ZoneWithNodes, error) {
-	zones, err := s.zoneRepo.ListZones(ctx)
+// ListZones returns one page of zones together with their nodes, satisfying
+// the zones spec's "return all zones and their node information". The
+// pagination unit is the zone: the page holds limit zones (offset skips the
+// first offset zones in id order), each with its full, unpaginated node
+// list — a zone embeds few nodes, so only the zone rows are paged. total is
+// the total number of zones, independent of the page.
+func (s *ZoneService) ListZones(ctx context.Context, limit, offset int) ([]ZoneWithNodes, int, error) {
+	zones, err := s.zoneRepo.ListZonesPage(ctx, limit, offset)
 	if err != nil {
-		return nil, fmt.Errorf("list zones: %w", err)
+		return nil, 0, fmt.Errorf("list zones: %w", err)
 	}
 	out := make([]ZoneWithNodes, 0, len(zones))
 	for _, z := range zones {
 		nodes, err := s.nodeRepo.ListNodesByZone(ctx, z.ID)
 		if err != nil {
-			return nil, fmt.Errorf("list zones: nodes of zone %d: %w", z.ID, err)
+			return nil, 0, fmt.Errorf("list zones: nodes of zone %d: %w", z.ID, err)
 		}
 		out = append(out, ZoneWithNodes{Zone: z, Nodes: nodes})
 	}
-	return out, nil
+	total, err := s.zoneRepo.CountZones(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list zones: count: %w", err)
+	}
+	return out, total, nil
 }
 
 // CreateNode registers a node in a zone. The zone must exist, the name must

@@ -90,6 +90,24 @@ func (r *IPPoolRepository) ListPools(ctx context.Context) ([]model.IPPool, error
 	return r.listPools(ctx, "SELECT "+poolCols+" FROM ip_pools ORDER BY id")
 }
 
+// ListPoolsPage returns one page of all pools ordered by id. It feeds the
+// paginated GET /ip-pools endpoint; ListPools stays available for internal
+// full scans.
+func (r *IPPoolRepository) ListPoolsPage(ctx context.Context, limit, offset int) ([]model.IPPool, error) {
+	return r.listPools(ctx,
+		"SELECT "+poolCols+" FROM ip_pools ORDER BY id LIMIT $1 OFFSET $2", limit, offset)
+}
+
+// CountPools returns the total number of pools, backing the X-Total-Count
+// header of GET /ip-pools.
+func (r *IPPoolRepository) CountPools(ctx context.Context) (int, error) {
+	var n int
+	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM ip_pools").Scan(&n); err != nil {
+		return 0, fmt.Errorf("ip pools: count: %w", err)
+	}
+	return n, nil
+}
+
 // ListPoolsByZone returns the pools of a zone ordered by id.
 func (r *IPPoolRepository) ListPoolsByZone(ctx context.Context, zoneID int64) ([]model.IPPool, error) {
 	return r.listPools(ctx, "SELECT "+poolCols+" FROM ip_pools WHERE zone_id=$1 ORDER BY id", zoneID)

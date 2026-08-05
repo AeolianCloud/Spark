@@ -67,12 +67,19 @@ func (h *StorageTypeHandler) Get(c *gin.Context) error {
 	return nil
 }
 
-// List handles GET /storage-types.
+// List handles GET /storage-types: one page of storage types (shared
+// limit/offset query parameters), with X-Total-Count carrying the total
+// count.
 func (h *StorageTypeHandler) List(c *gin.Context) error {
-	types, err := h.svc.List(c.Request.Context())
+	limit, offset, err := parsePagination(c)
+	if err != nil {
+		return err
+	}
+	types, total, err := h.svc.List(c.Request.Context(), limit, offset)
 	if err != nil {
 		return mapServiceError(err)
 	}
+	setTotalCount(c, total)
 	c.JSON(http.StatusOK, types)
 	return nil
 }

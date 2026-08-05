@@ -73,3 +73,40 @@ func TestFilterImagesAvailableByNodes(t *testing.T) {
 		})
 	}
 }
+
+// TestSlicePage pins down the shared Go-side page slicing used by the zone
+// image list: the slice never runs past the end, an offset past the end
+// yields an empty result, and a limit of 0 yields an empty page. Negative
+// limit/offset are clamped to 0 (the HTTP layer rejects them, but the shared
+// helper must not panic or mis-slice for callers that pass them).
+func TestSlicePage(t *testing.T) {
+	items := []int{1, 2, 3, 4, 5}
+	cases := []struct {
+		name       string
+		limit, off int
+		want       []int
+	}{
+		{"first page", 2, 0, []int{1, 2}},
+		{"middle page", 2, 2, []int{3, 4}},
+		{"last short page", 2, 4, []int{5}},
+		{"offset past the end", 2, 10, []int{}},
+		{"limit 0", 0, 0, []int{}},
+		{"exact end", 5, 0, []int{1, 2, 3, 4, 5}},
+		{"negative limit clamps to 0", -1, 0, []int{}},
+		{"negative offset clamps to 0", 2, -3, []int{1, 2}},
+		{"both negative", -1, -1, []int{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := slicePage(items, tc.limit, tc.off)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}

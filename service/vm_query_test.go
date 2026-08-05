@@ -192,9 +192,12 @@ func TestVMServiceListVMs(t *testing.T) {
 			pve.WithBaseURL(clients[host].URL), pve.WithHTTPClient(clients[host].Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	items, warnings, err := svc.ListVMs(context.Background())
+	items, warnings, total, err := svc.ListVMs(context.Background(), 25, 0)
 	if err != nil {
 		t.Fatalf("ListVMs: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3 (all local VMs)", total)
 	}
 	if len(items) != 2 || items[0].VM.VM.ID != 1 || items[1].VM.VM.ID != 2 {
 		t.Fatalf("items = %+v, want vm1 (merged) and vm-creating from pve1", items)
@@ -222,20 +225,88 @@ func TestVMServiceListVMsRepoErrors(t *testing.T) {
 		&fakeVMZoneRepository{}, &fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 
 	svc.zoneRepo = &fakeVMZoneRepository{err: errors.New("zone db down")}
-	if _, _, err := svc.ListVMs(context.Background()); err == nil {
+	if _, _, _, err := svc.ListVMs(context.Background(), 25, 0); err == nil {
 		t.Fatal("ListVMs with a failing zone repo: want an error")
 	}
 
 	svc.zoneRepo = &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
 	svc.nodeRepo = &fakeVMNodeRepository{err: errors.New("node db down")}
-	if _, _, err := svc.ListVMs(context.Background()); err == nil {
+	if _, _, _, err := svc.ListVMs(context.Background(), 25, 0); err == nil {
 		t.Fatal("ListVMs with a failing node repo: want an error")
 	}
 
 	svc.nodeRepo = &fakeVMNodeRepository{}
 	svc.vmRepo = &fakeVMRepository{listErr: errors.New("vm db down")}
-	if _, _, err := svc.ListVMs(context.Background()); err == nil {
+	if _, _, _, err := svc.ListVMs(context.Background(), 25, 0); err == nil {
 		t.Fatal("ListVMs with a failing vm repo: want an error")
+	}
+}
+
+// TestVMServiceListVMsPagination verifies the paging contract of GET /vms:
+// limit/offset select the page of local metadata rows (the PVE merge only
+// sees that page), and total is the full local VM count even when a node is
+// down and its VMs are dropped from the page.
+func TestVMServiceListVMsPagination(t *testing.T) {
+	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/nodes/pve1/qemu" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"data": [{"vmid": 100, "name": "vm1", "status": "running", "cpu": 0.5, "mem": 1048576, "maxmem": 2097152, "disk": 1073741824, "maxdisk": 2147483648, "uptime": 42}]}`)
+	}))
+	defer alive.Close()
+	clients := map[string]*httptest.Server{"h1": alive}
+
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 1, Name: "pve1", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	vmRepo := &fakeVMRepository{vms: []repository.VMWithIP{
+		vw(1, 1, 100, "vm1"),
+		vw(2, 1, 0, "vm-creating"),
+		vw(3, 1, 200, "vm3"),
+	}}
+	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("x", apiUser, apiTokenSecret,
+			pve.WithBaseURL(clients[host].URL), pve.WithHTTPClient(clients[host].Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	// Page 1 (offset 0, limit 2): the first two local rows by id order.
+	items, warnings, total, err := svc.ListVMs(context.Background(), 2, 0)
+	if err != nil {
+		t.Fatalf("ListVMs: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+	if len(items) != 2 || items[0].VM.VM.ID != 1 || items[1].VM.VM.ID != 2 {
+		t.Fatalf("items = %+v, want local rows 1 and 2", items)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %+v, want none", warnings)
+	}
+
+	// Page 2 (offset 2, limit 2): the last row, merged live.
+	items, _, total, err = svc.ListVMs(context.Background(), 2, 2)
+	if err != nil {
+		t.Fatalf("ListVMs page 2: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("page 2 total = %d, want 3", total)
+	}
+	if len(items) != 1 || items[0].VM.VM.ID != 3 {
+		t.Fatalf("items = %+v, want local row 3", items)
+	}
+
+	// Offset past the end: empty page, total unchanged.
+	items, _, total, err = svc.ListVMs(context.Background(), 2, 10)
+	if err != nil {
+		t.Fatalf("ListVMs past the end: %v", err)
+	}
+	if len(items) != 0 || total != 3 {
+		t.Fatalf("items = %+v total = %d, want empty page with total 3", items, total)
 	}
 }
 

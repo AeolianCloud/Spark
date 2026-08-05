@@ -62,6 +62,14 @@ func (f *fakeIPPoolRepository) ListPools(ctx context.Context) ([]model.IPPool, e
 	return f.poolsByZone, nil
 }
 
+func (f *fakeIPPoolRepository) ListPoolsPage(ctx context.Context, limit, offset int) ([]model.IPPool, error) {
+	return slicePage(f.poolsByZone, limit, offset), nil
+}
+
+func (f *fakeIPPoolRepository) CountPools(ctx context.Context) (int, error) {
+	return len(f.poolsByZone), nil
+}
+
 func (f *fakeIPPoolRepository) ListPoolsByZone(ctx context.Context, zoneID int64) ([]model.IPPool, error) {
 	return f.poolsByZone, nil
 }
@@ -142,6 +150,14 @@ func (s *scriptedIPPoolRepository) GetPool(ctx context.Context, id int64) (*mode
 
 func (s *scriptedIPPoolRepository) ListPools(ctx context.Context) ([]model.IPPool, error) {
 	return nil, errors.New("unused")
+}
+
+func (s *scriptedIPPoolRepository) ListPoolsPage(ctx context.Context, limit, offset int) ([]model.IPPool, error) {
+	return nil, errors.New("unused")
+}
+
+func (s *scriptedIPPoolRepository) CountPools(ctx context.Context) (int, error) {
+	return 0, errors.New("unused")
 }
 
 func (s *scriptedIPPoolRepository) ListPoolsByZone(ctx context.Context, zoneID int64) ([]model.IPPool, error) {

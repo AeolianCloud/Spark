@@ -63,7 +63,10 @@ func NewVMHandler(svc *service.VMService) *VMHandler {
 
 // RegisterVMsRoutes mounts the VM lifecycle routes on rg. It is called by
 // the router with the /vms group. GET /vms and GET /vms/:id coexist with the
-// POST routes without conflict (gin keeps separate trees per HTTP method).
+// POST/PATCH/DELETE routes without conflict (gin keeps separate trees per
+// HTTP method). The spec-change and destroy operations follow REST method
+// semantics: PATCH /vms/:id is the partial spec update, DELETE /vms/:id the
+// destroy.
 func RegisterVMsRoutes(rg *gin.RouterGroup, svc *service.VMService) {
 	h := NewVMHandler(svc)
 	rg.POST("", Handler(h.Create))
@@ -72,8 +75,8 @@ func RegisterVMsRoutes(rg *gin.RouterGroup, svc *service.VMService) {
 	rg.POST("/:id/start", Handler(h.Start))
 	rg.POST("/:id/stop", Handler(h.Stop))
 	rg.POST("/:id/restart", Handler(h.Restart))
-	rg.POST("/:id/resize", Handler(h.Resize))
-	rg.POST("/:id/destroy", Handler(h.Destroy))
+	rg.PATCH("/:id", Handler(h.Resize))
+	rg.DELETE("/:id", Handler(h.Destroy))
 }
 
 // vmResponse is the public VM payload. The password is never included;
@@ -172,11 +175,17 @@ func toVMListItem(item *service.VMListItem) vmListItem {
 	return out
 }
 
-// List handles GET /vms: one PVE call per enabled node merged with the local
-// metadata (8.1). Failed nodes are reported in warnings (8.3); warnings is
+// List handles GET /vms: one PVE call per enabled node merged with the
+// local metadata page (8.1). The page is selected by the shared limit/offset
+// query parameters and the X-Total-Count header reports the total number of
+// local VM rows. Failed nodes are reported in warnings (8.3); warnings is
 // always an array (empty when every node answered).
 func (h *VMHandler) List(c *gin.Context) error {
-	items, warnings, err := h.svc.ListVMs(c.Request.Context())
+	limit, offset, err := parsePagination(c)
+	if err != nil {
+		return err
+	}
+	items, warnings, total, err := h.svc.ListVMs(c.Request.Context(), limit, offset)
 	if err != nil {
 		return mapVMServiceError(err)
 	}
@@ -188,6 +197,7 @@ func (h *VMHandler) List(c *gin.Context) error {
 	for _, w := range warnings {
 		warns = append(warns, nodeWarning{Node: w.Node, Error: w.Error})
 	}
+	setTotalCount(c, total)
 	c.JSON(http.StatusOK, gin.H{"vms": vms, "warnings": warns})
 	return nil
 }
@@ -231,7 +241,8 @@ func (h *VMHandler) Create(c *gin.Context) error {
 // Start handles POST /vms/:id/start. 202 + {accepted: true} was chosen over
 // returning the PVE task ID: the operation is dispatched asynchronously and
 // the client has no task-polling endpoint — the VM's real state is read
-// pass-through (batch 8).
+// pass-through (batch 8). The Location header points at the pass-through
+// status endpoint GET /vms/:id, where the client can observe the outcome.
 func (h *VMHandler) Start(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -240,12 +251,14 @@ func (h *VMHandler) Start(c *gin.Context) error {
 	if err := h.svc.Start(c.Request.Context(), id); err != nil {
 		return mapVMServiceError(err)
 	}
+	c.Header("Location", fmt.Sprintf("/vms/%d", id))
 	c.JSON(http.StatusAccepted, gin.H{"accepted": true})
 	return nil
 }
 
 // Stop handles POST /vms/:id/stop (clean ACPI shutdown; see
-// VMService.Stop).
+// VMService.Stop). The Location header points at the pass-through status
+// endpoint GET /vms/:id.
 func (h *VMHandler) Stop(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -254,11 +267,13 @@ func (h *VMHandler) Stop(c *gin.Context) error {
 	if err := h.svc.Stop(c.Request.Context(), id); err != nil {
 		return mapVMServiceError(err)
 	}
+	c.Header("Location", fmt.Sprintf("/vms/%d", id))
 	c.JSON(http.StatusAccepted, gin.H{"accepted": true})
 	return nil
 }
 
-// Restart handles POST /vms/:id/restart.
+// Restart handles POST /vms/:id/restart. The Location header points at the
+// pass-through status endpoint GET /vms/:id.
 func (h *VMHandler) Restart(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -267,14 +282,17 @@ func (h *VMHandler) Restart(c *gin.Context) error {
 	if err := h.svc.Restart(c.Request.Context(), id); err != nil {
 		return mapVMServiceError(err)
 	}
+	c.Header("Location", fmt.Sprintf("/vms/%d", id))
 	c.JSON(http.StatusAccepted, gin.H{"accepted": true})
 	return nil
 }
 
-// Destroy handles POST /vms/:id/destroy. 200 + {destroyed: true} was chosen
-// over 204 so the response body can distinguish "destroyed" from future
-// "already gone" semantics; the operation is synchronous (the PVE destroy
-// task is waited on).
+// Destroy handles DELETE /vms/:id. The operation is synchronous (the PVE
+// destroy task is waited on) and answers 204 with no body on success. The
+// DELETE idempotency semantics live in the service layer and are unchanged:
+// a VM row that does not exist yields 404 not_found before any PVE call,
+// while a PVE-side 404 (the VM was already removed on the node) is treated
+// as "already destroyed" and only the local cleanup runs.
 func (h *VMHandler) Destroy(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {
@@ -283,22 +301,25 @@ func (h *VMHandler) Destroy(c *gin.Context) error {
 	if err := h.svc.Destroy(c.Request.Context(), id); err != nil {
 		return mapVMServiceError(err)
 	}
-	c.JSON(http.StatusOK, gin.H{"destroyed": true})
+	c.Status(http.StatusNoContent)
 	return nil
 }
 
-// resizeRequest is the body of POST /vms/:id/resize; every field is
-// optional, at least one must be set.
+// resizeRequest is the body of PATCH /vms/:id; every field is optional, at
+// least one must be set. Absent fields keep their current values.
 type resizeRequest struct {
 	CPU    *int   `json:"cpu"`
 	MemMB  *int64 `json:"mem_mb"`
 	DiskGB *int64 `json:"disk_gb"`
 }
 
-// Resize handles POST /vms/:id/resize and returns the VM with its real,
-// pass-through status: after the spec change is applied the live status is
-// re-read from PVE (GetVM), so the response reflects the actual VM state
-// rather than a stand-in — the same shape as GET /vms/:id.
+// Resize handles PATCH /vms/:id: a partial update of the VM spec. Only the
+// fields present in the {cpu?, mem_mb?, disk_gb?} body are applied; a
+// missing or null field keeps its current value (PVE first, then the local
+// row). It returns the VM with its real, pass-through status: after
+// the spec change is applied the live status is re-read from PVE (GetVM),
+// so the response reflects the actual VM state rather than a stand-in — the
+// same shape as GET /vms/:id.
 func (h *VMHandler) Resize(c *gin.Context) error {
 	id, err := parseIDParam(c, "id")
 	if err != nil {

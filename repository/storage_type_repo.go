@@ -60,6 +60,40 @@ func (r *StorageTypeRepository) List(ctx context.Context) ([]model.StorageType, 
 	return types, nil
 }
 
+// ListPage returns one page of storage types ordered by id. It feeds the
+// paginated GET /storage-types endpoint.
+func (r *StorageTypeRepository) ListPage(ctx context.Context, limit, offset int) ([]model.StorageType, error) {
+	rows, err := r.pool.Query(ctx,
+		"SELECT "+storageTypeCols+" FROM storage_types ORDER BY id LIMIT $1 OFFSET $2", limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("storage types: list page: %w", err)
+	}
+	defer rows.Close()
+
+	types := make([]model.StorageType, 0)
+	for rows.Next() {
+		var st model.StorageType
+		if err := rows.Scan(&st.ID, &st.Name, &st.DisplayName, &st.PVEStorage, &st.CreatedAt); err != nil {
+			return nil, fmt.Errorf("storage types: scan: %w", err)
+		}
+		types = append(types, st)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage types: iterate: %w", err)
+	}
+	return types, nil
+}
+
+// Count returns the total number of storage types, backing the
+// X-Total-Count header of GET /storage-types.
+func (r *StorageTypeRepository) Count(ctx context.Context) (int, error) {
+	var n int
+	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM storage_types").Scan(&n); err != nil {
+		return 0, fmt.Errorf("storage types: count: %w", err)
+	}
+	return n, nil
+}
+
 // Get returns the storage type with the given id, or pgx.ErrNoRows when
 // absent.
 func (r *StorageTypeRepository) Get(ctx context.Context, id int64) (*model.StorageType, error) {

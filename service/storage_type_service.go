@@ -39,13 +39,18 @@ func (s *StorageTypeService) Create(ctx context.Context, name, displayName, pveS
 	return st, nil
 }
 
-// List returns all storage types.
-func (s *StorageTypeService) List(ctx context.Context) ([]model.StorageType, error) {
-	types, err := s.repo.List(ctx)
+// List returns one page of storage types ordered by id; total is the total
+// number of storage types, independent of the page.
+func (s *StorageTypeService) List(ctx context.Context, limit, offset int) ([]model.StorageType, int, error) {
+	types, err := s.repo.ListPage(ctx, limit, offset)
 	if err != nil {
-		return nil, fmt.Errorf("list storage types: %w", err)
+		return nil, 0, fmt.Errorf("list storage types: %w", err)
 	}
-	return types, nil
+	total, err := s.repo.Count(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list storage types: count: %w", err)
+	}
+	return types, total, nil
 }
 
 // Get returns the storage type with the given id, or a not_found error.

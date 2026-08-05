@@ -59,25 +59,35 @@ func (h *IPPoolHandler) CreatePool(c *gin.Context) error {
 }
 
 // ListPools handles GET /ip-pools. With a zone_id query parameter it returns
-// only that zone's pools; without it, all pools.
+// only that zone's pools — deliberately unpaginated (a zone embeds few
+// pools); without it, all pools paged by the shared limit/offset query
+// parameters. X-Total-Count carries the total count in both branches. The
+// limit/offset parameters are validated in both branches so a bad value
+// fails consistently regardless of the filter.
 func (h *IPPoolHandler) ListPools(c *gin.Context) error {
 	ctx := c.Request.Context()
+	limit, offset, err := parsePagination(c)
+	if err != nil {
+		return err
+	}
 	if raw := c.Query("zone_id"); raw != "" {
 		zoneID, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || zoneID <= 0 {
 			return ErrBadRequest("invalid zone_id query parameter")
 		}
-		pools, err := h.svc.ListPools(ctx, &zoneID)
+		pools, total, err := h.svc.ListPools(ctx, &zoneID, limit, offset)
 		if err != nil {
 			return mapServiceErrorExtended(err)
 		}
+		setTotalCount(c, total)
 		c.JSON(http.StatusOK, pools)
 		return nil
 	}
-	pools, err := h.svc.ListPools(ctx, nil)
+	pools, total, err := h.svc.ListPools(ctx, nil, limit, offset)
 	if err != nil {
 		return mapServiceErrorExtended(err)
 	}
+	setTotalCount(c, total)
 	c.JSON(http.StatusOK, pools)
 	return nil
 }

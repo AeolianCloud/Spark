@@ -63,3 +63,38 @@ func (r *ZoneRepository) ListZones(ctx context.Context) ([]model.Zone, error) {
 	}
 	return zones, nil
 }
+
+// ListZonesPage returns one page of zones ordered by id. It feeds the
+// paginated GET /zones endpoint; ListZones stays available for the internal
+// full scans (create duplicate checks, the VM list's zone enumeration).
+func (r *ZoneRepository) ListZonesPage(ctx context.Context, limit, offset int) ([]model.Zone, error) {
+	rows, err := r.pool.Query(ctx,
+		"SELECT "+zoneCols+" FROM zones ORDER BY id LIMIT $1 OFFSET $2", limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("zones: list page: %w", err)
+	}
+	defer rows.Close()
+
+	zones := make([]model.Zone, 0)
+	for rows.Next() {
+		var z model.Zone
+		if err := rows.Scan(&z.ID, &z.Name, &z.CreatedAt); err != nil {
+			return nil, fmt.Errorf("zones: scan: %w", err)
+		}
+		zones = append(zones, z)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("zones: iterate: %w", err)
+	}
+	return zones, nil
+}
+
+// CountZones returns the total number of zones, backing the X-Total-Count
+// header of GET /zones.
+func (r *ZoneRepository) CountZones(ctx context.Context) (int, error) {
+	var n int
+	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM zones").Scan(&n); err != nil {
+		return 0, fmt.Errorf("zones: count: %w", err)
+	}
+	return n, nil
+}

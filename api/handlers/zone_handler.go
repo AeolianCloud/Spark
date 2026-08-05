@@ -117,9 +117,15 @@ func (h *ZoneHandler) CreateZone(c *gin.Context) error {
 	return nil
 }
 
-// ListZones handles GET /zones.
+// ListZones handles GET /zones: one page of zones (shared limit/offset
+// query parameters), each with its full node list; X-Total-Count carries
+// the total number of zones.
 func (h *ZoneHandler) ListZones(c *gin.Context) error {
-	zones, err := h.svc.ListZones(c.Request.Context())
+	limit, offset, err := parsePagination(c)
+	if err != nil {
+		return err
+	}
+	zones, total, err := h.svc.ListZones(c.Request.Context(), limit, offset)
 	if err != nil {
 		return mapServiceErrorExtended(err)
 	}
@@ -127,6 +133,7 @@ func (h *ZoneHandler) ListZones(c *gin.Context) error {
 	for _, z := range zones {
 		out = append(out, toZoneResponse(z))
 	}
+	setTotalCount(c, total)
 	c.JSON(http.StatusOK, out)
 	return nil
 }
