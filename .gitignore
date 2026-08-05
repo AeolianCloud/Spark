@@ -1,0 +1,14 @@
+# build artifacts
+/spark
+*.test
+
+# runtime config (contains secrets; use config/config.yaml as template)
+/config.local.yaml
+config.local.yaml
+/config/config.local.yaml
+
+# editor/OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

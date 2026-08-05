@@ -1,0 +1,14 @@
+server:
+  port: 8080
+
+database:
+  # PostgreSQL DSN, e.g. postgres://user:password@localhost:5432/spark?sslmode=disable
+  dsn: "postgres://spark:change-me@localhost:5432/spark?sslmode=disable"
+
+crypto:
+  # base64-encoded 32-byte AES key, MUST be replaced before production use.
+  # Generate one with: openssl rand -base64 32
+  encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+log:
+  level: "info"

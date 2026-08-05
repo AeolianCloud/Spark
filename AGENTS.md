@@ -1,0 +1,4 @@
+- 这是一个pve虚拟化后端项目
+- 主要技术栈为go+gin
+- 主要功能包括虚拟机的全生命周期管理，对接前端实现公有云
+- 严格按照pve标准api实现(https://pve.proxmox.com/pve-docs/api-viewer/index.html)
