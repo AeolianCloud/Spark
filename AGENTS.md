@@ -9,6 +9,6 @@
 ## 项目约束
 
 - 领域术语以根目录 `CONTEXT.md` 为准，架构决策记录在 `docs/adr/`（见 ADR 0003）
-- 变更必须同步两份 OpenAPI 契约：`docs/openapi.yaml`（权威源）与 `api/swagger/openapi.yaml`（Swagger UI 挂载副本），并保证 operationId 完整
+- 接口契约红线：任何接口的增、删、改（尤其写操作）后，必须同步更新 `docs/openapi.yaml`（权威源）与 `api/swagger/openapi.yaml`（Swagger UI 挂载副本），并保证 operationId 完整；契约是前端唯一的事实来源，未同步契约的接口变更不允许合并
 - 敏感字段加密：VM 密码已经 crypto 包（AES-256-GCM）加密后落库；节点 API 令牌加密待实现（见 ADR 0004），错误消息对外脱敏
 - 端到端测试位于 `e2e/`（`go test -tags=e2e ./e2e/ -count=1 -v`），依赖 fake PVE 服务器注入，改动涉及 PVE 客户端时须保持其可用
