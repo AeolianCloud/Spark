@@ -50,6 +50,8 @@ go run ./cmd/server                      # 直接运行
 
 启动流程：加载配置 → 连接 PostgreSQL（连接池 + Ping 健康检查）→ 自动执行内嵌迁移（`database.Migrate`，幂等，按版本号记录在 `schema_migrations`）→ 启动 HTTP 服务。
 
+Web 管理界面（`web/`）的生产部署（nginx 静态托管 + `/api` 反代、无鉴权网络隔离提示）见 [docs/web-deployment.md](docs/web-deployment.md)。
+
 ## PVE 节点准备
 
 每个被管理的 PVE 节点需要：
