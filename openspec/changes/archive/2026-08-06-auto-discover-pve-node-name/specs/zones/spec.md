@@ -1,31 +1,4 @@
-## Purpose
-
-定义区域（zone）与 PVE 节点的组织方式：一个区域包含多个节点，不同区域默认网络不互通，为虚拟机部署提供隔离边界。
-
-## ADDED Requirements
-
-### Requirement: 区域管理
-
-系统 SHALL 支持创建与查询区域。区域 SHALL 包含一个或多个 PVE 节点，每个节点 SHALL 只归属于一个区域。
-
-#### Scenario: 创建区域
-
-- **WHEN** 管理员提交包含名称的区域创建请求
-- **THEN** 系统创建区域并返回区域信息
-
-#### Scenario: 查询区域列表
-
-- **WHEN** 管理员请求区域列表
-- **THEN** 系统返回全部区域及其节点信息
-
-### Requirement: 区域隔离
-
-不同区域的节点之间 SHALL 默认不互通，虚拟机只部署于其所属区域内的节点，不得跨区域部署或使用其他区域的资源。
-
-#### Scenario: 跨区域资源隔离
-
-- **WHEN** 创建虚拟机指定了区域
-- **THEN** 该虚拟机只可能部署在该区域内的节点上，不会使用其他区域的节点或 IP
+## MODIFIED Requirements
 
 ### Requirement: 节点管理
 
