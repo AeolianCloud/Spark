@@ -140,6 +140,71 @@ func TestNewClientStripsHostPort(t *testing.T) {
 	}
 }
 
+// TestWithPortOverridesDefaultPort 验证 WithPort 覆盖默认端口 8006，
+// 且 port=0 被忽略（保持默认端口语义）。
+func TestWithPortOverridesDefaultPort(t *testing.T) {
+	c := NewClient("pve1", "root@pam", "spark=uuid", WithPort(8007))
+	if c.initErr != nil {
+		t.Fatalf("NewClient: %v", c.initErr)
+	}
+	if want := "https://pve1:8007/api2/json"; c.baseURL != want {
+		t.Fatalf("baseURL = %q, want %q", c.baseURL, want)
+	}
+	// port=0 表示不覆盖，保持默认端口 8006。
+	c2 := NewClient("pve1", "root@pam", "spark=uuid", WithPort(0))
+	if c2.initErr != nil {
+		t.Fatalf("NewClient(WithPort(0)): %v", c2.initErr)
+	}
+	if want := "https://pve1:8006/api2/json"; c2.baseURL != want {
+		t.Fatalf("baseURL = %q, want %q", c2.baseURL, want)
+	}
+}
+
+// TestWithPortWithStripHostPort 验证 stripHostPort 先剥离 host 中残留
+// 的 ":port"，再由 WithPort 覆盖端口，不会产生双端口。
+func TestWithPortWithStripHostPort(t *testing.T) {
+	c := NewClient("pve1:8009", "root@pam", "spark=uuid", WithPort(8007))
+	if c.initErr != nil {
+		t.Fatalf("NewClient: %v", c.initErr)
+	}
+	if want := "https://pve1:8007/api2/json"; c.baseURL != want {
+		t.Fatalf("baseURL = %q, want %q", c.baseURL, want)
+	}
+}
+
+// TestWithPortAndWithBaseURLOrder 验证与 WithBaseURL 的覆盖顺序：
+// Options 按顺序应用，后应用的 Option 生效；WithPort 直接改写
+// baseURL 的端口，因此任意顺序都能正确工作。
+func TestWithPortAndWithBaseURLOrder(t *testing.T) {
+	// WithBaseURL 后应用，最终以 WithBaseURL 为准。
+	c := NewClient("pve1", "root@pam", "spark=uuid", WithPort(8007), WithBaseURL("https://other:8443/api2/json"))
+	if c.initErr != nil {
+		t.Fatalf("NewClient: %v", c.initErr)
+	}
+	if want := "https://other:8443/api2/json"; c.baseURL != want {
+		t.Fatalf("baseURL = %q, want %q", c.baseURL, want)
+	}
+	// WithPort 后应用，覆盖 WithBaseURL 的端口。
+	c2 := NewClient("pve1", "root@pam", "spark=uuid", WithBaseURL("https://other:8443/api2/json"), WithPort(8007))
+	if c2.initErr != nil {
+		t.Fatalf("NewClient: %v", c2.initErr)
+	}
+	if want := "https://other:8007/api2/json"; c2.baseURL != want {
+		t.Fatalf("baseURL = %q, want %q", c2.baseURL, want)
+	}
+}
+
+// TestWithPortInvalidValues 覆盖非法端口取值：超出 1-65535 的端口
+// 会记录初始化错误并在首次使用时浮现，而不是被静默忽略。
+func TestWithPortInvalidValues(t *testing.T) {
+	for _, port := range []int{-1, 65536} {
+		c := NewClient("pve1", "root@pam", "spark=uuid", WithPort(port))
+		if c.initErr == nil || !strings.Contains(c.initErr.Error(), "WithPort") {
+			t.Fatalf("NewClient(WithPort(%d)) initErr = %v, want WithPort error", port, c.initErr)
+		}
+	}
+}
+
 // TestDoJSONSuccess 验证 2xx 响应返回 data 负载。
 func TestDoJSONSuccess(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -215,6 +280,58 @@ func TestUpstreamErrorNonJSONBody(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Internal Server Error") {
 		t.Fatalf("error %q does not carry the body", err.Error())
+	}
+}
+
+// TestListNodes 验证 GET /nodes 返回的集群节点名列表字段映射。
+func TestListNodes(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/nodes" {
+			t.Errorf("path = %s, want /nodes", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "PVEAPIToken=root@pam!spark=uuid" {
+			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		fmt.Fprint(w, `{"data": [
+			{"node": "aeoliancloud", "status": "online"},
+			{"node": "pve2", "status": "online"}
+		]}`)
+	})
+	nodes, err := c.ListNodes(context.Background())
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("len = %d, want 2", len(nodes))
+	}
+	if a := nodes[0]; a.Node != "aeoliancloud" || a.Status != "online" {
+		t.Fatalf("nodes[0] = %+v", a)
+	}
+	if b := nodes[1]; b.Node != "pve2" || b.Status != "online" {
+		t.Fatalf("nodes[1] = %+v", b)
+	}
+}
+
+// TestListNodesUpstreamError 覆盖无有效 token 时 PVE 返回 401 的场景，
+// 错误必须以 *UpstreamError 呈现。
+func TestListNodesUpstreamError(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"errors": {"auth": "no valid API token"}}`)
+	})
+	_, err := c.ListNodes(context.Background())
+	var upErr *UpstreamError
+	if !errors.As(err, &upErr) {
+		t.Fatalf("err = %v (%T), want *UpstreamError", err, err)
+	}
+	if upErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want 401", upErr.StatusCode)
+	}
+	if !strings.Contains(err.Error(), "no valid API token") {
+		t.Fatalf("error %q does not carry the PVE error", err.Error())
 	}
 }
 

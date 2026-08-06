@@ -127,10 +127,12 @@ func (r *ImageRepository) ZoneExists(ctx context.Context, id int64) (bool, error
 	return exists, nil
 }
 
-// EnabledNodeNamesByZone 返回区域内已启用节点的名称，按 id 排序。
-// 它支撑 ImageService.ListImagesByZone。
+// EnabledNodeNamesByZone 返回区域内已启用节点的 PVE 集群节点名（pve_name，
+// 空值回退业务名 name），按 id 排序。它支撑 ImageService.ListImagesByZone：
+// 镜像的 node_images 映射按集群节点名登记，交集校验因此必须使用
+// pve_name 而非业务名（任务 4.3）。
 func (r *ImageRepository) EnabledNodeNamesByZone(ctx context.Context, zoneID int64) ([]string, error) {
-	rows, err := r.pool.Query(ctx, "SELECT name FROM pve_nodes WHERE zone_id=$1 AND enabled=TRUE ORDER BY id", zoneID)
+	rows, err := r.pool.Query(ctx, "SELECT COALESCE(NULLIF(pve_name, ''), name) AS name FROM pve_nodes WHERE zone_id=$1 AND enabled=TRUE ORDER BY id", zoneID)
 	if err != nil {
 		return nil, fmt.Errorf("images: enabled nodes by zone: %w", err)
 	}

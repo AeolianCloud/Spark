@@ -159,9 +159,9 @@ type VMService struct {
 	imageRepo   VMImageRepository
 	storageRepo VMStorageTypeRepository
 	cipher      *crypto.Cipher
-	// newClient 为节点构建 PVE 客户端；可注入，以便测试将供给链和生命周期
-	// 调用指向假服务器。
-	newClient func(host, apiUser, apiTokenSecret string) *pve.Client
+	// newClient 为节点构建 PVE 客户端（host/port/API 用户/token）；可注入，
+	// 以便测试将供给链和生命周期调用指向假服务器。
+	newClient func(host string, port int, apiUser, apiTokenSecret string) *pve.Client
 	// selectNode 在池候选节点中挑选部署节点；可注入用于测试，生产默认使用与
 	// 服务在其他所有节点交互时相同的 newClient 工厂来探测可达性（因此
 	// SetClientFactory 同样会重定向这些探测）。
@@ -182,8 +182,8 @@ func NewVMService(beginner TxBeginner, vmRepo VMRepository, ipPoolRepo VMIPPoolR
 		imageRepo:   imageRepo,
 		storageRepo: storageRepo,
 		cipher:      cipher,
-		newClient: func(host, apiUser, apiTokenSecret string) *pve.Client {
-			return pve.NewClient(host, apiUser, apiTokenSecret)
+		newClient: func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+			return pve.NewClient(host, apiUser, apiTokenSecret, pve.WithPort(port))
 		},
 	}
 	// 可达性探测必须与其他所有节点交互使用相同的客户端工厂，因此覆盖
@@ -196,9 +196,10 @@ func NewVMService(beginner TxBeginner, vmRepo VMRepository, ipPoolRepo VMIPPoolR
 }
 
 // SetClientFactory 替换用于所有节点交互（供给链、生命周期操作、透传查询、
-// 可达性探测）的 PVE 客户端工厂。默认工厂针对 https://{host}:8006/api2/json
-// 构建客户端；覆盖它可以让调用方将服务指向不同的 base URL（测试、反向代理）。
-func (s *VMService) SetClientFactory(fn func(host, apiUser, apiTokenSecret string) *pve.Client) {
+// 可达性探测）的 PVE 客户端工厂。默认工厂针对
+// https://{host}:{port}/api2/json（port 取节点持久化的端口）构建客户端；
+// 覆盖它可以让调用方将服务指向不同的 base URL（测试、反向代理）。
+func (s *VMService) SetClientFactory(fn func(host string, port int, apiUser, apiTokenSecret string) *pve.Client) {
 	if fn != nil {
 		s.newClient = fn
 	}
@@ -404,6 +405,7 @@ func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Im
 			slog.Error("vm provisioning panicked",
 				"vm_id", vm.ID,
 				"node", node.Name,
+				"pve_node", nodeName(node),
 				"error", msg,
 			)
 		}
@@ -412,6 +414,7 @@ func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Im
 		slog.Error("vm provisioning failed",
 			"vm_id", vm.ID,
 			"node", node.Name,
+			"pve_node", nodeName(node),
 			"error", err,
 		)
 	}
@@ -426,17 +429,17 @@ func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Im
 func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENode,
 	image *model.Image, storageType *model.StorageType, pool model.IPPool,
 	plainPassword, ipAddr string) error {
-	client := s.newClient(node.Host, node.APIUser, node.APITokenSecret)
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
 
 	vmid, err := client.NextVMID(ctx)
 	if err != nil {
 		return s.failProvision(ctx, vm.ID, 0, "next vmid", err, plainPassword)
 	}
 
-	imagePath := image.NodeImages[node.Name]
+	imagePath := image.NodeImages[nodeName(node)]
 	if imagePath == "" {
 		return s.failProvision(ctx, vm.ID, 0, "image path",
-			fmt.Errorf("image %q has no storage path for node %q", image.Name, node.Name), plainPassword)
+			fmt.Errorf("image %q has no storage path for node %q", image.Name, nodeName(node)), plainPassword)
 	}
 
 	prefix, err := netip.ParsePrefix(pool.NetworkCIDR)
@@ -445,7 +448,7 @@ func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENo
 			fmt.Errorf("pool %d has invalid network_cidr %q: %v", pool.ID, pool.NetworkCIDR, err), plainPassword)
 	}
 
-	upid, err := client.CreateVM(ctx, node.Name, pve.CreateVMParams{
+	upid, err := client.CreateVM(ctx, nodeName(node), pve.CreateVMParams{
 		VMID:       int64(vmid),
 		Name:       vm.Name,
 		Memory:     vm.MemMB,
@@ -464,14 +467,14 @@ func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENo
 		return s.failProvision(ctx, vm.ID, int64(vmid), "create", err, plainPassword)
 	}
 
-	if _, err := client.WaitTask(ctx, node.Name, upid, 0, 0); err != nil {
+	if _, err := client.WaitTask(ctx, nodeName(node), upid, 0, 0); err != nil {
 		return s.failProvision(ctx, vm.ID, int64(vmid), "wait create", err, plainPassword)
 	}
 
 	// 导入的镜像可能小于请求的大小；此时磁盘会被扩展到 disk_gb。当镜像至少
 	// 与请求大小相同时，持久化的是实际大小。
 	diskGB := vm.DiskGB
-	cfg, err := client.GetVMConfig(ctx, node.Name, int64(vmid))
+	cfg, err := client.GetVMConfig(ctx, nodeName(node), int64(vmid))
 	if err != nil {
 		return s.failProvision(ctx, vm.ID, int64(vmid), "read config", err, plainPassword)
 	}
@@ -481,12 +484,12 @@ func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENo
 	}
 	if actual, perr := parseDiskSizeGB(cfg.String(boot)); perr == nil {
 		if vm.DiskGB > actual {
-			upid, err := client.ResizeDisk(ctx, node.Name, int64(vmid), boot, vm.DiskGB)
+			upid, err := client.ResizeDisk(ctx, nodeName(node), int64(vmid), boot, vm.DiskGB)
 			if err != nil {
 				return s.failProvision(ctx, vm.ID, int64(vmid), "resize disk", err, plainPassword)
 			}
 			if upid != "" {
-				if _, err := client.WaitTask(ctx, node.Name, upid, 0, 0); err != nil {
+				if _, err := client.WaitTask(ctx, nodeName(node), upid, 0, 0); err != nil {
 					return s.failProvision(ctx, vm.ID, int64(vmid), "wait resize", err, plainPassword)
 				}
 			}
@@ -617,8 +620,8 @@ func (s *VMService) Start(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	client := s.newClient(node.Host, node.APIUser, node.APITokenSecret)
-	if _, err := client.StartVM(ctx, node.Name, vm.VM.PVEVmid); err != nil {
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	if _, err := client.StartVM(ctx, nodeName(*node), vm.VM.PVEVmid); err != nil {
 		return mapPVEOpError(err, "start", id)
 	}
 	return nil
@@ -631,8 +634,8 @@ func (s *VMService) Stop(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	client := s.newClient(node.Host, node.APIUser, node.APITokenSecret)
-	if _, err := client.StopVM(ctx, node.Name, vm.VM.PVEVmid, false); err != nil {
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	if _, err := client.StopVM(ctx, nodeName(*node), vm.VM.PVEVmid, false); err != nil {
 		return mapPVEOpError(err, "stop", id)
 	}
 	return nil
@@ -644,8 +647,8 @@ func (s *VMService) Restart(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	client := s.newClient(node.Host, node.APIUser, node.APITokenSecret)
-	if _, err := client.RebootVM(ctx, node.Name, vm.VM.PVEVmid); err != nil {
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	if _, err := client.RebootVM(ctx, nodeName(*node), vm.VM.PVEVmid); err != nil {
 		return mapPVEOpError(err, "restart", id)
 	}
 	return nil
@@ -670,8 +673,8 @@ func (s *VMService) Destroy(ctx context.Context, id int64) error {
 		if err != nil {
 			return fmt.Errorf("destroy vm %d: get node: %w", id, err)
 		}
-		client := s.newClient(node.Host, node.APIUser, node.APITokenSecret)
-		if _, err := client.DestroyVM(ctx, node.Name, vm.VM.PVEVmid, true); err != nil {
+		client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+		if _, err := client.DestroyVM(ctx, nodeName(*node), vm.VM.PVEVmid, true); err != nil {
 			var upErr *pve.UpstreamError
 			if errors.As(err, &upErr) && upErr.StatusCode == http.StatusNotFound {
 				// PVE VM 已不存在（在服务之外被移除）；下面的本地清理仍会执行。
@@ -751,7 +754,7 @@ func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskG
 		next.DiskGB = *diskGB
 	}
 
-	client := s.newClient(node.Host, node.APIUser, node.APITokenSecret)
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
 
 	changed := false
 	if (cpu != nil && *cpu != vm.VM.CPU) || (memMB != nil && *memMB != vm.VM.MemMB) {
@@ -764,14 +767,14 @@ func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskG
 			m := *memMB
 			params.MemoryMB = &m
 		}
-		if _, err := client.SetVMConfig(ctx, node.Name, vm.VM.PVEVmid, params); err != nil {
+		if _, err := client.SetVMConfig(ctx, nodeName(*node), vm.VM.PVEVmid, params); err != nil {
 			return nil, fmt.Errorf("resize vm %d: set config: %w", id, err)
 		}
 		changed = true
 	}
 
 	if diskGB != nil && *diskGB > vm.VM.DiskGB {
-		cfg, err := client.GetVMConfig(ctx, node.Name, vm.VM.PVEVmid)
+		cfg, err := client.GetVMConfig(ctx, nodeName(*node), vm.VM.PVEVmid)
 		if err != nil {
 			return nil, fmt.Errorf("resize vm %d: read config: %w", id, err)
 		}
@@ -779,12 +782,12 @@ func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskG
 		if boot == "" {
 			boot = "scsi0"
 		}
-		upid, err := client.ResizeDisk(ctx, node.Name, vm.VM.PVEVmid, boot, *diskGB)
+		upid, err := client.ResizeDisk(ctx, nodeName(*node), vm.VM.PVEVmid, boot, *diskGB)
 		if err != nil {
 			return nil, fmt.Errorf("resize vm %d: resize disk: %w", id, err)
 		}
 		if upid != "" {
-			if _, err := client.WaitTask(ctx, node.Name, upid, 0, 0); err != nil {
+			if _, err := client.WaitTask(ctx, nodeName(*node), upid, 0, 0); err != nil {
 				return nil, fmt.Errorf("resize vm %d: wait resize: %w", id, err)
 			}
 		}

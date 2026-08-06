@@ -65,7 +65,7 @@ func TestEmbeddedMigrationsDiscovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrationFiles(MigrationFS): %v", err)
 	}
-	want := []string{"0001_init.sql", "0002_create_tables.sql", "0003_indexes_and_unique.sql", "0004_add_provision_error.sql"}
+	want := []string{"0001_init.sql", "0002_create_tables.sql", "0003_indexes_and_unique.sql", "0004_add_provision_error.sql", "0005_add_node_port.sql", "0006_add_pve_name.sql"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("embedded migrations = %v, want %v", names, want)
 	}

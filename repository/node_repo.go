@@ -17,15 +17,16 @@ func NewNodeRepository(pool pgxQuerier) *NodeRepository {
 	return &NodeRepository{pool: pool}
 }
 
-const nodeCols = "id, zone_id, name, host, api_user, api_token_secret, enabled, created_at"
+const nodeCols = "id, zone_id, name, pve_name, host, port, api_user, api_token_secret, enabled, created_at"
 
-// CreateNode 插入一个节点。凭据按设计以明文存储
-// （vms 上的 password_encrypted 是唯一的加密字段）。
+// CreateNode 插入一个节点。节点包含业务名、PVE 集群节点名、主机地址、
+// API 凭据与可选端口（默认 8006）。
+// 凭据按设计以明文存储（vms 上的 password_encrypted 是唯一的加密字段）。
 func (r *NodeRepository) CreateNode(ctx context.Context, node model.PVENode) (*model.PVENode, error) {
 	created := node
 	err := r.pool.QueryRow(ctx,
-		"INSERT INTO pve_nodes (zone_id, name, host, api_user, api_token_secret, enabled) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at",
-		node.ZoneID, node.Name, node.Host, node.APIUser, node.APITokenSecret, node.Enabled,
+		"INSERT INTO pve_nodes (zone_id, name, pve_name, host, port, api_user, api_token_secret, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, created_at",
+		node.ZoneID, node.Name, node.PveName, node.Host, node.Port, node.APIUser, node.APITokenSecret, node.Enabled,
 	).Scan(&created.ID, &created.CreatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
@@ -37,7 +38,7 @@ func (r *NodeRepository) CreateNode(ctx context.Context, node model.PVENode) (*m
 func (r *NodeRepository) GetNode(ctx context.Context, id int64) (*model.PVENode, error) {
 	var n model.PVENode
 	err := r.pool.QueryRow(ctx, "SELECT "+nodeCols+" FROM pve_nodes WHERE id=$1", id).
-		Scan(&n.ID, &n.ZoneID, &n.Name, &n.Host, &n.APIUser, &n.APITokenSecret, &n.Enabled, &n.CreatedAt)
+		Scan(&n.ID, &n.ZoneID, &n.Name, &n.PveName, &n.Host, &n.Port, &n.APIUser, &n.APITokenSecret, &n.Enabled, &n.CreatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
 	}
@@ -64,7 +65,7 @@ func (r *NodeRepository) listNodes(ctx context.Context, sql string, args ...any)
 	nodes := make([]model.PVENode, 0)
 	for rows.Next() {
 		var n model.PVENode
-		if err := rows.Scan(&n.ID, &n.ZoneID, &n.Name, &n.Host, &n.APIUser, &n.APITokenSecret, &n.Enabled, &n.CreatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.ZoneID, &n.Name, &n.PveName, &n.Host, &n.Port, &n.APIUser, &n.APITokenSecret, &n.Enabled, &n.CreatedAt); err != nil {
 			return nil, fmt.Errorf("nodes: scan: %w", err)
 		}
 		nodes = append(nodes, n)
@@ -80,9 +81,9 @@ func (r *NodeRepository) listNodes(ctx context.Context, sql string, args ...any)
 func (r *NodeRepository) UpdateNode(ctx context.Context, node model.PVENode) (*model.PVENode, error) {
 	var n model.PVENode
 	err := r.pool.QueryRow(ctx,
-		"UPDATE pve_nodes SET zone_id=$1, name=$2, host=$3, api_user=$4, api_token_secret=$5, enabled=$6 WHERE id=$7 RETURNING "+nodeCols,
-		node.ZoneID, node.Name, node.Host, node.APIUser, node.APITokenSecret, node.Enabled, node.ID,
-	).Scan(&n.ID, &n.ZoneID, &n.Name, &n.Host, &n.APIUser, &n.APITokenSecret, &n.Enabled, &n.CreatedAt)
+		"UPDATE pve_nodes SET zone_id=$1, name=$2, pve_name=$3, host=$4, port=$5, api_user=$6, api_token_secret=$7, enabled=$8 WHERE id=$9 RETURNING "+nodeCols,
+		node.ZoneID, node.Name, node.PveName, node.Host, node.Port, node.APIUser, node.APITokenSecret, node.Enabled, node.ID,
+	).Scan(&n.ID, &n.ZoneID, &n.Name, &n.PveName, &n.Host, &n.Port, &n.APIUser, &n.APITokenSecret, &n.Enabled, &n.CreatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
 	}

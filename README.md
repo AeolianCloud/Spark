@@ -37,6 +37,9 @@ openssl rand -base64 32
 ```
 
 > 生产环境必须替换 `config/config.yaml` 中的示例密钥（启动时检测到示例值会打印警告）。
+> 本地敏感配置（真实数据库密码、加密密钥）可放入仓库根目录的 `.env.local`（已 gitignore），
+> 通过 `set -a; source .env.local; set +a; go run ./cmd/server` 加载，`config/config.yaml`
+> 只保留占位示例值。
 
 ### 构建与运行
 
@@ -162,7 +165,7 @@ SPARK_E2E_DSN='postgres://spark:spark@127.0.0.1:5432/spark_test' \
 
 - `-tags=pg` 用例会执行 `DELETE` 清理 `ips` / `ip_pool_nodes` / `ip_pools` 表；
 - `-tags=e2e` 用例会 `TRUNCATE` 全部业务表（zones、pve_nodes、ip_pools、ips、storage_types、images、vms），测试前后各执行一次，可与 pg 测试共用同一数据库。
-- 假 PVE 服务器通过 `api.WithVMClientFactory` + `pve.WithBaseURL` 注入（VM 服务探活/供给/生命周期全部走注入的客户端）。
+- 假 PVE 服务器通过 `api.WithVMClientFactory` 注入（VM 服务探活/供给/生命周期全部走注入的客户端）；节点以 `127.0.0.1:<随机端口>` 登记，客户端经 `pve.WithPort` 真实连接假服务器的监听端口。
 
 ## 已知限制（v1）
 

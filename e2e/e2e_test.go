@@ -3,7 +3,7 @@
 // 针对真实 PostgreSQL 数据库和 fake PVE 服务器（任务 9.2）的完整虚拟机生命周期端到端验证：
 // 每个步骤都会走完完整的 HTTP 链路——gin 路由、处理器、服务层、仓储层、
 // 真实数据库，以及通过 api.WithVMClientFactory 注入的内存版 PVE JSON API 模拟
-// （pve 客户端的 base URL 通过 pve.WithBaseURL 注入）。
+// （节点以 host:port 登记，客户端通过 pve.WithPort 真实连接 fake PVE 的监听端口）。
 //
 // 运行方式：
 //
@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -105,6 +106,9 @@ func (f *fakePVE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case p == "/version" && r.Method == http.MethodGet:
 		f.writeJSON(w, map[string]any{"version": "8.2.7", "release": "8.2", "repoid": "fake"})
+	case p == "/nodes" && r.Method == http.MethodGet:
+		// 集群节点名列表（任务 4.1 探测入口）：fake 集群只有一个节点 pve1。
+		f.writeJSON(w, []map[string]any{{"node": "pve1", "status": "online"}})
 	case p == "/cluster/nextid" && r.Method == http.MethodGet:
 		f.mu.Lock()
 		vmid := f.nextVMID
@@ -399,17 +403,20 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	truncateBusinessTables(t, ctx, pool)
 	defer truncateBusinessTables(t, ctx, pool)
 
-	// fake PVE 服务器；pve 客户端的 base URL 通过
-	// api.WithVMClientFactory + pve.WithBaseURL 逐节点注入（否则路由
-	// 无从得知 fake 的地址）。
+	// fake PVE 服务器：节点以 host:port 登记，客户端工厂通过
+	// pve.WithPort 将请求真实打到 fake 的监听端口（自定义端口链路，任务 6.3）。
 	fakePVE := newFakePVE(t)
-	pveServer := httptest.NewServer(fakePVE)
+	pveServer := httptest.NewTLSServer(fakePVE)
 	defer pveServer.Close()
+	pvePort := pveServer.Listener.Addr().(*net.TCPAddr).Port
 
 	router := api.NewRouter(pool, e2eCipher(t),
-		api.WithVMClientFactory(func(host, apiUser, apiTokenSecret string) *pve.Client {
-			return pve.NewClient("fake-pve", apiUser, apiTokenSecret,
-				pve.WithBaseURL(pveServer.URL+"/api2/json"),
+		// 工厂签名携带 host/port（任务 4.3）：host 是节点登记的纯地址，
+		// port 是节点的 API 端口。客户端按默认 https 构造 base URL 后由
+		// WithPort 覆盖端口，请求真实打到 fake PVE 的监听端口（任务 6.3）。
+		api.WithVMClientFactory(func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+			return pve.NewClient(host, apiUser, apiTokenSecret,
+				pve.WithPort(port),
 				pve.WithHTTPClient(pveServer.Client()),
 				pve.WithTimeout(5*time.Second))
 		}))
@@ -419,16 +426,51 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	client := app.Client()
 	base := app.URL
 
-	// 1. 注册部署环境：zone、node（host 仅被存储；客户端工厂会忽略它）、
+	// 1. 注册部署环境：zone、node（host 携带 fake PVE 的监听端口）、
 	// IP 池 + 节点白名单、存储类型、镜像（在节点上存在）。
 	zone := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/zones", map[string]any{"name": "e2e-zone"}, http.StatusCreated))
 	zoneID := int64(zone["id"].(float64))
 
+	// 1a. 业务名与 fake 集群真实节点名（只有 pve1）不一致 -> 503 被拒，
+	// 错误消息提示集群真实名；登记走的是生产默认探测实现（真实连接 fake
+	// PVE 的 /nodes），因此同时验证了探测链路。
+	mismatch := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
+		fmt.Sprintf("/zones/%d/nodes", zoneID),
+		map[string]any{"name": "aeolian", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
+		http.StatusServiceUnavailable))
+	mismatchErr := e2eObj(t, mismatch["error"])
+	if code, _ := mismatchErr["code"].(string); code != "node_unavailable" {
+		t.Fatalf("mismatch rejection code = %q, want node_unavailable", code)
+	}
+	if msg, _ := mismatchErr["message"].(string); !strings.Contains(msg, "pve1") {
+		t.Fatalf("mismatch rejection message = %q, want the cluster node name pve1", msg)
+	}
+
 	node := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
 		fmt.Sprintf("/zones/%d/nodes", zoneID),
-		map[string]any{"name": "pve1", "host": "127.0.0.1", "api_user": "root@pam", "api_token": "spark=uuid"},
+		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
 		http.StatusCreated))
 	nodeID := int64(node["id"].(float64))
+
+	// host:port 登记后，创建响应回显剥离端口后的 host 与解析出的 port，
+	// 且 pve_name 与业务名一致（集群名探测匹配，任务 4.1）。
+	if node["host"] != "127.0.0.1" || node["port"] != float64(pvePort) {
+		t.Fatalf("node = %+v, want host=127.0.0.1 port=%d", node, pvePort)
+	}
+	if node["pve_name"] != "pve1" {
+		t.Fatalf("node pve_name = %v, want pve1 (matched against the cluster)", node["pve_name"])
+	}
+
+	// 节点列表同样回显 port（请求确实打到该端口，由后续 VM 生命周期链路
+	// 经同一客户端工厂隐式验证）。
+	listed := e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/zones/%d/nodes", zoneID), nil, http.StatusOK).([]any)
+	if len(listed) != 1 {
+		t.Fatalf("GET nodes = %+v, want 1 node", listed)
+	}
+	listedNode := e2eObj(t, listed[0])
+	if listedNode["host"] != "127.0.0.1" || listedNode["port"] != float64(pvePort) {
+		t.Fatalf("listed node = %+v, want host=127.0.0.1 port=%d", listedNode, pvePort)
+	}
 
 	poolRes := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/ip-pools", map[string]any{
 		"zone_id": zoneID, "name": "e2e-pool", "network_cidr": "10.9.0.0/24",

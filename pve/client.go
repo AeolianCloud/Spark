@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -51,7 +52,7 @@ type Option func(*Client) error
 // NewClient 为 host（IP 或主机名，不带 scheme）构建 PVE API 客户端，凭证
 // 取自 pve_nodes 表的一行记录。host 上的 ":port" 后缀会被剥离，确保 base
 // URL 不会出现重复端口（"https://host:8006:8006/..."）；需要自定义端口的
-// 调用方请使用 WithBaseURL。不支持 IPv6 字面量主机，会显式报错。apiTokenSecret
+// 调用方请使用 WithPort。不支持 IPv6 字面量主机，会显式报错。apiTokenSecret
 // 可接受的 API 令牌形式有：
 //
 //	"root@pam",            "spark=<secret>"         -> root@pam!spark=<secret>
@@ -170,6 +171,30 @@ func isValidAuthHeader(header string) bool {
 func WithBaseURL(baseURL string) Option {
 	return func(c *Client) error {
 		c.baseURL = strings.TrimSuffix(baseURL, "/")
+		return nil
+	}
+}
+
+// WithPort 覆盖 base URL 中的 API 端口（默认 8006）。port 为 0 时
+// 忽略，保持默认端口；超出合法范围（1-65535）的取值会显式报错，
+// 而不是被静默忽略。它通过 url.Parse 直接改写 c.baseURL 的端口部分，
+// 因此与 WithBaseURL 同时使用时，后应用的 Option 生效（Options 按
+// 顺序应用），任意顺序都不会产生 "https://host:8006:8007/..." 这种
+// 双端口。
+func WithPort(port int) Option {
+	return func(c *Client) error {
+		if port == 0 {
+			return nil
+		}
+		if port < 0 || port > 65535 {
+			return fmt.Errorf("pve: WithPort: invalid port %d (must be 0 or 1-65535)", port)
+		}
+		u, err := url.Parse(c.baseURL)
+		if err != nil {
+			return fmt.Errorf("pve: WithPort: parse base URL: %w", err)
+		}
+		u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(port))
+		c.baseURL = u.String()
 		return nil
 	}
 }
@@ -364,6 +389,31 @@ func (c *Client) ProbeVersion(ctx context.Context) (*VersionInfo, error) {
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.ProbeVersion(ctx)
 	return err
+}
+
+// NodeInfo 是 GET /nodes 响应中单个集群节点的信息。
+type NodeInfo struct {
+	// Node 是 PVE 集群节点名，登记节点时用它探测集群真实节点名列表。
+	Node string `json:"node"`
+	// Status 是节点的在线状态（例如 "online"），部分场景可能缺失，
+	// 因此是可选的。
+	Status string `json:"status"`
+}
+
+// ListNodes 调用 GET /nodes 探测 PVE 集群节点名列表，登记节点时用来
+// 校验业务名与集群真实节点名是否一致，避免不一致导致 595 错误。
+// 请求需要 Authorization 头（doJSON 已处理）；无有效 token 时 PVE
+// 返回 401，以 *UpstreamError 形式呈现。
+func (c *Client) ListNodes(ctx context.Context) ([]NodeInfo, error) {
+	raw, err := c.doJSON(ctx, http.MethodGet, "/nodes", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	nodes, err := decodeData[[]NodeInfo](raw)
+	if err != nil {
+		return nil, fmt.Errorf("pve: list nodes: %w", err)
+	}
+	return nodes, nil
 }
 
 // decodeData 将原始 "data" 负载反序列化为具体类型。

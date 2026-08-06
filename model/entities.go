@@ -11,10 +11,16 @@ type Zone struct {
 
 // PVENode 是已注册的 Proxmox VE 节点，包含其 API 凭据。
 type PVENode struct {
-	ID             int64     `json:"id"`
-	ZoneID         int64     `json:"zone_id"`
-	Name           string    `json:"name"`
-	Host           string    `json:"host"`
+	ID     int64  `json:"id"`
+	ZoneID int64  `json:"zone_id"`
+	Name   string `json:"name"`
+	// PveName 是 PVE 集群节点名，与业务名 Name 分离；
+	// 空值表示沿用 Name。
+	PveName string `json:"pve_name"`
+	Host    string `json:"host"`
+	// Port 是节点 API 端口；0/未登记时语义为默认端口 8006
+	// （由 service 层保证非 0 值落库）。
+	Port           int       `json:"port"`
 	APIUser        string    `json:"api_user"`
 	APITokenSecret string    `json:"api_token_secret"`
 	Enabled        bool      `json:"enabled"`

@@ -22,8 +22,9 @@ import (
 // routerOptions 携带 NewRouter 的可选构造覆盖项。
 type routerOptions struct {
 	// vmClientFactory 在设置时替换 VM 服务的 PVE 客户端工厂；
-	// 为 nil 时保持默认值（https://{host}:8006/api2/json）。
-	vmClientFactory func(host, apiUser, apiTokenSecret string) *pve.Client
+	// 为 nil 时保持默认值（https://{host}:{port}/api2/json，port 取
+	// 节点持久化的端口）。
+	vmClientFactory func(host string, port int, apiUser, apiTokenSecret string) *pve.Client
 }
 
 // RouterOption 定制路由的构造过程。它主要是一个测试接缝：
@@ -33,7 +34,7 @@ type RouterOption func(o *routerOptions)
 // WithVMClientFactory 覆盖 VM 服务使用的 PVE 客户端工厂，使测试可以将
 // 供给链路、生命周期调用和透传查询指向模拟 PVE 服务器（否则路由没有
 // 途径得知非默认的 base URL）。
-func WithVMClientFactory(fn func(host, apiUser, apiTokenSecret string) *pve.Client) RouterOption {
+func WithVMClientFactory(fn func(host string, port int, apiUser, apiTokenSecret string) *pve.Client) RouterOption {
 	return func(o *routerOptions) { o.vmClientFactory = fn }
 }
 

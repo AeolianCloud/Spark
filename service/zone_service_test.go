@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -220,6 +221,12 @@ func TestCreateNodeValidation(t *testing.T) {
 		{ID: 1, ZoneID: 1, Name: "pve1", Host: "10.0.0.10", APIUser: "root@pam!spark", APITokenSecret: "s1", Enabled: true},
 	}}
 	svc := NewZoneService(zoneRepo, nodeRepo)
+	// 登记成功路径会探测 PVE 集群节点名（任务 4.1）：桩化为返回后续创建
+	// 的业务名，避免打真实网络；失败断言（未知区域/重名/缺字段）在探测之前
+	// 就已终止。
+	svc.probeNodes = func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error) {
+		return []string{"pve9", "pve10"}, nil
+	}
 
 	// 未知区域 -> not_found。
 	if _, err := svc.CreateNode(context.Background(), 99, "pve9", "10.0.0.9", "root@pam!spark", "t", nil); err == nil {
@@ -273,9 +280,14 @@ func TestUpdateNode(t *testing.T) {
 		{ID: 1, ZoneID: 1, Name: "pve1", Host: "10.0.0.10", APIUser: "root@pam!spark", APITokenSecret: "old-secret", Enabled: true},
 	}}
 	svc := NewZoneService(&fakeZoneRepository{}, nodeRepo)
+	// host 变化会触发集群节点名探测（任务 4.2）：桩化为返回业务名 pve1，
+	// 避免打真实网络；重名/未知节点的失败断言在探测之前就已终止。
+	svc.probeNodes = func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error) {
+		return []string{"pve1"}, nil
+	}
 
 	// 空的 api_token 保留已存储的密钥。
-	n, tokenChanged, err := svc.UpdateNode(context.Background(), 1, "pve1", "10.0.0.20", "root@pam!spark", "", nil)
+	n, tokenChanged, err := svc.UpdateNode(context.Background(), 1, "pve1", "", "10.0.0.20", "root@pam!spark", "", nil)
 	if err != nil {
 		t.Fatalf("update node: %v", err)
 	}
@@ -289,8 +301,20 @@ func TestUpdateNode(t *testing.T) {
 		t.Fatalf("host = %q, want 10.0.0.20", n.Host)
 	}
 
+	// host 携带 :port 后缀 -> 更新后 Port 生效，host 只存纯地址。
+	n, tokenChanged, err = svc.UpdateNode(context.Background(), 1, "pve1", "", "10.0.0.5:9001", "root@pam!spark", "", nil)
+	if err != nil {
+		t.Fatalf("update node with port: %v", err)
+	}
+	if tokenChanged {
+		t.Fatal("tokenChanged = true, want false")
+	}
+	if n.Port != 9001 || n.Host != "10.0.0.5" {
+		t.Fatalf("node = %+v, want port=9001 host=10.0.0.5", n)
+	}
+
 	// 提供的 api_token 会替换密钥。
-	n, tokenChanged, err = svc.UpdateNode(context.Background(), 1, "pve1", "10.0.0.20", "root@pam!spark", "new-secret", nil)
+	n, tokenChanged, err = svc.UpdateNode(context.Background(), 1, "pve1", "", "10.0.0.20", "root@pam!spark", "new-secret", nil)
 	if err != nil {
 		t.Fatalf("update node: %v", err)
 	}
@@ -300,14 +324,14 @@ func TestUpdateNode(t *testing.T) {
 
 	// 重命名为已有名称 -> conflict。
 	nodeRepo.nodes = append(nodeRepo.nodes, model.PVENode{ID: 2, ZoneID: 1, Name: "pve2", Host: "10.0.0.30"})
-	if _, _, err := svc.UpdateNode(context.Background(), 1, "pve2", "10.0.0.20", "root@pam!spark", "", nil); err == nil {
+	if _, _, err := svc.UpdateNode(context.Background(), 1, "pve2", "", "10.0.0.20", "root@pam!spark", "", nil); err == nil {
 		t.Fatal("rename to existing name: want error")
 	} else if err.(*Error).Kind != KindConflict {
 		t.Fatalf("rename: kind = %v, want KindConflict", err.(*Error).Kind)
 	}
 
 	// 未知节点 -> not_found。
-	if _, _, err := svc.UpdateNode(context.Background(), 99, "pve9", "10.0.0.9", "root@pam!spark", "", nil); err == nil {
+	if _, _, err := svc.UpdateNode(context.Background(), 99, "pve9", "", "10.0.0.9", "root@pam!spark", "", nil); err == nil {
 		t.Fatal("unknown node: want error")
 	} else if err.(*Error).Kind != KindNotFound {
 		t.Fatalf("unknown node: kind = %v, want KindNotFound", err.(*Error).Kind)
@@ -369,7 +393,7 @@ func TestSelectReachableNodePicksFirstReachable(t *testing.T) {
 		{ID: 1, Name: "dead", Host: "h1", APIUser: "root@pam!probe", APITokenSecret: "secret123"},
 		{ID: 2, Name: "alive", Host: "h2", APIUser: "root@pam!probe", APITokenSecret: "secret123"},
 	}
-	newClient := func(host, apiUser, apiTokenSecret string) *pve.Client {
+	newClient := func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		srv := servers[host]
 		return pve.NewClient("localhost", apiUser, apiTokenSecret,
 			pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(2*time.Second))
@@ -391,7 +415,7 @@ func TestSelectReachableNodeAllFail(t *testing.T) {
 		{ID: 1, Name: "a", Host: "h1", APIUser: "root@pam!probe", APITokenSecret: "secret123"},
 		{ID: 2, Name: "b", Host: "h2", APIUser: "root@pam!probe", APITokenSecret: "secret123"},
 	}
-	newClient := func(host, apiUser, apiTokenSecret string) *pve.Client {
+	newClient := func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("localhost", apiUser, apiTokenSecret,
 			pve.WithBaseURL(dead.URL), pve.WithHTTPClient(dead.Client()), pve.WithTimeout(2*time.Second))
 	}
@@ -410,6 +434,97 @@ func TestSelectReachableNodeEmptyCandidates(t *testing.T) {
 	var serr *Error
 	if !errors.As(err, &serr) || serr.Kind != KindNodeUnavailable {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
+	}
+}
+
+// TestCreateNodePortParsing 验证 CreateNode 对 host 中 :port 后缀的解析：
+// 带端口登记成功且 node.Port 正确、存储的 host 不含端口；无端口默认 8006；
+// 非法端口（超范围、非数字、IPv6 多冒号）与以 / 开头的裸路径地址均以
+// badRequest 拒绝且不落库。
+func TestCreateNodePortParsing(t *testing.T) {
+	zoneRepo := &fakeZoneRepository{zones: []model.Zone{{ID: 1, Name: "cn-east-1"}}}
+	nodeRepo := &fakeNodeRepository{}
+	svc := NewZoneService(zoneRepo, nodeRepo)
+	// 成功登记路径会探测 PVE 集群节点名（任务 4.1）：桩化为返回后续创建
+	// 的业务名，避免打真实网络；非法 host 在解析阶段即被拒绝，不会探测。
+	svc.probeNodes = func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error) {
+		return []string{"pve-port", "pve-default"}, nil
+	}
+
+	// host 带端口 -> 登记成功，Port=8007，host 只存纯地址。
+	n, err := svc.CreateNode(context.Background(), 1, "pve-port", "117.177.33.8:8007", "root@pam!spark", "t", nil)
+	if err != nil {
+		t.Fatalf("create node with port: %v", err)
+	}
+	if n.Port != 8007 || n.Host != "117.177.33.8" {
+		t.Fatalf("node = %+v, want port=8007 host=117.177.33.8", n)
+	}
+
+	// host 无端口 -> 默认 8006。
+	n, err = svc.CreateNode(context.Background(), 1, "pve-default", "117.177.33.9", "root@pam!spark", "t", nil)
+	if err != nil {
+		t.Fatalf("create node without port: %v", err)
+	}
+	if n.Port != defaultNodePort || n.Host != "117.177.33.9" {
+		t.Fatalf("node = %+v, want port=%d host=117.177.33.9", n, defaultNodePort)
+	}
+
+	// 非法输入 -> bad_request，且不落库（仓库中仍只有两个成功节点）。
+	for _, host := range []string{"117.177.33.8:99999", "117.177.33.8:abc", "117.177.33.8:0", "117.177.33.8:", "117.177.33.8/", "::1", "/host:8007", "https:///host:8007", "/host"} {
+		if _, err := svc.CreateNode(context.Background(), 1, "pve-bad", host, "root@pam!spark", "t", nil); err == nil {
+			t.Fatalf("host %q: want error", host)
+		} else {
+			var serr *Error
+			if !errors.As(err, &serr) || serr.Kind != KindBadRequest {
+				t.Fatalf("host %q: err = %v, want KindBadRequest", host, err)
+			}
+		}
+	}
+	if len(nodeRepo.nodes) != 2 {
+		t.Fatalf("persisted nodes = %d, want 2 (rejected hosts must not be saved)", len(nodeRepo.nodes))
+	}
+}
+
+// TestCreateNodeRejectsClusterNameMismatch 验证业务名与 PVE 集群真实节点名
+// 不一致时登记被拒（任务 4.1）：错误消息列出集群真实节点名且不落库；探测
+// 本身失败（不可达/401 等）同样以 node_unavailable 拒绝，绝不静默落库。
+func TestCreateNodeRejectsClusterNameMismatch(t *testing.T) {
+	zoneRepo := &fakeZoneRepository{zones: []model.Zone{{ID: 1, Name: "cn-east-1"}}}
+	nodeRepo := &fakeNodeRepository{}
+	svc := NewZoneService(zoneRepo, nodeRepo)
+
+	// 业务名 "aeolian" 不在集群节点名列表中 -> 拒绝并提示真实名 aeoliancloud。
+	svc.probeNodes = func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error) {
+		return []string{"aeoliancloud"}, nil
+	}
+	_, err := svc.CreateNode(context.Background(), 1, "aeolian", "117.177.33.8", "root@pam!spark", "t", nil)
+	if err == nil {
+		t.Fatal("mismatched name: want error")
+	}
+	var serr *Error
+	if !errors.As(err, &serr) || serr.Kind != KindNodeUnavailable {
+		t.Fatalf("err = %v, want KindNodeUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "aeoliancloud") {
+		t.Fatalf("err = %q, want the cluster node name in the message", err)
+	}
+	if len(nodeRepo.nodes) != 0 {
+		t.Fatalf("persisted nodes = %d, want 0 (rejected node must not be saved)", len(nodeRepo.nodes))
+	}
+
+	// 探测失败（PVE 不可达/401 等）-> 同样拒绝且不落库。
+	svc.probeNodes = func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error) {
+		return nil, errors.New("connection refused")
+	}
+	_, err = svc.CreateNode(context.Background(), 1, "aeoliancloud", "117.177.33.8", "root@pam!spark", "t", nil)
+	if err == nil {
+		t.Fatal("probe failure: want error")
+	}
+	if !errors.As(err, &serr) || serr.Kind != KindNodeUnavailable {
+		t.Fatalf("err = %v, want KindNodeUnavailable", err)
+	}
+	if len(nodeRepo.nodes) != 0 {
+		t.Fatalf("persisted nodes = %d, want 0 (probe failure must not save)", len(nodeRepo.nodes))
 	}
 }
 

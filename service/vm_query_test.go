@@ -186,7 +186,7 @@ func TestVMServiceListVMs(t *testing.T) {
 	}}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, zoneRepo, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(clients[host].URL), pve.WithHTTPClient(clients[host].Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -212,6 +212,48 @@ func TestVMServiceListVMs(t *testing.T) {
 	}
 	if !strings.Contains(warnings[0].Error, "pve daemon down") {
 		t.Fatalf("warning error = %q, want the PVE message", warnings[0].Error)
+	}
+}
+
+// TestVMServiceListVMsUsesPveName 验证节点 PveName 非空时列表调用使用
+// PveName 作为 PVE 请求路径（任务 4.3）：业务名 pve1、集群名 aeoliancloud
+// 的节点请求 GET /nodes/aeoliancloud/qemu，业务名绝不出现。
+func TestVMServiceListVMsUsesPveName(t *testing.T) {
+	var paths []string
+	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path != "/nodes/aeoliancloud/qemu" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"data": [{"vmid": 100, "name": "vm1", "status": "running", "cpu": 0.5, "mem": 1048576, "maxmem": 2097152, "disk": 1073741824, "maxdisk": 2147483648, "uptime": 42}]}`)
+	}))
+	defer alive.Close()
+
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 1, Name: "pve1", PveName: "aeoliancloud", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	vmRepo := &fakeVMRepository{vms: []repository.VMWithIP{vw(1, 1, 100, "vm1")}}
+	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("x", apiUser, apiTokenSecret,
+			pve.WithBaseURL(alive.URL), pve.WithHTTPClient(alive.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	items, warnings, total, err := svc.ListVMs(context.Background(), 25, 0)
+	if err != nil {
+		t.Fatalf("ListVMs: %v", err)
+	}
+	if total != 1 || len(items) != 1 || items[0].Status != "running" || items[0].Live == nil {
+		t.Fatalf("items = %+v total = %d, want the merged running vm", items, total)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %+v, want none", warnings)
+	}
+	if len(paths) != 1 || paths[0] != "/nodes/aeoliancloud/qemu" {
+		t.Fatalf("paths = %v, want exactly /nodes/aeoliancloud/qemu", paths)
 	}
 }
 
@@ -265,7 +307,7 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 	}}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, zoneRepo, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(clients[host].URL), pve.WithHTTPClient(clients[host].Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -317,7 +359,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 
 	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -329,7 +371,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 	creating := &repository.VMWithIP{VM: model.VM{ID: 1, NodeID: 1, PVEVmid: 0}, IP: "10.0.0.5"}
 	svc2 := newVMService(t, &fakeVMRepository{get: creating}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc2.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc2.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -344,7 +386,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 	failed := &repository.VMWithIP{VM: model.VM{ID: 1, NodeID: 1, PVEVmid: 0, ProvisionError: "create failed: no space"}}
 	svc3 := newVMService(t, &fakeVMRepository{get: failed}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc3.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc3.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -379,8 +421,8 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 		{ID: 2, ZoneID: 1, Name: "pve2", Host: "h2", APIUser: "root@pam", APITokenSecret: "spark=uuid"},
 	}}
 
-	newClient := func(srv *httptest.Server) func(host, apiUser, apiTokenSecret string) *pve.Client {
-		return func(host, apiUser, apiTokenSecret string) *pve.Client {
+	newClient := func(srv *httptest.Server) func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 			return pve.NewClient("x", apiUser, apiTokenSecret,
 				pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
 		}
@@ -435,7 +477,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 func TestGetVMDetailGetNodeFails(t *testing.T) {
 	ts := noCallServer(t)
 	defer ts.Close()
-	newClient := func(host, apiUser, apiTokenSecret string) *pve.Client {
+	newClient := func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}

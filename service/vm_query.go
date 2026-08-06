@@ -141,6 +141,16 @@ func mergeVMListItems(local []repository.VMWithIP, nodes map[int64]nodeQueryResu
 	return items, warnings
 }
 
+// nodeName 返回节点在 PVE API 路径与镜像键中使用的集群节点名（任务 4.3）：
+// PveName 非空时使用 PveName，否则回退到业务名 Name——兼容迁移回填前的存量
+// 数据，保证"PveName 缺省 = Name"的行为不回归（设计 D3）。
+func nodeName(n model.PVENode) string {
+	if n.PveName != "" {
+		return n.PveName
+	}
+	return n.Name
+}
+
 // findVM 返回节点列表中指定 vmid 的 VM 的实时状态（如果存在）。列表合并
 // （mergeVMListItems）改用预构建的 vmid 映射；findVM 服务于单 VM 详情路径。
 func findVM(vms []pve.VMStatus, vmid int64) (pve.VMStatus, bool) {
@@ -193,8 +203,8 @@ func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListIte
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			client := s.newClient(n.Host, n.APIUser, n.APITokenSecret)
-			vms, err := client.ListVMs(ctx, n.Name)
+			client := s.newClient(n.Host, n.Port, n.APIUser, n.APITokenSecret)
+			vms, err := client.ListVMs(ctx, nodeName(n))
 			if err != nil {
 				// 部分失败（任务 8.3）：丢弃该节点的 VM 并产生一条警告。消息可安全
 				// 展示——PVE 客户端绝不在其错误中内嵌凭据（纵深防御：这里也不要
@@ -258,12 +268,12 @@ func (s *VMService) GetVM(ctx context.Context, id int64) (*VMListItem, error) {
 		}
 		return nil, fmt.Errorf("get vm %d: get node %d: %w", id, vm.VM.NodeID, err)
 	}
-	client := s.newClient(node.Host, node.APIUser, node.APITokenSecret)
-	vms, err := client.ListVMs(ctx, node.Name)
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	vms, err := client.ListVMs(ctx, nodeName(*node))
 	if err != nil {
 		// 任务 8.3：详情路径上的节点失败是显式错误，不是伪造的 "creating"。
 		// pve 客户端会脱敏自己的错误（绝不内嵌 token），因此消息可安全展示。
-		return nil, nodeUnavailablef("node %q unavailable: %v", node.Name, err)
+		return nil, nodeUnavailablef("node %q unavailable: %v", nodeName(*node), err)
 	}
 	if st, found := findVM(vms, vm.VM.PVEVmid); found {
 		return &VMListItem{VM: *vm, Status: st.Status, Live: &LiveVMStatus{

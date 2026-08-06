@@ -384,7 +384,7 @@ func newVMService(t *testing.T, vmRepo VMRepository, ipRepo VMIPPoolRepository,
 	srv := newScriptedProvisionServer(t, "15G")
 	ts := httptest.NewServer(srv.handler())
 	t.Cleanup(ts.Close)
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -808,7 +808,7 @@ func TestProvisionSuccessChain(t *testing.T) {
 	vmRepo := &fakeVMRepository{}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -850,6 +850,62 @@ func TestProvisionSuccessChain(t *testing.T) {
 	}
 }
 
+// TestProvisionSuccessChainUsesPveName 验证节点 PveName 非空时供给链使用
+// PveName 作为 PVE API 路径与镜像键（任务 4.3）：业务名 pve1、集群名
+// aeoliancloud 的节点把全部请求打到 /nodes/aeoliancloud/qemu，镜像路径取自
+// NodeImages["aeoliancloud"]，业务名 pve1 绝不出现于请求路径。
+func TestProvisionSuccessChainUsesPveName(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch {
+		case r.URL.Path == "/cluster/nextid":
+			fmt.Fprint(w, `{"data": "100"}`)
+		case r.URL.Path == "/nodes/aeoliancloud/qemu" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"data": "UPID:aeoliancloud:00000E5B:01C9EC9E:5FAB1EC4:qmcreate:100:root@pam:"}`)
+		case strings.HasPrefix(r.URL.Path, "/nodes/aeoliancloud/tasks/") && strings.HasSuffix(r.URL.Path, "/status"):
+			fmt.Fprint(w, `{"data": {"upid": "UPID:aeoliancloud:0:0:0:qmcreate:100:root@pam:", "node": "aeoliancloud", "type": "qmcreate", "id": "100", "user": "root@pam", "status": "stopped", "exitstatus": "OK"}}`)
+		case r.URL.Path == "/nodes/aeoliancloud/qemu/100/config" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"data": {"bootdisk": "scsi0", "scsi0": "local-ssd:vm-100-disk-0,size=15G", "cores": "2", "memory": "2048"}}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	vmRepo := &fakeVMRepository{}
+	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	err := svc.provision(context.Background(),
+		model.VM{ID: 1, Name: "vm1", MemMB: 2048, CPU: 2, DiskGB: 10},
+		model.PVENode{Name: "pve1", PveName: "aeoliancloud", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"},
+		&model.Image{Name: "debian-12-cloud", DefaultUser: "debian", NodeImages: map[string]string{"aeoliancloud": "/templates/d.qcow2"}},
+		&model.StorageType{PVEStorage: "local-ssd"},
+		model.IPPool{NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
+		"pw", "10.0.0.5")
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	// 单步链的 4 次调用（nextid/create/wait/config）全部使用 PveName。
+	if len(paths) != 4 {
+		t.Fatalf("requests = %v, want 4", paths)
+	}
+	for _, p := range paths {
+		if strings.Contains(p, "pve1") {
+			t.Fatalf("request path %q uses business name instead of PveName", p)
+		}
+	}
+	if vmRepo.linkedVMID != 100 {
+		t.Fatalf("vmid = %d, want 100", vmRepo.linkedVMID)
+	}
+}
+
 // TestProvisionSuccessChainWithResize 覆盖扩展路径：导入的镜像小于请求，
 // 因此会运行 resize 任务并持久化请求的大小。
 func TestProvisionSuccessChainWithResize(t *testing.T) {
@@ -860,7 +916,7 @@ func TestProvisionSuccessChainWithResize(t *testing.T) {
 	vmRepo := &fakeVMRepository{}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -896,7 +952,7 @@ func TestProvisionFailureSetsSanitizedError(t *testing.T) {
 	vmRepo := &fakeVMRepository{}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -966,7 +1022,7 @@ func TestProvisionFailureAfterCreateIncludesVMID(t *testing.T) {
 	vmRepo := &fakeVMRepository{}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1127,7 +1183,7 @@ func TestStartStopRestart(t *testing.T) {
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
 	svc := newVMService(t, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
 		&fakeVMZoneRepository{}, nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1174,7 +1230,7 @@ func TestStartVMPVENotFound(t *testing.T) {
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
 	svc := newVMService(t, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
 		&fakeVMZoneRepository{}, nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1193,7 +1249,7 @@ func TestDestroyFlow(t *testing.T) {
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
 	svc := newVMService(t, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1255,7 +1311,7 @@ func TestDestroyPVEFailureKeepsRecordAndIP(t *testing.T) {
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
 	svc := newVMService(t, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1282,7 +1338,7 @@ func TestDestroyPVE404CleansUpLocal(t *testing.T) {
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
 	svc := newVMService(t, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1316,7 +1372,7 @@ func TestResizeRejectsShrinkBeforePVE(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
 		&fakeVMZoneRepository{}, &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}},
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1337,7 +1393,7 @@ func TestResizeNoOpEqualDisk(t *testing.T) {
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}},
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1383,7 +1439,7 @@ func TestResizeGrowAll(t *testing.T) {
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{}, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
@@ -1420,7 +1476,7 @@ func TestResizeSpecConflict(t *testing.T) {
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{}, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	svc.newClient = func(host, apiUser, apiTokenSecret string) *pve.Client {
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}

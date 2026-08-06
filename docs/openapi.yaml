@@ -938,9 +938,12 @@ components:
         name:
           type: string
           description: 节点名（区域内唯一）
+        pve_name:
+          type: string
+          description: PVE 集群节点名，可选；缺省时登记自动探测
         host:
           type: string
-          description: 节点 IP 或主机名
+          description: 节点主机地址，可携带 :port 端口后缀，缺省 8006
         api_user:
           type: string
           description: PVE API 用户，如 spark@pve
@@ -953,7 +956,7 @@ components:
 
     NodeResponse:
       type: object
-      required: [id, zone_id, name, host, api_user, api_token_set, enabled, created_at]
+      required: [id, zone_id, name, pve_name, host, port, api_user, api_token_set, enabled, created_at]
       properties:
         id:
           type: integer
@@ -963,8 +966,17 @@ components:
           format: int64
         name:
           type: string
+        pve_name:
+          type: string
+          description: PVE 集群节点名，空值表示沿用业务名 name
         host:
           type: string
+          description: 节点主机地址（纯地址，端口见 port 字段）
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: 节点 API 端口，默认 8006
         api_user:
           type: string
         api_token_set:

@@ -202,6 +202,36 @@ func TestReleaseIPByVM(t *testing.T) {
 	}
 }
 
+// TestGetPoolNodesReadsPveName 验证 GetPoolNodes 的 JOIN 查询按 nodeCols
+// 列序扫描 pve_name 与 port 列（防列错位回归）：两个节点行分别携带
+// pve_name 非空与空值。
+func TestGetPoolNodesReadsPveName(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectQuery("SELECT n.id, zone_id, name, pve_name, host, port, api_user, api_token_secret, enabled, created_at FROM pve_nodes n JOIN ip_pool_nodes pn ON pn.node_id = n.id WHERE pn.ip_pool_id=$1 ORDER BY n.id").
+		WithArgs(int64(3)).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "zone_id", "name", "pve_name", "host", "port", "api_user", "api_token_secret", "enabled", "created_at"}).
+			AddRow(int64(11), int64(1), "pve1", "aeoliancloud", "10.0.0.1", int32(8443), "root@pam!spark", "s1", true, testTime).
+			AddRow(int64(12), int64(1), "pve2", "", "10.0.0.2", int32(8006), "root@pam!spark", "s2", false, testTime))
+
+	repo := NewIPPoolRepository(mock)
+	nodes, err := repo.GetPoolNodes(context.Background(), 3)
+	if err != nil {
+		t.Fatalf("GetPoolNodes: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("nodes = %+v, want 2", nodes)
+	}
+	if nodes[0].Name != "pve1" || nodes[0].PveName != "aeoliancloud" || nodes[0].Port != 8443 {
+		t.Fatalf("nodes[0] = %+v, want name pve1, pve_name aeoliancloud, port 8443", nodes[0])
+	}
+	if nodes[1].Name != "pve2" || nodes[1].PveName != "" || nodes[1].Port != 8006 {
+		t.Fatalf("nodes[1] = %+v, want name pve2, empty pve_name, port 8006", nodes[1])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestGetPoolNoRows(t *testing.T) {
 	mock := newMockPool(t)
 	mock.ExpectQuery("SELECT id, zone_id, name, network_cidr, gateway, dns, created_at FROM ip_pools WHERE id=$1").

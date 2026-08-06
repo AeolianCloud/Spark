@@ -145,7 +145,7 @@ func (r *IPPoolRepository) GetPoolNodes(ctx context.Context, poolID int64) ([]mo
 	nodes := make([]model.PVENode, 0)
 	for rows.Next() {
 		var n model.PVENode
-		if err := rows.Scan(&n.ID, &n.ZoneID, &n.Name, &n.Host, &n.APIUser, &n.APITokenSecret, &n.Enabled, &n.CreatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.ZoneID, &n.Name, &n.PveName, &n.Host, &n.Port, &n.APIUser, &n.APITokenSecret, &n.Enabled, &n.CreatedAt); err != nil {
 			return nil, fmt.Errorf("ip pools: scan pool node: %w", err)
 		}
 		nodes = append(nodes, n)

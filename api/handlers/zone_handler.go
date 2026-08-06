@@ -68,12 +68,15 @@ type zoneResponse struct {
 
 // nodeResponse 是公开的 node 负载。API token 永不包含在响应中；
 // api_token_set 报告是否存有 token（create 之后恒为 true，
-// update 时则表示 token 是否被替换）。
+// update 时则表示 token 是否被替换）。port 为节点 API 端口，默认 8006；
+// pve_name 为 PVE 集群节点名，空值表示沿用业务名 name。
 type nodeResponse struct {
 	ID          int64     `json:"id"`
 	ZoneID      int64     `json:"zone_id"`
 	Name        string    `json:"name"`
+	PveName     string    `json:"pve_name"`
 	Host        string    `json:"host"`
+	Port        int       `json:"port"`
 	APIUser     string    `json:"api_user"`
 	APITokenSet bool      `json:"api_token_set"`
 	Enabled     bool      `json:"enabled"`
@@ -90,8 +93,8 @@ func toZoneResponse(z service.ZoneWithNodes) zoneResponse {
 
 func toNodeResponse(n model.PVENode, apiTokenSet bool) nodeResponse {
 	return nodeResponse{
-		ID: n.ID, ZoneID: n.ZoneID, Name: n.Name, Host: n.Host,
-		APIUser: n.APIUser, APITokenSet: apiTokenSet, Enabled: n.Enabled,
+		ID: n.ID, ZoneID: n.ZoneID, Name: n.Name, PveName: n.PveName, Host: n.Host,
+		Port: n.Port, APIUser: n.APIUser, APITokenSet: apiTokenSet, Enabled: n.Enabled,
 		CreatedAt: n.CreatedAt,
 	}
 }
@@ -137,9 +140,11 @@ func (h *ZoneHandler) ListZones(c *gin.Context) error {
 }
 
 // nodeRequest 是创建/更新 node 的请求体。api_token 在更新时可选
-// （空值表示保留已存储的密钥）；enabled 默认为 true。
+// （空值表示保留已存储的密钥）；enabled 默认为 true；pve_name 可选
+// （PVE 集群节点名），缺省时自动探测。
 type nodeRequest struct {
 	Name     string `json:"name"`
+	PveName  string `json:"pve_name"`
 	Host     string `json:"host"`
 	APIUser  string `json:"api_user"`
 	APIToken string `json:"api_token"`
@@ -193,7 +198,7 @@ func (h *ZoneHandler) UpdateNode(c *gin.Context) error {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		return ErrBadRequest("invalid request body")
 	}
-	node, tokenChanged, err := h.svc.UpdateNode(c.Request.Context(), id, req.Name, req.Host, req.APIUser, req.APIToken, req.Enabled)
+	node, tokenChanged, err := h.svc.UpdateNode(c.Request.Context(), id, req.Name, req.PveName, req.Host, req.APIUser, req.APIToken, req.Enabled)
 	if err != nil {
 		return mapServiceErrorExtended(err)
 	}
