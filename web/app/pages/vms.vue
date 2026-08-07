@@ -6,13 +6,17 @@
  * - 创建虚拟机：列表页内 UModal 表单，Zone 联动过滤镜像；密码一次性提交不存储不回显
  * - 行内生命周期操作：启动/停止/重启/销毁（销毁二次确认），失败展示后端错误且状态不变
  */
-import type { Image, NodeWarning, StorageType, VMListItem, ZoneResponse } from '~/api'
+import type { Image, NodeResponse, NodeWarning, Pool, StorageType, UnmanagedVM, VMListItem, ZoneResponse } from '~/api'
 import {
   ApiError,
   createVM,
   destroyVM,
+  importVM,
   listImages,
+  listNodesByZone,
+  listPools,
   listStorageTypes,
+  listUnmanagedVMs,
   listVMs,
   listZones,
   restartVM,
@@ -301,20 +305,24 @@ watch(() => createForm.zone_id, async (zoneId) => {
   }
 })
 
+// 可用区列表懒加载（创建/导入两个弹窗共用；加载失败记录错误 ref，弹窗内给出轻量提示，重新打开会重试）
+async function loadZones(): Promise<void> {
+  if (zones.value.length > 0) return
+  zonesLoadError.value = null
+  try {
+    zones.value = (await listZones({ limit: 100 })).data
+  } catch (err) {
+    zonesLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
+    zones.value = []
+  }
+}
+
 // 打开创建弹窗：选项懒加载（Zone/存储类型全局一次；镜像随后续 Zone 选择联动加载）
 // 加载失败不吞掉：记录错误 ref，弹窗内给出轻量提示（重新打开弹窗会重试）
 async function openCreateModal(): Promise<void> {
   createError.value = null
   createOpen.value = true
-  if (zones.value.length === 0) {
-    zonesLoadError.value = null
-    try {
-      zones.value = (await listZones({ limit: 100 })).data
-    } catch (err) {
-      zonesLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
-      zones.value = []
-    }
-  }
+  await loadZones()
   if (storageTypes.value.length === 0) {
     storageTypesLoadError.value = null
     try {
@@ -390,6 +398,201 @@ watch(createOpen, (open) => {
   if (!open) password.value = ''
 })
 
+// ---- 导入已有 VM：把 PVE 上已存在的 VM 纳入平台纳管（无密码字段） ----
+const importOpen = ref(false)
+const importing = ref(false)
+const importError = ref<ApiError | null>(null)
+// 表单实例引用：footer 提交按钮经由 form.submit() 触发校验与 @submit
+const importFormRef = ref<{ submit: () => Promise<void> }>()
+
+// 表单状态：pve_vmid 即候选 VM 的 vmid；ip_pool_id/name 可选
+const importForm = reactive({
+  zone_id: undefined as number | undefined,
+  node_id: undefined as number | undefined,
+  pve_vmid: undefined as number | undefined,
+  ip_pool_id: undefined as number | undefined,
+  name: ''
+})
+
+// 联动选项（按需加载；加载失败记录错误 ref，下拉内给出轻量提示而非静默）
+const nodes = ref<NodeResponse[]>([])
+const unmanagedVMs = ref<UnmanagedVM[]>([])
+const pools = ref<Pool[]>([])
+const nodesLoading = ref(false)
+const candidatesLoading = ref(false)
+const poolsLoading = ref(false)
+const nodesLoadError = ref<ApiError | null>(null)
+const candidatesLoadError = ref<ApiError | null>(null)
+const poolsLoadError = ref<ApiError | null>(null)
+
+const nodeOptions = computed(() => nodes.value.map(n => ({ label: n.name, value: n.id })))
+const candidateOptions = computed(() => unmanagedVMs.value.map(vm => ({
+  label: `${vm.name}（VMID ${vm.vmid}，${vm.status}）`,
+  value: vm.vmid
+})))
+const poolOptions = computed(() => pools.value.map(p => ({ label: p.name, value: p.id })))
+
+// 请求序号守卫：可用区/节点快速切换时丢弃过期响应，防止旧联动结果覆盖新联动。
+// 注意：nodes/pools 两条链必须各自独立计数（参考创建弹窗 imagesSeq），
+// 若共用同一计数器，zone watch 内同步顺序调用会让后发起者抢走序号，
+// 先发起者的响应到达时序号已不匹配，恒被当作过期丢弃（节点下拉永远加载不出）
+let nodesSeq = 0 // 可用区联动（节点）响应守卫
+let poolsSeq = 0 // 可用区联动（IP 池）响应守卫
+let candidateSeq = 0 // 节点联动（候选 VM）响应守卫
+
+async function loadNodes(zoneId: number): Promise<void> {
+  const seq = ++nodesSeq
+  nodesLoading.value = true
+  nodesLoadError.value = null
+  try {
+    const res = await listNodesByZone(zoneId)
+    // 过期响应丢弃：期间可用区已再次切换
+    if (seq !== nodesSeq || zoneId !== importForm.zone_id) return
+    nodes.value = res.data
+  } catch (err) {
+    if (seq !== nodesSeq || zoneId !== importForm.zone_id) return
+    nodesLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
+  } finally {
+    if (seq === nodesSeq) nodesLoading.value = false
+  }
+}
+
+async function loadPools(zoneId: number): Promise<void> {
+  const seq = ++poolsSeq
+  poolsLoading.value = true
+  poolsLoadError.value = null
+  try {
+    // listPools 契约支持 zone_id 过滤，直接按可用区拉取
+    const res = await listPools({ zone_id: zoneId, limit: 100 })
+    if (seq !== poolsSeq || zoneId !== importForm.zone_id) return
+    pools.value = res.data
+  } catch (err) {
+    if (seq !== poolsSeq || zoneId !== importForm.zone_id) return
+    poolsLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
+  } finally {
+    if (seq === poolsSeq) poolsLoading.value = false
+  }
+}
+
+async function loadCandidates(nodeId: number): Promise<void> {
+  const seq = ++candidateSeq
+  candidatesLoading.value = true
+  candidatesLoadError.value = null
+  try {
+    const res = await listUnmanagedVMs({ node_id: nodeId })
+    // 过期响应丢弃：期间节点已再次切换
+    if (seq !== candidateSeq || nodeId !== importForm.node_id) return
+    unmanagedVMs.value = res.data.vms
+  } catch (err) {
+    if (seq !== candidateSeq || nodeId !== importForm.node_id) return
+    candidatesLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
+  } finally {
+    if (seq === candidateSeq) candidatesLoading.value = false
+  }
+}
+
+// 可用区切换 → 重置节点/候选/IP 池（原选择可能不可用），并行按该 Zone 加载节点与 IP 池
+watch(() => importForm.zone_id, (zoneId) => {
+  importForm.node_id = undefined
+  importForm.pve_vmid = undefined
+  importForm.ip_pool_id = undefined
+  nodes.value = []
+  unmanagedVMs.value = []
+  pools.value = []
+  nodesLoadError.value = null
+  candidatesLoadError.value = null
+  poolsLoadError.value = null
+  if (zoneId === undefined) return
+  void loadNodes(zoneId)
+  void loadPools(zoneId)
+})
+
+// 节点切换 → 重置候选 VM（原候选可能不可用），按该节点加载候选
+watch(() => importForm.node_id, (nodeId) => {
+  importForm.pve_vmid = undefined
+  unmanagedVMs.value = []
+  candidatesLoadError.value = null
+  if (nodeId === undefined) return
+  void loadCandidates(nodeId)
+})
+
+// 打开导入弹窗：可用区选项懒加载（与创建弹窗共用 zones ref）
+async function openImportModal(): Promise<void> {
+  importError.value = null
+  importOpen.value = true
+  await loadZones()
+}
+
+// 弹窗关闭（取消）时重置表单与联动状态：避免上次的 zone/node/候选选择残留，
+// 且再次打开时联动选项过期（PVE 侧可能已变化），应清空后按新选择重新拉取。
+// 成功路径 submitImport 已自行重置，此处统一兜底，逻辑与创建弹窗的 watch(createOpen) 一致
+watch(importOpen, (open) => {
+  if (open) return
+  importForm.zone_id = undefined
+  importForm.node_id = undefined
+  importForm.pve_vmid = undefined
+  importForm.ip_pool_id = undefined
+  importForm.name = ''
+  nodes.value = []
+  unmanagedVMs.value = []
+  pools.value = []
+  importError.value = null
+  nodesLoadError.value = null
+  candidatesLoadError.value = null
+  poolsLoadError.value = null
+})
+
+// 表单校验：可用区/节点/候选 VM 必选（IP 池与名称可选）
+// 名称上限 128 字符与后端契约 ImportVMRequest.name maxLength 对齐；留空时不做长度校验
+function validateImportForm(): { name?: string, message: string }[] {
+  const errors: { name?: string, message: string }[] = []
+  if (importForm.zone_id === undefined) errors.push({ name: 'zone_id', message: '请选择可用区' })
+  if (importForm.node_id === undefined) errors.push({ name: 'node_id', message: '请选择节点' })
+  if (importForm.pve_vmid === undefined) errors.push({ name: 'pve_vmid', message: '请选择要导入的虚拟机' })
+  if (importForm.name.trim().length > 128) errors.push({ name: 'name', message: '名称最多 128 字符' })
+  return errors
+}
+
+// 提交导入：候选 VM 的 vmid 即 pve_vmid；名称留空时不传（使用 PVE 侧名称）
+async function submitImport(): Promise<void> {
+  if (importing.value) return
+  // 防御性二次校验（UForm 校验之外的最后防线）：不通过则不发起请求
+  const residualErrors = validateImportForm()
+  if (residualErrors.length > 0) {
+    importError.value = new ApiError(400, 'bad_request', residualErrors.map(e => e.message).join('；'))
+    return
+  }
+  importing.value = true
+  importError.value = null
+  try {
+    // 校验已保证 zone_id/node_id/pve_vmid 非空
+    await importVM({
+      zone_id: importForm.zone_id!,
+      node_id: importForm.node_id!,
+      pve_vmid: importForm.pve_vmid!,
+      ip_pool_id: importForm.ip_pool_id,
+      name: importForm.name.trim() || undefined
+    })
+    // 成功后清空表单并关闭弹窗，刷新列表可见新纳入的 VM
+    importForm.zone_id = undefined
+    importForm.node_id = undefined
+    importForm.pve_vmid = undefined
+    importForm.ip_pool_id = undefined
+    importForm.name = ''
+    nodes.value = []
+    unmanagedVMs.value = []
+    pools.value = []
+    importOpen.value = false
+    toast.add({ title: '已导入', description: '虚拟机已纳入纳管，可刷新查看最新状态', color: 'success', icon: 'i-lucide-check-circle-2' })
+    void fetchVMs()
+  } catch (err) {
+    // 契约错误（含 vm_not_found_on_node / vm_already_managed / ip_exhausted 等）由 AppErrorAlert 展示错误码与后端描述
+    importError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
+  } finally {
+    importing.value = false
+  }
+}
+
 // 表格列定义（accessorKey 对应 VMListItem 字段，插槽按列 id 覆盖渲染）
 const columns = [
   { accessorKey: 'name', header: '名称' },
@@ -437,13 +640,22 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
               自动刷新（15 秒）
             </label>
           </div>
-          <UButton
-            icon="i-lucide-plus"
-            color="primary"
-            @click="openCreateModal"
-          >
-            创建虚拟机
-          </UButton>
+          <div class="flex items-center gap-2">
+            <UButton
+              icon="i-lucide-import"
+              variant="outline"
+              @click="openImportModal"
+            >
+              导入 VM
+            </UButton>
+            <UButton
+              icon="i-lucide-plus"
+              color="primary"
+              @click="openCreateModal"
+            >
+              创建虚拟机
+            </UButton>
+          </div>
         </div>
 
         <!-- PVE 降级提示：节点查询失败，状态为降级后的静态字段值，非实时（不伪造状态） -->
@@ -825,6 +1037,136 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
             @click="confirmDestroy"
           >
             确认销毁
+          </UButton>
+        </template>
+      </UModal>
+
+      <!-- BUG-1：UModal 移出 panel 作为兄弟节点；导入把 PVE 已有 VM 纳入纳管，无密码字段 -->
+      <UModal
+        v-model:open="importOpen"
+        title="导入 VM"
+        description="将 PVE 上已有的虚拟机纳入平台纳管"
+        :dismissible="!importing"
+        :ui="{ footer: 'justify-end' }"
+      >
+        <template #body>
+          <UForm
+            ref="importFormRef"
+            :state="importForm"
+            :validate="validateImportForm"
+            class="space-y-4"
+            @submit="submitImport"
+          >
+            <UFormField
+              name="zone_id"
+              label="可用区"
+              required
+              :description="zonesLoadError ? `可用区列表加载失败（${zonesLoadError.code}），请关闭弹窗后重新打开重试` : undefined"
+            >
+              <USelect
+                :model-value="importForm.zone_id"
+                :items="zoneOptions"
+                placeholder="选择可用区"
+                class="w-full"
+                @update:model-value="(v: number | undefined) => { importForm.zone_id = v }"
+              />
+            </UFormField>
+
+            <UFormField
+              name="node_id"
+              label="节点"
+              required
+              :description="nodesLoadError
+                ? `节点列表加载失败（${nodesLoadError.code}），请重新选择可用区重试`
+                : (importForm.zone_id === undefined ? '请先选择可用区以加载节点' : '已按所选可用区过滤')"
+            >
+              <USelect
+                :model-value="importForm.node_id"
+                :items="nodeOptions"
+                :loading="nodesLoading"
+                :disabled="importForm.zone_id === undefined"
+                placeholder="选择节点"
+                class="w-full"
+                @update:model-value="(v: number | undefined) => { importForm.node_id = v }"
+              />
+            </UFormField>
+
+            <UFormField
+              name="pve_vmid"
+              label="待导入虚拟机"
+              required
+              :description="candidatesLoadError
+                ? `候选列表加载失败（${candidatesLoadError.code}），请重新选择节点重试`
+                : (importForm.node_id === undefined ? '请先选择节点以加载候选' : '仅展示该节点上未被纳管的 VM')"
+            >
+              <USelect
+                :model-value="importForm.pve_vmid"
+                :items="candidateOptions"
+                :loading="candidatesLoading"
+                :disabled="importForm.node_id === undefined"
+                placeholder="选择要导入的虚拟机"
+                class="w-full"
+                @update:model-value="(v: number | undefined) => { importForm.pve_vmid = v }"
+              />
+            </UFormField>
+
+            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <UFormField
+                name="ip_pool_id"
+                label="IP 池"
+                :description="poolsLoadError
+                  ? `IP 池加载失败（${poolsLoadError.code}），请重新选择可用区重试`
+                  : (importForm.zone_id === undefined ? '请先选择可用区以加载 IP 池' : '留空自动分配')"
+              >
+                <USelect
+                  :model-value="importForm.ip_pool_id"
+                  :items="poolOptions"
+                  :loading="poolsLoading"
+                  :disabled="importForm.zone_id === undefined"
+                  placeholder="自动分配"
+                  class="w-full"
+                  @update:model-value="(v: number | undefined) => { importForm.ip_pool_id = v }"
+                />
+              </UFormField>
+
+              <UFormField
+                name="name"
+                label="名称"
+              >
+                <UInput
+                  v-model="importForm.name"
+                  maxlength="128"
+                  placeholder="留空使用 PVE 上的名称"
+                  autocomplete="off"
+                />
+              </UFormField>
+            </div>
+          </UForm>
+
+          <!-- 导入失败（含 vm_not_found_on_node / vm_already_managed / ip_exhausted 等契约错误码） -->
+          <AppErrorAlert
+            v-if="importError"
+            class="mt-4"
+            :code="importError.code"
+            :message="importError.message"
+            title="导入失败"
+          />
+        </template>
+
+        <template #footer>
+          <UButton
+            variant="outline"
+            :disabled="importing"
+            @click="importOpen = false"
+          >
+            取消
+          </UButton>
+          <UButton
+            color="primary"
+            :loading="importing"
+            @click="importFormRef?.submit()"
+          >
+            导入
           </UButton>
         </template>
       </UModal>

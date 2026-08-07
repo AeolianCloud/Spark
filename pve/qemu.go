@@ -12,18 +12,20 @@ import (
 // VMStatus 是 GET /nodes/{node}/qemu 返回的一项。内存和磁盘值以字节为
 // 单位；CPU 是当前使用的配置核数占比，Cpus 是配置中最大可用 CPU 数量
 // （sockets×cores，并以宿主机核数为上限）。已停止的 VM 会省略大多数字段，
-// 解码为零值。
+// 解码为零值。Template 标记该 VM 是 PVE 模板（1）还是普通 VM（0）：
+// 模板是供克隆使用的基础镜像而非运行实体，导入与未托管列表都排除它。
 type VMStatus struct {
-	VMID    int64   `json:"vmid"`
-	Name    string  `json:"name,omitempty"`
-	Status  string  `json:"status,omitempty"`
-	CPU     float64 `json:"cpu,omitempty"`
-	Cpus    int64   `json:"cpus,omitempty"`
-	Mem     int64   `json:"mem,omitempty"`
-	MaxMem  int64   `json:"maxmem,omitempty"`
-	Disk    int64   `json:"disk,omitempty"`
-	MaxDisk int64   `json:"maxdisk,omitempty"`
-	Uptime  int64   `json:"uptime,omitempty"`
+	VMID     int64   `json:"vmid"`
+	Name     string  `json:"name,omitempty"`
+	Status   string  `json:"status,omitempty"`
+	CPU      float64 `json:"cpu,omitempty"`
+	Cpus     int64   `json:"cpus,omitempty"`
+	Mem      int64   `json:"mem,omitempty"`
+	MaxMem   int64   `json:"maxmem,omitempty"`
+	Disk     int64   `json:"disk,omitempty"`
+	MaxDisk  int64   `json:"maxdisk,omitempty"`
+	Uptime   int64   `json:"uptime,omitempty"`
+	Template int64   `json:"template,omitempty"`
 }
 
 // CreateVMParams 是 POST /nodes/{node}/qemu 支持的参数。零值字段会被省略

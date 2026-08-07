@@ -30,6 +30,12 @@ const (
 	KindDiskShrinkNotAllowed ErrorKind = 103
 	// KindImageNotAvailable：镜像未出现在请求区域的每个启用节点上。
 	KindImageNotAvailable ErrorKind = 104
+	// KindVMNotFoundOnNode：节点 PVE 可达，但请求的 pve_vmid 不在该节点上
+	//（导入已有 VM 时的资源不存在，区别于 zone/node 自身的 not_found）。
+	KindVMNotFoundOnNode ErrorKind = 105
+	// KindVMAlreadyManaged：该节点上的 pve_vmid 已被托管，重复导入被拒绝
+	//（区别于一般资源冲突的 KindConflict）。
+	KindVMAlreadyManaged ErrorKind = 106
 )
 
 func vmNotReadyf(format string, args ...any) *Error {
@@ -44,6 +50,16 @@ func imageNotAvailablef(format string, args ...any) *Error {
 	return &Error{Kind: KindImageNotAvailable, Message: fmt.Sprintf(format, args...)}
 }
 
+// vmNotFoundOnNodef 构造一个 KindVMNotFoundOnNode 服务错误。
+func vmNotFoundOnNodef(format string, args ...any) *Error {
+	return &Error{Kind: KindVMNotFoundOnNode, Message: fmt.Sprintf(format, args...)}
+}
+
+// vmAlreadyManagedf 构造一个 KindVMAlreadyManaged 服务错误。
+func vmAlreadyManagedf(format string, args ...any) *Error {
+	return &Error{Kind: KindVMAlreadyManaged, Message: fmt.Sprintf(format, args...)}
+}
+
 const (
 	// vmClaimRetries 限制创建事务内条件式 IP 抢占的重试循环次数
 	// （repository.ErrAllocationRetry）。
@@ -54,6 +70,11 @@ const (
 	// maxProvisionErrorLen 限制存储在 vms 中的 provision_error 值长度，避免
 	// 冗长的 PVE dump 撑大该行。
 	maxProvisionErrorLen = 1000
+	// importVMBudget 限制 ImportVM 整个导入流程（ListVMs + GetVMConfig +
+	// 事务落库）的请求级总预算：与 ListVMs 的 listVMsTimeout 相同的部分
+	// 失败语义——预算耗尽时 PVE 调用以 context 错误失败，映射为
+	// node_unavailable。
+	importVMBudget = 30 * time.Second
 	// vmNamePattern 是 PVE qm 的名称规则：必须匹配
 	// ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$（首字符为字母、数字或下划线，之后
 	// 可以是字母、数字、下划线、点和短横线）。
@@ -72,6 +93,12 @@ type TxBeginner interface {
 // VMRepository 是 VMService 依赖的 vms 数据访问层。
 type VMRepository interface {
 	CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error)
+	// ImportVMTx 在调用方的事务内插入一条 pve_vmid 非零的已导入 VM 行
+	// （image_id/storage_type_id/password_encrypted 为 NULL）。
+	ImportVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error)
+	// GetVMByNodeVMID 返回节点上指定 pve_vmid 的已托管 VM（导入幂等检查）；
+	// 无该行时返回 pgx.ErrNoRows。
+	GetVMByNodeVMID(ctx context.Context, nodeID, vmid int64) (*model.VM, error)
 	GetVM(ctx context.Context, id int64) (*repository.VMWithIP, error)
 	ListVMs(ctx context.Context) ([]repository.VMWithIP, error)
 	ListVMsPage(ctx context.Context, limit, offset int) ([]repository.VMWithIP, error)
@@ -97,9 +124,14 @@ type VMNodeRepository interface {
 
 // VMIPPoolRepository 是 VMService 依赖的 IP 池数据访问层。
 type VMIPPoolRepository interface {
+	GetPool(ctx context.Context, id int64) (*model.IPPool, error)
 	ListPoolsByZone(ctx context.Context, zoneID int64) ([]model.IPPool, error)
 	GetPoolNodes(ctx context.Context, poolID int64) ([]model.PVENode, error)
 	ClaimFreeIP(ctx context.Context, tx pgx.Tx, poolID int64, vmID *int64) (model.IP, error)
+	// ClaimIPByAddressTx 在调用方的事务内按地址精确领取空闲地址（导入时
+	// 优先复用 PVE 静态 IP）；地址不在池内时返回 pgx.ErrNoRows，被并发
+	// 抢占时返回 repository.ErrAllocationRetry。
+	ClaimIPByAddressTx(ctx context.Context, tx pgx.Tx, poolID int64, ipAddr string, vmID *int64) (model.IP, error)
 	ReleaseIPByVMTx(ctx context.Context, tx pgx.Tx, vmID int64) error
 }
 
@@ -287,8 +319,8 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 		Name:              req.Name,
 		ZoneID:            req.ZoneID,
 		NodeID:            node.ID,
-		ImageID:           req.ImageID,
-		StorageTypeID:     req.StorageTypeID,
+		ImageID:           &req.ImageID,
+		StorageTypeID:     &req.StorageTypeID,
 		CPU:               req.CPU,
 		MemMB:             req.MemMB,
 		DiskGB:            req.DiskGB,

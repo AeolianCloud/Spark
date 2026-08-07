@@ -394,7 +394,7 @@ func TestCreateVM(t *testing.T) {
 	}
 }
 
-// TestListVMs 验证 VM 列表响应的字段映射。
+// TestListVMs 验证 VM 列表响应的字段映射，包括模板标记（template）。
 func TestListVMs(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data": [
@@ -402,7 +402,7 @@ func TestListVMs(t *testing.T) {
 			 "cpu": 0.37, "cpus": 2,
 			 "mem": 1073741824, "maxmem": 2147483648,
 			 "disk": 536870912, "maxdisk": 10737418240, "uptime": 3600},
-			{"vmid": 101, "name": "vm2", "status": "stopped"}
+			{"vmid": 101, "name": "vm2", "status": "stopped", "template": 1}
 		]}`)
 	})
 	vms, err := c.ListVMs(context.Background(), "pve1")
@@ -423,8 +423,11 @@ func TestListVMs(t *testing.T) {
 	if a.Cpus != 2 {
 		t.Fatalf("vm1 cpus = %d, want 2 (max usable CPU count)", a.Cpus)
 	}
-	if b := vms[1]; b.VMID != 101 || b.Status != "stopped" {
-		t.Fatalf("vm2 = %+v", b)
+	if a.Template != 0 {
+		t.Fatalf("vm1 template = %d, want 0 (plain VM)", a.Template)
+	}
+	if b := vms[1]; b.VMID != 101 || b.Status != "stopped" || b.Template != 1 {
+		t.Fatalf("vm2 = %+v, want stopped template 1", b)
 	}
 }
 

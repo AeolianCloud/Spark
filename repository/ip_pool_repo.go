@@ -186,6 +186,11 @@ const (
 	// 重新检查 status='free'，因此并发领取会在行锁上串行化，
 	// 且恰好其中一个报告 RowsAffected=1。
 	claimFreeIPSQL = "UPDATE ips SET status='used', vm_id=$2, updated_at=now() WHERE id=$1 AND status='free'"
+	// getIPByAddressSQL 按池与地址精确读取目标行（导入流程的按地址领取）。
+	getIPByAddressSQL = "SELECT id, pool_id, ip, status, vm_id, updated_at FROM ips WHERE pool_id=$1 AND ip=$2"
+	// claimIPByAddressSQL 是按地址原子领取语句，WHERE 守卫与
+	// claimFreeIPSQL 相同（重新检查 status='free'），并发语义完全一致。
+	claimIPByAddressSQL = "UPDATE ips SET status='used', vm_id=$2, updated_at=now() WHERE id=$1 AND status='free'"
 )
 
 // ClaimFreeIP 在调用方的事务内部原子地领取池中一个随机的空闲地址并返回它。
@@ -214,6 +219,43 @@ func (r *IPPoolRepository) ClaimFreeIP(ctx context.Context, tx pgx.Tx, poolID in
 	}
 
 	tag, err := tx.Exec(ctx, claimFreeIPSQL, ip.ID, vmID)
+	if err != nil {
+		return model.IP{}, err
+	}
+	if tag.RowsAffected() != 1 {
+		return model.IP{}, ErrAllocationRetry
+	}
+
+	ip.Status = model.IPStatusUsed
+	if vmID != nil {
+		ip.VMID = vmID
+	}
+	return ip, nil
+}
+
+// ClaimIPByAddressTx 在调用方的事务内按指定地址原子领取 IP 并返回
+// 更新后的行。与 ClaimFreeIP 的差异仅在选择目标的方式：ClaimFreeIP
+// 随机挑选一个空闲候选地址，这里按调用方指定的 (poolID, ipAddr)
+// 精确定位（导入已有 VM 时静态 IP 解析到的地址必须在池中存在）。
+//
+// 并发语义与 ClaimFreeIP 完全一致：目标行在无锁情况下读出，再由单条
+// 条件式 UPDATE（WHERE 守卫重新检查 status='free'）原子领取。READ
+// COMMITTED 下 Postgres 对照最新已提交的行版本重新检查 WHERE 子句，
+// 竞争双方恰好一个 RowsAffected=1，败者得到 RowsAffected=0 并返回
+// ErrAllocationRetry 让调用方回退到池分配。
+//
+// 池中不存在该地址时返回 pgx.ErrNoRows；地址已被其他 VM 占用时返回
+// ErrAllocationRetry。vmID 非空时把领取与既有的 vms 行关联（FK 环在
+// 调用方的事务内部解开，参见 migration 头部说明）。
+func (r *IPPoolRepository) ClaimIPByAddressTx(ctx context.Context, tx pgx.Tx, poolID int64, ipAddr string, vmID *int64) (model.IP, error) {
+	var ip model.IP
+	err := tx.QueryRow(ctx, getIPByAddressSQL, poolID, ipAddr).
+		Scan(&ip.ID, &ip.PoolID, &ip.IP, &ip.Status, &ip.VMID, &ip.UpdatedAt)
+	if err != nil {
+		return model.IP{}, err
+	}
+
+	tag, err := tx.Exec(ctx, claimIPByAddressSQL, ip.ID, vmID)
 	if err != nil {
 		return model.IP{}, err
 	}
