@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,11 +33,18 @@ const (
 	// KindImageNotAvailable：镜像未出现在请求区域的每个启用节点上。
 	KindImageNotAvailable ErrorKind = 104
 	// KindVMNotFoundOnNode：节点 PVE 可达，但请求的 pve_vmid 不在该节点上
-	//（导入已有 VM 时的资源不存在，区别于 zone/node 自身的 not_found）。
+	//（导入已有 VM 或操作 external VM 时的资源不存在，区别于 zone/node
+	// 自身的 not_found）。
 	KindVMNotFoundOnNode ErrorKind = 105
 	// KindVMAlreadyManaged：该节点上的 pve_vmid 已被托管，重复导入被拒绝
 	//（区别于一般资源冲突的 KindConflict）。
 	KindVMAlreadyManaged ErrorKind = 106
+	// KindInvalidVMRef：路径 id 无法解析为数字本地行 id 或 ext-{nodeID}-{vmid}
+	// 合成标识。
+	KindInvalidVMRef ErrorKind = 107
+	// KindOperationLogFailed：PVE 已受理操作，但操作记录写入失败（设计 D5
+	// 的审计完整性优先：返回 500，前端提示可刷新确认）。
+	KindOperationLogFailed ErrorKind = 108
 )
 
 func vmNotReadyf(format string, args ...any) *Error {
@@ -60,6 +69,16 @@ func vmAlreadyManagedf(format string, args ...any) *Error {
 	return &Error{Kind: KindVMAlreadyManaged, Message: fmt.Sprintf(format, args...)}
 }
 
+// invalidVMReff 构造一个 KindInvalidVMRef 服务错误。
+func invalidVMReff(format string, args ...any) *Error {
+	return &Error{Kind: KindInvalidVMRef, Message: fmt.Sprintf(format, args...)}
+}
+
+// operationLogFailedf 构造一个 KindOperationLogFailed 服务错误。
+func operationLogFailedf(format string, args ...any) *Error {
+	return &Error{Kind: KindOperationLogFailed, Message: fmt.Sprintf(format, args...)}
+}
+
 const (
 	// vmClaimRetries 限制创建事务内条件式 IP 抢占的重试循环次数
 	// （repository.ErrAllocationRetry）。
@@ -70,6 +89,10 @@ const (
 	// maxProvisionErrorLen 限制存储在 vms 中的 provision_error 值长度，避免
 	// 冗长的 PVE dump 撑大该行。
 	maxProvisionErrorLen = 1000
+	// maxOperationErrorLen 限制 vm_operations.error_message 的最大长度（字符
+	// 数），与迁移 0008 的 VARCHAR(1000) 列约束一致：落库前截断保证永不触发
+	// Postgres 的字符串超长错误（SQLSTATE 22001）。
+	maxOperationErrorLen = 1000
 	// importVMBudget 限制 ImportVM 整个导入流程（ListVMs + GetVMConfig +
 	// 事务落库）的请求级总预算：与 ListVMs 的 listVMsTimeout 相同的部分
 	// 失败语义——预算耗尽时 PVE 调用以 context 错误失败，映射为
@@ -100,14 +123,23 @@ type VMRepository interface {
 	// 无该行时返回 pgx.ErrNoRows。
 	GetVMByNodeVMID(ctx context.Context, nodeID, vmid int64) (*model.VM, error)
 	GetVM(ctx context.Context, id int64) (*repository.VMWithIP, error)
+	// ListVMs 返回本地全部 VM 行（含 IP）：列表合并需要与每节点 PVE 全量
+	// 摘要做差集（设计 D1/D3），分页在合并排序后由服务层统一执行。
 	ListVMs(ctx context.Context) ([]repository.VMWithIP, error)
-	ListVMsPage(ctx context.Context, limit, offset int) ([]repository.VMWithIP, error)
-	CountVMs(ctx context.Context) (int, error)
 	SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error
 	UpdateVMPVEVMID(ctx context.Context, id, vmid, diskGB int64) error
 	SetProvisionError(ctx context.Context, id int64, message string) error
 	UpdateSpec(ctx context.Context, id int64, newCPU int, newMemMB, newDiskGB int64, oldCPU int, oldMemMB, oldDiskGB int64) error
 	DeleteVMTx(ctx context.Context, tx pgx.Tx, id int64) error
+}
+
+// VMOperationRepository 是 VMService 依赖的 vm_operations 数据访问层
+// （生命周期操作的审计记录，设计 D5）。
+type VMOperationRepository interface {
+	CreateOperation(ctx context.Context, op model.VMOperation) (*model.VMOperation, error)
+	// ListOperations 按时间倒序分页返回指定 (node_id, pve_vmid) 的操作记录
+	// 及匹配总数。
+	ListOperations(ctx context.Context, nodeID, vmid int64, limit, offset int) ([]model.VMOperation, int, error)
 }
 
 // VMZoneRepository 是 VMService 依赖的区域数据访问层。
@@ -120,6 +152,9 @@ type VMZoneRepository interface {
 type VMNodeRepository interface {
 	GetNode(ctx context.Context, id int64) (*model.PVENode, error)
 	ListEnabledNodesByZone(ctx context.Context, zoneID int64) ([]model.PVENode, error)
+	// ListNodesByIDs 返回指定 id 集合中的节点（不存在的 id 被忽略），供
+	// 列表合并把被禁用/已移除节点的 id 翻译为节点名（警告的 Node 字段）。
+	ListNodesByIDs(ctx context.Context, ids []int64) ([]model.PVENode, error)
 }
 
 // VMIPPoolRepository 是 VMService 依赖的 IP 池数据访问层。
@@ -181,10 +216,13 @@ func validateCreateVMRequest(req CreateVMRequest) error {
 }
 
 // VMService 实现 VM 生命周期的业务规则：创建（原子 IP 分配与分离式 PVE
-// 供给链）、启动/停止/重启、销毁（含 IP 释放）以及规格变更。
+// 供给链）、启动/停止/重启、销毁（含 IP 释放）以及规格变更。生命周期操作
+// 对本地行与外部 VM（ext- 合成标识，设计 D2）一视同仁，操作受理后写入
+// 审计记录（设计 D5）。
 type VMService struct {
 	beginner    TxBeginner
 	vmRepo      VMRepository
+	opRepo      VMOperationRepository
 	ipPoolRepo  VMIPPoolRepository
 	zoneRepo    VMZoneRepository
 	nodeRepo    VMNodeRepository
@@ -202,12 +240,13 @@ type VMService struct {
 
 // NewVMService 使用给定的仓库和加密密码器创建一个 VMService（密码器用于在
 // 存储前加密 cloud-init 密码）。
-func NewVMService(beginner TxBeginner, vmRepo VMRepository, ipPoolRepo VMIPPoolRepository,
-	zoneRepo VMZoneRepository, nodeRepo VMNodeRepository, imageRepo VMImageRepository,
-	storageRepo VMStorageTypeRepository, cipher *crypto.Cipher) *VMService {
+func NewVMService(beginner TxBeginner, vmRepo VMRepository, opRepo VMOperationRepository,
+	ipPoolRepo VMIPPoolRepository, zoneRepo VMZoneRepository, nodeRepo VMNodeRepository,
+	imageRepo VMImageRepository, storageRepo VMStorageTypeRepository, cipher *crypto.Cipher) *VMService {
 	s := &VMService{
 		beginner:    beginner,
 		vmRepo:      vmRepo,
+		opRepo:      opRepo,
 		ipPoolRepo:  ipPoolRepo,
 		zoneRepo:    zoneRepo,
 		nodeRepo:    nodeRepo,
@@ -613,8 +652,120 @@ func sanitizeProvisionError(err error, secrets ...string) string {
 	return msg
 }
 
-// vmAndNode 加载 VM（缺失的行映射为 not_found）及其节点。pve_vmid 仍为零
-// 的 VM 尚未完成供给，会产生 KindVMNotReady。
+// sanitizePVEError 把 PVE 客户端错误转换为对外可展示的脱敏摘要。原始错误
+// 可能携带内部细节——PVE 请求路径（如 "/nodes/pve1/qemu"）与网络层失败的
+// 内部 base URL/host:port（如 "Get https://10.0.0.7:8006/api2/json/...:
+// dial tcp 10.0.0.7:8006: connect: connection refused"）——违反"对外错误
+// 消息不得暴露内部细节"的红线。摘要只保留：
+//
+//	*pve.UpstreamError -> PVE 返回的 errors 对象（或响应体）消息；
+//	传输层错误 -> 错误链最末的原因段（如 "connection refused"）。
+func sanitizePVEError(err error) string {
+	var upErr *pve.UpstreamError
+	if errors.As(err, &upErr) {
+		if len(upErr.Errors) > 0 {
+			keys := make([]string, 0, len(upErr.Errors))
+			for k := range upErr.Errors {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			parts := make([]string, 0, len(keys))
+			for _, k := range keys {
+				parts = append(parts, fmt.Sprintf("%s: %s", k, upErr.Errors[k]))
+			}
+			return strings.Join(parts, ", ")
+		}
+		if msg := strings.TrimSpace(upErr.Body); msg != "" {
+			return msg
+		}
+		return "empty response"
+	}
+	// 网络层错误（节点不可达/TLS/超时）：取错误链最末一个冒号之后的段
+	//（"connect: connection refused" 的最后段是 "connection refused"），
+	// 剥离其中的内部地址与 URL。
+	msg := err.Error()
+	if i := strings.LastIndex(msg, ":"); i >= 0 {
+		msg = strings.TrimSpace(msg[i+1:])
+	}
+	if msg == "" {
+		msg = "unreachable"
+	}
+	return msg
+}
+
+// sanitizeOperationError 生成失败操作审计记录（vm_operations.error_message）
+// 的落库值：保留服务层自己的包装上下文（如 "start vm 1"），把错误链中的
+// PVE 部分替换为脱敏摘要（sanitizePVEError），并按 maxOperationErrorLen
+// 截断。先脱敏后截断（与 sanitizeProvisionError 相同的顺序），按 rune 边界
+// 切割，多字节 UTF-8 字符绝不会被切成非法序列（VARCHAR 列会拒绝它们，
+// Postgres 22001）。
+func sanitizeOperationError(err error) string {
+	msg := err.Error()
+	var upErr *pve.UpstreamError
+	if errors.As(err, &upErr) {
+		// 定位 PVE 响应错误在完整消息中的起始位置：它之前是服务层上下文
+		//（如 "start vm 1: "），保留；PVE 段替换为摘要。
+		marker := upErr.Error()
+		if i := strings.Index(msg, marker); i >= 0 {
+			msg = msg[:i] + sanitizePVEError(upErr)
+		} else {
+			msg = sanitizePVEError(upErr)
+		}
+	} else if i := strings.Index(msg, "pve: "); i >= 0 {
+		// 网络层失败同样带 "pve: METHOD /path: " 前缀：保留其之前的服务层
+		// 上下文，PVE 段替换为传输层原因摘要。
+		msg = msg[:i] + sanitizePVEError(errors.New(msg[i:]))
+	}
+	r := []rune(msg)
+	if len(r) > maxOperationErrorLen {
+		msg = string(r[:maxOperationErrorLen])
+	}
+	return msg
+}
+
+// vmTarget 是生命周期操作的目标 VM（设计 D2/D4）：数字本地行 id 或
+// external 合成标识 ext-{nodeID}-{vmid}。
+type vmTarget struct {
+	localID int64
+	nodeID  int64
+	vmid    int64
+	// external 为 true 时目标是 PVE 上存在、本地无记录的外部虚拟机。
+	external bool
+}
+
+// vmRefNumberRe 匹配合成标识中数字组成部分的规范形态：正整数，无符号、
+// 无前导零（"ext-01-005"、"ext-+1-+5" 这类歧义写法一律按非法标识拒绝）。
+var vmRefNumberRe = regexp.MustCompile(`^[1-9][0-9]*$`)
+
+// parseVMRef 解析路径 id 参数（设计 D2）：纯数字 -> 本地行 id；前缀
+// ext- -> 外部合成标识 ext-{nodeID}-{vmid}（nodeID 是本地 DB 的
+// pve_nodes.id）；其余格式 -> KindInvalidVMRef。
+func parseVMRef(id string) (vmTarget, error) {
+	if strings.HasPrefix(id, extIDPrefix) {
+		rest := strings.TrimPrefix(id, extIDPrefix)
+		parts := strings.Split(rest, "-")
+		if len(parts) != 2 || !vmRefNumberRe.MatchString(parts[0]) || !vmRefNumberRe.MatchString(parts[1]) {
+			return vmTarget{}, invalidVMReff("invalid external vm id %q, want %sext-{nodeID}-{vmid}", id, extIDPrefix)
+		}
+		nodeID, err1 := strconv.ParseInt(parts[0], 10, 64)
+		vmid, err2 := strconv.ParseInt(parts[1], 10, 64)
+		if err1 != nil || err2 != nil {
+			return vmTarget{}, invalidVMReff("invalid external vm id %q, want %sext-{nodeID}-{vmid}", id, extIDPrefix)
+		}
+		return vmTarget{nodeID: nodeID, vmid: vmid, external: true}, nil
+	}
+	if !vmRefNumberRe.MatchString(id) {
+		return vmTarget{}, invalidVMReff("invalid vm id %q: must be a positive integer or %sext-{nodeID}-{vmid}", id, extIDPrefix)
+	}
+	localID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return vmTarget{}, invalidVMReff("invalid vm id %q: must be a positive integer or %sext-{nodeID}-{vmid}", id, extIDPrefix)
+	}
+	return vmTarget{localID: localID}, nil
+}
+
+// vmAndNode 加载本地 VM（缺失的行映射为 not_found）及其节点。pve_vmid 仍为
+// 零的 VM 尚未完成供给，会产生 KindVMNotReady。
 func (s *VMService) vmAndNode(ctx context.Context, id int64) (*repository.VMWithIP, *model.PVENode, error) {
 	vm, err := s.vmRepo.GetVM(ctx, id)
 	if err != nil {
@@ -633,9 +784,67 @@ func (s *VMService) vmAndNode(ctx context.Context, id int64) (*repository.VMWith
 	return vm, node, nil
 }
 
-// mapPVEOpError 将生命周期操作失败转换为服务错误：PVE 404 表示 pve_vmid
-// 在节点上已不再指向任何实体（VM 在服务之外被移除），以 vm_not_ready 呈现；
-// 其余失败保持普通错误（由处理器呈现为通用的 500）。
+// resolveVMTarget 把解析后的目标解析为可直接调用 PVE 的连接信息（节点 +
+// PVE VMID，设计 D4）：
+//
+//	本地行   -> 现有 vmAndNode 路径（pve_vmid == 0 拒绝为 vm_not_ready）
+//	ext- 标识 -> 按 nodeID 反查节点（缺失 -> not_found，禁用 -> node_unavailable），
+//	           并校验 pve_vmid 在该节点 PVE 上存在（缺失 -> vm_not_found_on_node，
+//	           节点查询失败 -> node_unavailable；PVE 模板同样拒绝）。
+//
+// external 分支返回的 localID 非零表示该 (nodeID, pve_vmid) 已有本地托管行
+// （PVE 是真相源，列表以差集判定，ext- 标识可能指向已托管 VM）：调用方应
+// 把操作路由到本地行流程，保证销毁的本地清理（IP 释放与行删除）与操作错误
+// 映射（本地行 -> vm_not_ready）的一致性。
+func (s *VMService) resolveVMTarget(ctx context.Context, t vmTarget) (*model.PVENode, int64, int64, error) {
+	if !t.external {
+		vm, node, err := s.vmAndNode(ctx, t.localID)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		return node, vm.VM.PVEVmid, 0, nil
+	}
+	node, err := s.nodeRepo.GetNode(ctx, t.nodeID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, 0, 0, notFoundf("node %d not found", t.nodeID)
+		}
+		return nil, 0, 0, fmt.Errorf("get node %d: %w", t.nodeID, err)
+	}
+	if !node.Enabled {
+		return nil, 0, 0, nodeUnavailablef("node %q is disabled", nodeName(*node))
+	}
+	// 本地托管检查：ext- 标识指向的 (nodeID, pve_vmid) 可能已有本地行
+	//（列表以 PVE 全量摘要与本地记录做差集，两者可能并存）。命中时由调用方
+	// 路由到本地流程，绝不走 external 直调路径（否则 destroy 会绕过 IP 释放
+	// 与行删除）。
+	local, err := s.vmRepo.GetVMByNodeVMID(ctx, t.nodeID, t.vmid)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, 0, 0, fmt.Errorf("check managed vm %d on node %d: %w", t.vmid, t.nodeID, err)
+	}
+	if local != nil {
+		return node, t.vmid, local.ID, nil
+	}
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	vms, err := client.ListVMs(ctx, nodeName(*node))
+	if err != nil {
+		return nil, 0, 0, nodeUnavailablef("node %q unavailable: %s", nodeName(*node), sanitizePVEError(err))
+	}
+	st, found := findVM(vms, t.vmid)
+	if !found {
+		return nil, 0, 0, vmNotFoundOnNodef("vm %d not found on node %q", t.vmid, nodeName(*node))
+	}
+	if st.Template == 1 {
+		// PVE 模板是供克隆使用的基础镜像而非运行实体，不可操作（与列表
+		// 不并入、认领拒绝的语义一致）。
+		return nil, 0, 0, badRequestf("cannot operate on pve template vm %d", t.vmid)
+	}
+	return node, t.vmid, 0, nil
+}
+
+// mapPVEOpError 将本地 VM 的生命周期操作失败转换为服务错误：PVE 404 表示
+// pve_vmid 在节点上已不再指向任何实体（VM 在服务之外被移除），以
+// vm_not_ready 呈现；其余失败保持普通错误（由处理器呈现为通用的 500）。
 func mapPVEOpError(err error, op string, id int64) error {
 	var upErr *pve.UpstreamError
 	if errors.As(err, &upErr) && upErr.StatusCode == http.StatusNotFound {
@@ -644,55 +853,159 @@ func mapPVEOpError(err error, op string, id int64) error {
 	return fmt.Errorf("%s vm %d: %w", op, id, err)
 }
 
-// Start 启动 VM（POST /nodes/{node}/qemu/{vmid}/status/start）。PVE 任务 ID
-// 不对外暴露：调用方没有可轮询它的对象，且 VM 的真实状态反正会通过透传读取
-// （批次 8）。
-func (s *VMService) Start(ctx context.Context, id int64) error {
-	vm, node, err := s.vmAndNode(ctx, id)
-	if err != nil {
-		return err
+// mapExternalPVEOpError 将 external VM 的生命周期操作失败转换为服务错误：
+// PVE 404（VM 已从节点移除）以 vm_not_found_on_node（资源不存在）呈现，
+// 区别于本地行的 vm_not_ready（spec：对不存在的虚拟机执行操作 -> 资源不存在）。
+func mapExternalPVEOpError(err error, op string, nodeID, vmid int64) error {
+	var upErr *pve.UpstreamError
+	if errors.As(err, &upErr) && upErr.StatusCode == http.StatusNotFound {
+		return vmNotFoundOnNodef("vm %d not found on node %d (cannot %s)", vmid, nodeID, op)
 	}
-	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
-	if _, err := client.StartVM(ctx, nodeName(*node), vm.VM.PVEVmid); err != nil {
-		return mapPVEOpError(err, "start", id)
+	return fmt.Errorf("%s external vm %d on node %d: %w", op, vmid, nodeID, err)
+}
+
+// recordAcceptedOperation 在 PVE 受理成功后写入审计记录（设计 D5）。写失败
+// 返回 KindOperationLogFailed：操作已被 PVE 受理，返回 500 保证审计完整性
+// 优先，前端提示可刷新确认。
+func (s *VMService) recordAcceptedOperation(ctx context.Context, action string, nodeID, vmid int64) error {
+	if _, err := s.opRepo.CreateOperation(ctx, model.VMOperation{
+		NodeID: nodeID, PVEVmid: vmid, Action: action, Result: model.VMOpResultAccepted,
+	}); err != nil {
+		return operationLogFailedf("%s vm %d on node %d accepted by pve but operation record write failed: %v",
+			action, vmid, nodeID, err)
 	}
 	return nil
+}
+
+// recordFailedOperation 在 PVE 返回错误后写入 result=failed 的审计记录
+// （spec：记录失败的操作）。该写入是尽力而为：审计记录是次要信息，写失败
+// 只记日志，绝不掩盖向调用方返回的 PVE 错误。error_message 落库前经
+// sanitizeOperationError 脱敏与截断：绝不落库内部 base URL/API 路径等内部
+// 细节，也不超出迁移 0008 的 VARCHAR(1000) 列约束。
+func (s *VMService) recordFailedOperation(ctx context.Context, action string, nodeID, vmid int64, opErr error) {
+	if _, err := s.opRepo.CreateOperation(ctx, model.VMOperation{
+		NodeID: nodeID, PVEVmid: vmid, Action: action, Result: model.VMOpResultFailed,
+		ErrorMessage: sanitizeOperationError(opErr),
+	}); err != nil {
+		slog.Error("could not persist failed operation record",
+			"action", action, "node_id", nodeID, "pve_vmid", vmid, "error", err)
+	}
+}
+
+// Start 启动 VM（POST /nodes/{node}/qemu/{vmid}/status/start），支持本地
+// 行与 external 标识（设计 D4）。PVE 任务 ID 不对外暴露：调用方没有可轮询
+// 它的对象，且 VM 的真实状态反正会通过透传读取（批次 8）。受理成功后同步
+// 写入操作记录（设计 D5）。
+func (s *VMService) Start(ctx context.Context, id string) error {
+	return s.runLifecycleOp(ctx, id, model.VMOpActionStart, "start",
+		func(client *pve.Client, nodeName string, vmid int64) error {
+			_, err := client.StartVM(ctx, nodeName, vmid)
+			return err
+		})
 }
 
 // Stop 关闭 VM（POST .../status/stop）。force=false 执行干净的 ACPI 关机；
 // PVE 侧的强制停机留给运维自行操作。
-func (s *VMService) Stop(ctx context.Context, id int64) error {
-	vm, node, err := s.vmAndNode(ctx, id)
-	if err != nil {
-		return err
-	}
-	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
-	if _, err := client.StopVM(ctx, nodeName(*node), vm.VM.PVEVmid, false); err != nil {
-		return mapPVEOpError(err, "stop", id)
-	}
-	return nil
+func (s *VMService) Stop(ctx context.Context, id string) error {
+	return s.runLifecycleOp(ctx, id, model.VMOpActionStop, "stop",
+		func(client *pve.Client, nodeName string, vmid int64) error {
+			_, err := client.StopVM(ctx, nodeName, vmid, false)
+			return err
+		})
 }
 
 // Restart 重启 VM（POST .../status/reboot）。
-func (s *VMService) Restart(ctx context.Context, id int64) error {
-	vm, node, err := s.vmAndNode(ctx, id)
+func (s *VMService) Restart(ctx context.Context, id string) error {
+	return s.runLifecycleOp(ctx, id, model.VMOpActionReboot, "restart",
+		func(client *pve.Client, nodeName string, vmid int64) error {
+			_, err := client.RebootVM(ctx, nodeName, vmid)
+			return err
+		})
+}
+
+// runLifecycleOp 是 start/stop/reboot 三个生命周期操作的统一骨架（设计
+// D4/D5）：解析标识 -> 解析目标（数字行走现有路径，ext- 标识反查节点并
+// 校验 PVE 存在；ext- 标识指向已托管 VM 时路由到本地行路径，保证错误映射
+// 与操作记录的一致性）-> 调用 PVE -> 记录操作（成功 accepted / 失败
+// failed，失败写入尽力而为）。PVE 404 的映射区分目标类型：本地行 ->
+// vm_not_ready，external -> vm_not_found_on_node（资源不存在）。
+func (s *VMService) runLifecycleOp(ctx context.Context, id, action, verb string,
+	call func(client *pve.Client, node string, vmid int64) error) error {
+	t, err := parseVMRef(id)
 	if err != nil {
 		return err
 	}
-	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
-	if _, err := client.RebootVM(ctx, nodeName(*node), vm.VM.PVEVmid); err != nil {
-		return mapPVEOpError(err, "restart", id)
+	node, vmid, localID, err := s.resolveVMTarget(ctx, t)
+	if err != nil {
+		return err
 	}
-	return nil
+	if t.external && localID > 0 {
+		// ext- 标识指向已托管 VM（PVE 为真相源，列表以差集判定）：按本地行
+		// 语义执行——PVE 404 映射为 vm_not_ready、操作记录以本地行
+		// (node_id, pve_vmid) 写入，与数字 id 的操作完全一致。
+		t = vmTarget{localID: localID}
+	}
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	if err := call(client, nodeName(*node), vmid); err != nil {
+		var mapped error
+		if t.external {
+			mapped = mapExternalPVEOpError(err, verb, node.ID, vmid)
+		} else {
+			mapped = mapPVEOpError(err, verb, t.localID)
+		}
+		s.recordFailedOperation(ctx, action, node.ID, vmid, mapped)
+		return mapped
+	}
+	return s.recordAcceptedOperation(ctx, action, node.ID, vmid)
 }
 
-// Destroy 删除 VM：先销毁 PVE VM（purge=true，任务在 DestroyVM 内部等待
-// 完成）；仅当成功后才在单个事务内释放已抢占的 IP 并删除 vms 行（migration
-// 0002 约定：先释放后删除）。任何 PVE 失败都会中止销毁并同时保留数据库记录
-// 与 IP，以便运维检查或重试——但 PVE 404 除外（VM 已在 PVE 侧被移除，例如
-// 被运维手动删除），它被视为"已销毁"并继续本地清理。从未到达 PVE 的 VM
-// （pve_vmid == 0）会跳过 PVE 调用，仅清理本地记录。
-func (s *VMService) Destroy(ctx context.Context, id int64) error {
+// Destroy 删除 VM：数字 id 走现有本地行流程（PVE 销毁 + 事务内释放 IP 与
+// 删除行，migration 0002 约定）；ext- 标识直接销毁 PVE VM（无本地行/IP 可
+// 清理，设计 D4），但指向已托管 VM 时（PVE 是真相源，列表以差集判定，两者
+// 可能并存）路由到本地销毁流程——否则 PVE VM 被销毁后本地行会滞留、IP 池
+// 地址会永久处于 used 状态。两种路径都在受理后同步写入操作记录（设计 D5）。
+func (s *VMService) Destroy(ctx context.Context, id string) error {
+	t, err := parseVMRef(id)
+	if err != nil {
+		return err
+	}
+	if t.external {
+		return s.destroyExternal(ctx, t)
+	}
+	return s.destroyLocal(ctx, t.localID)
+}
+
+// destroyExternal 销毁本地无记录的 external VM：解析目标（校验 PVE 存在，
+// 命中本地托管行时由 resolveVMTarget 的路由语义转入 destroyLocal），调用
+// PVE DestroyVM（purge=true），无本地行/IP 清理，受理后写入操作记录。
+func (s *VMService) destroyExternal(ctx context.Context, t vmTarget) error {
+	node, vmid, localID, err := s.resolveVMTarget(ctx, t)
+	if err != nil {
+		return err
+	}
+	if localID > 0 {
+		// ext- 标识指向已托管 VM：路由到本地销毁流程（含 IP 释放与行删除），
+		// 绝不让 PVE 销毁后本地行/IP 滞留。
+		return s.destroyLocal(ctx, localID)
+	}
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	if _, err := client.DestroyVM(ctx, nodeName(*node), vmid, true); err != nil {
+		mapped := mapExternalPVEOpError(err, "destroy", node.ID, vmid)
+		s.recordFailedOperation(ctx, model.VMOpActionDestroy, node.ID, vmid, mapped)
+		return mapped
+	}
+	return s.recordAcceptedOperation(ctx, model.VMOpActionDestroy, node.ID, vmid)
+}
+
+// destroyLocal 删除本地 VM：先销毁 PVE VM（purge=true，任务在 DestroyVM
+// 内部等待完成）；仅当成功后才在单个事务内释放已抢占的 IP 并删除 vms 行
+// （migration 0002 约定：先释放后删除）。任何 PVE 失败都会中止销毁并同时
+// 保留数据库记录与 IP，以便运维检查或重试——但 PVE 404 除外（VM 已在 PVE
+// 侧被移除，例如被运维手动删除），它被视为"已销毁"并继续本地清理。从未
+// 到达 PVE 的 VM（pve_vmid == 0）会跳过 PVE 调用，仅清理本地记录。PVE
+// 失败时写入 failed 操作记录（尽力而为），本地清理成功后写入 accepted 记录
+// （设计 D5）。
+func (s *VMService) destroyLocal(ctx context.Context, id int64) error {
 	vm, err := s.vmRepo.GetVM(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -711,7 +1024,9 @@ func (s *VMService) Destroy(ctx context.Context, id int64) error {
 			if errors.As(err, &upErr) && upErr.StatusCode == http.StatusNotFound {
 				// PVE VM 已不存在（在服务之外被移除）；下面的本地清理仍会执行。
 			} else {
-				return fmt.Errorf("destroy vm %d on pve: %w (vm record and ip kept)", id, err)
+				mapped := fmt.Errorf("destroy vm %d on pve: %w (vm record and ip kept)", id, err)
+				s.recordFailedOperation(ctx, model.VMOpActionDestroy, vm.VM.NodeID, vm.VM.PVEVmid, mapped)
+				return mapped
 			}
 		}
 	}
@@ -731,7 +1046,36 @@ func (s *VMService) Destroy(ctx context.Context, id int64) error {
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("destroy vm %d: commit: %w", id, err)
 	}
-	return nil
+	return s.recordAcceptedOperation(ctx, model.VMOpActionDestroy, vm.VM.NodeID, vm.VM.PVEVmid)
+}
+
+// ListOperations 返回指定 VM 的操作记录（按时间倒序分页，设计 D5）。数字
+// id 要求本地行存在（spec：查询本地不存在的 VM -> 资源不存在），取其
+// node_id/pve_vmid 查询；ext- 标识直接按 node+vmid 查询（不校验 VM 当前
+// 是否存在：记录是审计历史，PVE 侧可能已销毁该 VM）。
+func (s *VMService) ListOperations(ctx context.Context, id string, limit, offset int) ([]model.VMOperation, int, error) {
+	t, err := parseVMRef(id)
+	if err != nil {
+		return nil, 0, err
+	}
+	var nodeID, vmid int64
+	if t.external {
+		nodeID, vmid = t.nodeID, t.vmid
+	} else {
+		vm, err := s.vmRepo.GetVM(ctx, t.localID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, 0, notFoundf("vm %d not found", t.localID)
+			}
+			return nil, 0, fmt.Errorf("list operations of vm %d: %w", t.localID, err)
+		}
+		nodeID, vmid = vm.VM.NodeID, vm.VM.PVEVmid
+	}
+	ops, total, err := s.opRepo.ListOperations(ctx, nodeID, vmid, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list operations of vm %s: %w", id, err)
+	}
+	return ops, total, nil
 }
 
 // validateResizeSpec 对照 VM 当前值校验调整请求：至少一个字段必须存在且

@@ -178,7 +178,8 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	// NewVMService 将 pool 作为其事务入口点：IP 分配/销毁的事务编排
 	// 位于 service 层（migration 0002 约定）。
 	vmRepo := repository.NewVMRepository(pool)
-	vmSvc := service.NewVMService(pool, vmRepo, ipPoolRepo, zoneRepo, nodeRepo, imageRepo, storageTypeRepo, cipher)
+	opRepo := repository.NewVMOperationRepository(pool)
+	vmSvc := service.NewVMService(pool, vmRepo, opRepo, ipPoolRepo, zoneRepo, nodeRepo, imageRepo, storageTypeRepo, cipher)
 	if options.vmClientFactory != nil {
 		vmSvc.SetClientFactory(options.vmClientFactory)
 	}

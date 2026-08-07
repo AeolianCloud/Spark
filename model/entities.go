@@ -92,6 +92,16 @@ const (
 	VMStateReady = "ready"
 )
 
+// VM 来源标识常量（设计 D3）：列表与详情响应的 source 字段取值。
+const (
+	// VMSourceSparkCreated：由 Spark 镜像创建（vms.source 列默认值）。
+	VMSourceSparkCreated = "spark_created"
+	// VMSourceClaimed：已认领（原"导入"）的外部虚拟机（vms.source 列）。
+	VMSourceClaimed = "claimed"
+	// VMSourceExternal：PVE 上存在而本地无记录——实时差集判定，不落库。
+	VMSourceExternal = "external"
+)
+
 // VM 是虚拟机记录；实时状态不存储（对 PVE 的透传查询，见设计 D1）。
 type VM struct {
 	ID      int64  `json:"id"`
@@ -115,7 +125,39 @@ type VM struct {
 	PasswordEncrypted string `json:"password_encrypted,omitempty"`
 	// ProvisionError 携带分离式 PVE 预配置链的脱敏失败消息
 	// （预配置中或成功后为空）。
-	ProvisionError string    `json:"provision_error,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ProvisionError string `json:"provision_error,omitempty"`
+	// Source 标识 VM 的来源（spark_created/claimed，设计 D3）。external
+	// 由列表接口对 PVE 全量摘要与本地记录实时差集判定，不落库。
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// VM 生命周期操作的动作与结果常量（vm_operations 列取值，设计 D5）。
+const (
+	VMOpActionStart   = "start"
+	VMOpActionStop    = "stop"
+	VMOpActionReboot  = "reboot"
+	VMOpActionDestroy = "destroy"
+
+	// VMOpResultAccepted：PVE 已受理该操作（受理成功）。
+	VMOpResultAccepted = "accepted"
+	// VMOpResultFailed：PVE 返回错误，error_message 记录失败原因。
+	VMOpResultFailed = "failed"
+)
+
+// VMOperation 是一次已受理的虚拟机生命周期操作（启动/停止/重启/销毁）的
+// 审计记录（设计 D5）。操作记录不随 vms 行删除而删除（无外键 ON DELETE），
+// 供审计与排障使用。
+type VMOperation struct {
+	ID      int64  `json:"id"`
+	NodeID  int64  `json:"node_id"`
+	PVEVmid int64  `json:"pve_vmid"`
+	Action  string `json:"action"`
+	Result  string `json:"result"`
+	// ErrorMessage 记录失败原因；受理成功时为空。
+	ErrorMessage string `json:"error_message,omitempty"`
+	// UserID 预留：用户体系（单独提案）启用前恒为 NULL。
+	UserID    *int64    `json:"user_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }

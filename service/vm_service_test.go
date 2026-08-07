@@ -169,20 +169,6 @@ func (f *fakeVMRepository) ListVMs(ctx context.Context) ([]repository.VMWithIP, 
 	return f.vms, nil
 }
 
-func (f *fakeVMRepository) ListVMsPage(ctx context.Context, limit, offset int) ([]repository.VMWithIP, error) {
-	if f.listErr != nil {
-		return nil, f.listErr
-	}
-	return slicePage(f.vms, limit, offset), nil
-}
-
-func (f *fakeVMRepository) CountVMs(ctx context.Context) (int, error) {
-	if f.listErr != nil {
-		return 0, f.listErr
-	}
-	return len(f.vms), nil
-}
-
 func (f *fakeVMRepository) SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error {
 	f.linkedIPID = ipID
 	return nil
@@ -231,6 +217,39 @@ func (f *fakeVMRepository) DeleteVMTx(ctx context.Context, tx pgx.Tx, id int64) 
 	}
 	f.deleted = append(f.deleted, id)
 	return nil
+}
+
+// fakeVMOperationRepository 是供服务测试使用的可脚本化
+// VMOperationRepository：记录写入的操作并支持按 (node_id, pve_vmid)
+// 倒序分页查询（时间戳用递增的 vmTestTime 近似，最新写入排最前）。
+type fakeVMOperationRepository struct {
+	ops       []model.VMOperation
+	createErr error
+	listErr   error
+}
+
+func (f *fakeVMOperationRepository) CreateOperation(ctx context.Context, op model.VMOperation) (*model.VMOperation, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	op.ID = int64(len(f.ops) + 1)
+	op.CreatedAt = vmTestTime.Add(time.Duration(len(f.ops)) * time.Second)
+	f.ops = append(f.ops, op)
+	return &op, nil
+}
+
+func (f *fakeVMOperationRepository) ListOperations(ctx context.Context, nodeID, vmid int64, limit, offset int) ([]model.VMOperation, int, error) {
+	if f.listErr != nil {
+		return nil, 0, f.listErr
+	}
+	var all []model.VMOperation
+	for i := len(f.ops) - 1; i >= 0; i-- { // 倒序：最新写入在前
+		op := f.ops[i]
+		if op.NodeID == nodeID && op.PVEVmid == vmid {
+			all = append(all, op)
+		}
+	}
+	return slicePage(all, limit, offset), len(all), nil
 }
 
 // fakeVMIPPoolRepository 是供服务测试使用的可脚本化 VMIPPoolRepository：
@@ -374,6 +393,21 @@ func (f *fakeVMNodeRepository) ListEnabledNodesByZone(ctx context.Context, zoneI
 	return out, nil
 }
 
+func (f *fakeVMNodeRepository) ListNodesByIDs(ctx context.Context, ids []int64) ([]model.PVENode, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]model.PVENode, 0)
+	for _, n := range f.nodes {
+		for _, id := range ids {
+			if n.ID == id {
+				out = append(out, n)
+			}
+		}
+	}
+	return out, nil
+}
+
 // fakeVMImageRepository 是供服务测试使用的可脚本化 VMImageRepository。
 type fakeVMImageRepository struct {
 	images    []model.Image
@@ -443,7 +477,26 @@ func newVMService(t *testing.T, vmRepo VMRepository, ipRepo VMIPPoolRepository,
 	zoneRepo VMZoneRepository, nodeRepo VMNodeRepository, imageRepo VMImageRepository,
 	stRepo VMStorageTypeRepository) *VMService {
 	t.Helper()
-	svc := NewVMService(&fakeBeginner{}, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo, testCipher(t))
+	svc := NewVMService(&fakeBeginner{}, vmRepo, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo, testCipher(t))
+	svc.selectNode = firstReachableCandidate
+	srv := newScriptedProvisionServer(t, "15G")
+	ts := httptest.NewServer(srv.handler())
+	t.Cleanup(ts.Close)
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	return svc
+}
+
+// newVMServiceWithOps 与 newVMService 相同，但注入脚本化的操作记录仓库
+// （断言审计记录用）；默认 PVE 客户端同样指向脚本化的供给服务器，测试需要
+// 覆盖 newClient 时仍可自行替换。
+func newVMServiceWithOps(t *testing.T, opRepo VMOperationRepository, vmRepo VMRepository, ipRepo VMIPPoolRepository,
+	zoneRepo VMZoneRepository, nodeRepo VMNodeRepository, imageRepo VMImageRepository,
+	stRepo VMStorageTypeRepository) *VMService {
+	t.Helper()
+	svc := NewVMService(&fakeBeginner{}, vmRepo, opRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo, testCipher(t))
 	svc.selectNode = firstReachableCandidate
 	srv := newScriptedProvisionServer(t, "15G")
 	ts := httptest.NewServer(srv.handler())
@@ -784,7 +837,7 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 		},
 		poolNodes: map[int64][]model.PVENode{1: {deadNode}, 2: {aliveNode}},
 	}
-	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo,
+	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, testCipher(t))
 
 	// 池 1 的唯一节点是死的，池 2 的可达 -> 池 2 胜出。
@@ -1126,6 +1179,75 @@ func TestSanitizeProvisionError(t *testing.T) {
 	}
 }
 
+// TestSanitizePVEError 固定 G3 的脱敏契约：对外消息绝不携带内部 base
+// URL/host:port 与 API 路径；PVE 返回的 errors 消息（UpstreamError）原样
+// 保留，传输层错误只保留最末原因段。
+func TestSanitizePVEError(t *testing.T) {
+	// PVE 响应错误：errors 对象排序拼接，不含请求路径/status。
+	upErr := &pve.UpstreamError{Method: "GET", Path: "/nodes/pve1/qemu", StatusCode: 500,
+		Errors: map[string]string{"_": "pve daemon down"}}
+	got := sanitizePVEError(upErr)
+	if !strings.Contains(got, "pve daemon down") || strings.Contains(got, "/nodes/") {
+		t.Fatalf("upstream err = %q, want only the pve message", got)
+	}
+
+	// 网络层错误：消息含内部 URL 与 host:port，摘要只保留最后的原因段。
+	netErr := errors.New(`pve: GET /nodes/pve1/qemu: Get "https://10.0.0.7:8006/api2/json/nodes/pve1/qemu": dial tcp 10.0.0.7:8006: connect: connection refused`)
+	got = sanitizePVEError(netErr)
+	if got != "connection refused" {
+		t.Fatalf("net err = %q, want \"connection refused\"", got)
+	}
+	if strings.Contains(got, "10.0.0.7") || strings.Contains(got, "http") || strings.Contains(got, "/nodes/") {
+		t.Fatalf("net err summary leaks internals: %q", got)
+	}
+
+	// 普通错误（无 pve 包装）：保留原消息。
+	got = sanitizePVEError(errors.New("boom"))
+	if got != "boom" {
+		t.Fatalf("plain err = %q, want \"boom\"", got)
+	}
+}
+
+// TestSanitizeOperationError 固定 G2 的落库契约：error_message 保留服务层
+// 上下文，PVE 部分替换为脱敏摘要（去掉 URL/路径），并按
+// maxOperationErrorLen 截断（rune 安全）。
+func TestSanitizeOperationError(t *testing.T) {
+	// PVE 响应错误链：保留 "start vm 1" 上下文，PVE 段替换为摘要。
+	upErr := &pve.UpstreamError{Method: "POST", Path: "/nodes/pve1/qemu/100/start", StatusCode: 500,
+		Errors: map[string]string{"_": "VM 100 not found on this node"}}
+	got := sanitizeOperationError(fmt.Errorf("start vm 1: %w", upErr))
+	if !strings.Contains(got, "start vm 1") || !strings.Contains(got, "VM 100 not found on this node") {
+		t.Fatalf("mapped = %q, want the service context and the pve message", got)
+	}
+	if strings.Contains(got, "/nodes/") || strings.Contains(got, "status 500") || strings.Contains(got, "pve: POST") {
+		t.Fatalf("mapped leaks pve internals: %q", got)
+	}
+
+	// 网络层错误链：保留服务层上下文，URL 不落库。
+	netErr := errors.New(`pve: GET /nodes/pve1/qemu: Get "https://10.0.0.7:8006/api2/json/nodes/pve1/qemu": dial tcp 10.0.0.7:8006: connect: connection refused`)
+	got = sanitizeOperationError(fmt.Errorf("start vm 1: %w", netErr))
+	if !strings.Contains(got, "start vm 1") || !strings.Contains(got, "connection refused") {
+		t.Fatalf("net mapped = %q, want context and reason", got)
+	}
+	if strings.Contains(got, "10.0.0.7") || strings.Contains(got, "http") {
+		t.Fatalf("net mapped leaks internals: %q", got)
+	}
+
+	// 无 PVE 包装的错误（如 404 映射的 vm_not_ready 消息）：原样保留。
+	got = sanitizeOperationError(vmNotReadyf("vm 1 does not exist on the pve node (cannot start)"))
+	if !strings.Contains(got, "does not exist on the pve node") {
+		t.Fatalf("plain mapped = %q, want the message preserved", got)
+	}
+
+	// 截断：长错误被压到 maxOperationErrorLen 字符内且保持合法 UTF-8。
+	long := strings.Repeat("界", maxOperationErrorLen+50)
+	got = sanitizeOperationError(errors.New(long))
+	if utf8.RuneCountInString(got) != maxOperationErrorLen || !utf8.ValidString(got) {
+		t.Fatalf("truncated length = %d runes / valid = %v, want %d runes / valid",
+			utf8.RuneCountInString(got), utf8.ValidString(got), maxOperationErrorLen)
+	}
+}
+
 // TestFailProvisionBoundsLength 固定 failProvision 契约：先拼接步骤前缀，
 // 再对整条消息脱敏（先脱敏后截断），因此冗长的 PVE 错误无法把存储的
 // provision_error 推过 maxProvisionErrorLen，前缀绝不会被截掉，跨越截断边界
@@ -1218,7 +1340,7 @@ func TestParseDiskSizeGB(t *testing.T) {
 
 func provisionedVM() *repository.VMWithIP {
 	return &repository.VMWithIP{
-		VM: model.VM{ID: 1, NodeID: 1, PVEVmid: 100, CPU: 2, MemMB: 2048, DiskGB: 10, Name: "vm1"},
+		VM: model.VM{ID: 1, NodeID: 1, PVEVmid: 100, CPU: 2, MemMB: 2048, DiskGB: 10, Name: "vm1", Source: model.VMSourceSparkCreated},
 		IP: "10.0.0.5",
 	}
 }
@@ -1240,12 +1362,15 @@ func startStopRestartServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+// TestStartStopRestart 覆盖本地行的三个生命周期操作：每个操作成功后都写
+// 入 result=accepted 的操作记录（设计 D5），动作与节点/VMID 正确。
 func TestStartStopRestart(t *testing.T) {
 	ts := startStopRestartServer(t)
 	defer ts.Close()
 
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
-	svc := newVMService(t, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
+	opRepo := &fakeVMOperationRepository{}
+	svc := newVMServiceWithOps(t, opRepo, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
 		&fakeVMZoneRepository{}, nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
@@ -1253,37 +1378,66 @@ func TestStartStopRestart(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := svc.Start(ctx, 1); err != nil {
+	if err := svc.Start(ctx, "1"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := svc.Stop(ctx, 1); err != nil {
+	if err := svc.Stop(ctx, "1"); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	if err := svc.Restart(ctx, 1); err != nil {
+	if err := svc.Restart(ctx, "1"); err != nil {
 		t.Fatalf("Restart: %v", err)
+	}
+	// 三个 accepted 记录：start/stop/reboot，节点 1 / VMID 100。
+	if len(opRepo.ops) != 3 {
+		t.Fatalf("operations = %+v, want 3 records", opRepo.ops)
+	}
+	for i, wantAction := range []string{model.VMOpActionStart, model.VMOpActionStop, model.VMOpActionReboot} {
+		op := opRepo.ops[i]
+		if op.Action != wantAction || op.Result != model.VMOpResultAccepted ||
+			op.NodeID != 1 || op.PVEVmid != 100 || op.ErrorMessage != "" {
+			t.Fatalf("operation %d = %+v, want %s accepted on node 1 / vmid 100", i, op, wantAction)
+		}
 	}
 }
 
+// TestStartVMNotFound 覆盖数字 id 的本地行不存在 -> not_found。
 func TestStartVMNotFound(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	if err := svc.Start(context.Background(), 404); !isKind(err, KindNotFound) {
+	if err := svc.Start(context.Background(), "404"); !isKind(err, KindNotFound) {
 		t.Fatalf("err = %v, want KindNotFound", err)
 	}
 }
 
+// TestInvalidVMRefs 覆盖路径标识解析失败：非数字非 ext- 前缀、ext- 前缀
+// 但格式非法 -> KindInvalidVMRef。数字组成部分拒绝前导零与符号
+// （"ext-01-005"、"ext-+1-+5"、"01" 这类歧义写法一律非法，reviewer-C1）。
+func TestInvalidVMRefs(t *testing.T) {
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	for _, id := range []string{
+		"abc", "ext-", "ext-1", "ext-a-b", "ext-1-2-3", "ext-0-5", "ext-1-0", "-1",
+		"ext-01-005", "ext-+1-+5", "ext-1-+5", "ext-01-5", "01", "0", "+1",
+	} {
+		if err := svc.Start(context.Background(), id); !isKind(err, KindInvalidVMRef) {
+			t.Fatalf("id %q err = %v, want KindInvalidVMRef", id, err)
+		}
+	}
+}
+
+// TestStartVMNotProvisioned 覆盖 pve_vmid=0 的本地行 -> vm_not_ready。
 func TestStartVMNotProvisioned(t *testing.T) {
 	vm := provisionedVM()
 	vm.VM.PVEVmid = 0
 	svc := newVMService(t, &fakeVMRepository{get: vm}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	if err := svc.Start(context.Background(), 1); !isKind(err, KindVMNotReady) {
+	if err := svc.Start(context.Background(), "1"); !isKind(err, KindVMNotReady) {
 		t.Fatalf("err = %v, want KindVMNotReady", err)
 	}
 }
 
-// TestStartVMPVENotFound 将 PVE 404（VM 在节点上已不存在）映射为
-// vm_not_ready。
+// TestStartVMPVENotFound 将本地行路径的 PVE 404（VM 在节点上已不存在）
+// 映射为 vm_not_ready，并写入 failed 操作记录（spec：记录失败的操作）。
 func TestStartVMPVENotFound(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -1292,14 +1446,165 @@ func TestStartVMPVENotFound(t *testing.T) {
 	defer ts.Close()
 
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
-	svc := newVMService(t, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
+	opRepo := &fakeVMOperationRepository{}
+	svc := newVMServiceWithOps(t, opRepo, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
 		&fakeVMZoneRepository{}, nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	if err := svc.Start(context.Background(), 1); !isKind(err, KindVMNotReady) {
+	if err := svc.Start(context.Background(), "1"); !isKind(err, KindVMNotReady) {
 		t.Fatalf("err = %v, want KindVMNotReady", err)
+	}
+	if len(opRepo.ops) != 1 {
+		t.Fatalf("operations = %+v, want 1 failed record", opRepo.ops)
+	}
+	op := opRepo.ops[0]
+	if op.Action != model.VMOpActionStart || op.Result != model.VMOpResultFailed ||
+		op.ErrorMessage == "" || !strings.Contains(op.ErrorMessage, "does not exist on the pve node") {
+		t.Fatalf("operation = %+v, want failed record carrying the mapped error", op)
+	}
+}
+
+// TestExternalLifecycleOps 覆盖 external VM（ext- 合成标识，设计 D2/D4）
+// 的 start/stop/restart：反查节点并校验 PVE 存在后直调 PVE，操作记录照写。
+func TestExternalLifecycleOps(t *testing.T) {
+	// 服务器需同时应答 PVE 列表（resolveVMTarget 预检）与状态操作。
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/nodes/pve1/qemu" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"data": [{"vmid": 200, "name": "ext-vm", "status": "stopped"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/start") || strings.HasSuffix(r.URL.Path, "/stop") || strings.HasSuffix(r.URL.Path, "/reboot"):
+			fmt.Fprint(w, `{"data": "UPID:pve1:00000E5B:01C9EC9E:5FAB1EC4:qmstart:200:root@pam:"}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 3, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
+	opRepo := &fakeVMOperationRepository{}
+	svc := newVMServiceWithOps(t, opRepo, &fakeVMRepository{}, &fakeVMIPPoolRepository{},
+		&fakeVMZoneRepository{}, nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	ctx := context.Background()
+	if err := svc.Start(ctx, "ext-3-200"); err != nil {
+		t.Fatalf("Start external: %v", err)
+	}
+	if err := svc.Stop(ctx, "ext-3-200"); err != nil {
+		t.Fatalf("Stop external: %v", err)
+	}
+	if err := svc.Restart(ctx, "ext-3-200"); err != nil {
+		t.Fatalf("Restart external: %v", err)
+	}
+	if len(opRepo.ops) != 3 {
+		t.Fatalf("operations = %+v, want 3 external records", opRepo.ops)
+	}
+	for i, wantAction := range []string{model.VMOpActionStart, model.VMOpActionStop, model.VMOpActionReboot} {
+		op := opRepo.ops[i]
+		if op.Action != wantAction || op.Result != model.VMOpResultAccepted ||
+			op.NodeID != 3 || op.PVEVmid != 200 {
+			t.Fatalf("operation %d = %+v, want %s accepted on node 3 / vmid 200", i, op, wantAction)
+		}
+	}
+}
+
+// TestExternalLifecycleOpMissingNode 覆盖 ext- 标识引用的节点不存在 ->
+// not_found；节点禁用 -> node_unavailable；均不发起 PVE 操作调用。
+func TestExternalLifecycleOpMissingNode(t *testing.T) {
+	ts := noCallServer(t)
+	defer ts.Close()
+	opRepo := &fakeVMOperationRepository{}
+	svc := newVMServiceWithOps(t, opRepo, &fakeVMRepository{}, &fakeVMIPPoolRepository{},
+		&fakeVMZoneRepository{}, &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 3, ZoneID: 1, Name: "pve1", Enabled: true}}},
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	if err := svc.Start(context.Background(), "ext-99-200"); !isKind(err, KindNotFound) {
+		t.Fatalf("missing node err = %v, want KindNotFound", err)
+	}
+	if len(opRepo.ops) != 0 {
+		t.Fatalf("operations = %+v, want none", opRepo.ops)
+	}
+}
+
+// TestExternalLifecycleOpVMNotFoundOnNode 覆盖 ext- 标识指向的 VM 在该
+// 节点 PVE 上不存在 -> vm_not_found_on_node（资源不存在，spec）。
+func TestExternalLifecycleOpVMNotFoundOnNode(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/nodes/pve1/qemu" && r.Method == http.MethodGet {
+			fmt.Fprint(w, `{"data": [{"vmid": 200, "name": "ext-vm", "status": "stopped"}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 3, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	if err := svc.Start(context.Background(), "ext-3-999"); !isKind(err, KindVMNotFoundOnNode) {
+		t.Fatalf("err = %v, want KindVMNotFoundOnNode", err)
+	}
+}
+
+// TestExternalLifecycleOpPVE404MapsNotFound 覆盖 external 路径操作时 PVE
+// 404（VM 在预检与操作之间被移除）映射为 vm_not_found_on_node 并记录
+// failed。
+func TestExternalLifecycleOpPVE404MapsNotFound(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/nodes/pve1/qemu" && r.Method == http.MethodGet {
+			fmt.Fprint(w, `{"data": [{"vmid": 200, "name": "ext-vm", "status": "stopped"}]}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"errors": {"_": "VM 200 not found on this node"}}`)
+	}))
+	defer ts.Close()
+
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 3, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
+	opRepo := &fakeVMOperationRepository{}
+	svc := newVMServiceWithOps(t, opRepo, &fakeVMRepository{}, &fakeVMIPPoolRepository{},
+		&fakeVMZoneRepository{}, nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	if err := svc.Restart(context.Background(), "ext-3-200"); !isKind(err, KindVMNotFoundOnNode) {
+		t.Fatalf("err = %v, want KindVMNotFoundOnNode", err)
+	}
+	if len(opRepo.ops) != 1 || opRepo.ops[0].Result != model.VMOpResultFailed {
+		t.Fatalf("operations = %+v, want 1 failed record", opRepo.ops)
+	}
+}
+
+// TestOperationLogWriteFailure 覆盖 PVE 受理成功但操作记录写入失败：返回
+// KindOperationLogFailed（设计 D5：审计完整性优先，500 + 明确错误码）。
+func TestOperationLogWriteFailure(t *testing.T) {
+	ts := startStopRestartServer(t)
+	defer ts.Close()
+
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
+	opRepo := &fakeVMOperationRepository{createErr: errors.New("db down")}
+	svc := newVMServiceWithOps(t, opRepo, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
+		&fakeVMZoneRepository{}, nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	if err := svc.Start(context.Background(), "1"); !isKind(err, KindOperationLogFailed) {
+		t.Fatalf("err = %v, want KindOperationLogFailed", err)
 	}
 }
 
@@ -1310,15 +1615,16 @@ func TestDestroyFlow(t *testing.T) {
 
 	vmRepo := &fakeVMRepository{get: provisionedVM()}
 	ipRepo := &fakeVMIPPoolRepository{}
+	opRepo := &fakeVMOperationRepository{}
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
-	svc := newVMService(t, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
+	svc := newVMServiceWithOps(t, opRepo, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Destroy(context.Background(), 1); err != nil {
+	if err := svc.Destroy(context.Background(), "1"); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 	if !srv.destroyed {
@@ -1331,38 +1637,203 @@ func TestDestroyFlow(t *testing.T) {
 	if len(vmRepo.deleted) != 1 || vmRepo.deleted[0] != 1 {
 		t.Fatalf("deleted = %v, want [1]", vmRepo.deleted)
 	}
+	// 受理后写入 accepted 销毁记录（设计 D5）。
+	if len(opRepo.ops) != 1 || opRepo.ops[0].Action != model.VMOpActionDestroy ||
+		opRepo.ops[0].Result != model.VMOpResultAccepted || opRepo.ops[0].PVEVmid != 100 {
+		t.Fatalf("operations = %+v, want the accepted destroy record", opRepo.ops)
+	}
 }
 
 // TestDestroyUnprovisioned 跳过 PVE 调用（还没有 pve_vmid）但仍清理本地记录
-// 和 IP。
+// 和 IP，并写入 accepted 销毁记录。
 func TestDestroyUnprovisioned(t *testing.T) {
 	vm := provisionedVM()
 	vm.VM.PVEVmid = 0
 	vmRepo := &fakeVMRepository{get: vm}
 	ipRepo := &fakeVMIPPoolRepository{}
-	svc := newVMService(t, vmRepo, ipRepo, &fakeVMZoneRepository{}, &fakeVMNodeRepository{},
+	opRepo := &fakeVMOperationRepository{}
+	svc := newVMServiceWithOps(t, opRepo, vmRepo, ipRepo, &fakeVMZoneRepository{}, &fakeVMNodeRepository{},
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	// newVMService 的 newClient 对所有请求都应答 503；PVE 调用绝不能发生，
 	// 因此任何调用都会导致下面的测试失败。
 
-	if err := svc.Destroy(context.Background(), 1); err != nil {
+	if err := svc.Destroy(context.Background(), "1"); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 	if len(ipRepo.released) != 1 || len(vmRepo.deleted) != 1 {
 		t.Fatalf("released = %v, deleted = %v", ipRepo.released, vmRepo.deleted)
+	}
+	if len(opRepo.ops) != 1 || opRepo.ops[0].Action != model.VMOpActionDestroy ||
+		opRepo.ops[0].Result != model.VMOpResultAccepted {
+		t.Fatalf("operations = %+v, want the accepted destroy record", opRepo.ops)
 	}
 }
 
 func TestDestroyVMNotFound(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	if err := svc.Destroy(context.Background(), 404); !isKind(err, KindNotFound) {
+	if err := svc.Destroy(context.Background(), "404"); !isKind(err, KindNotFound) {
 		t.Fatalf("err = %v, want KindNotFound", err)
 	}
 }
 
+// TestDestroyExternal 覆盖 external VM 销毁（设计 D4）：PVE DestroyVM 被
+// 调用、无本地行/IP 清理，受理后写入 accepted 操作记录。
+func TestDestroyExternal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/nodes/pve1/qemu" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"data": [{"vmid": 200, "name": "ext-vm", "status": "stopped"}]}`)
+		case r.URL.Path == "/nodes/pve1/qemu/200" && r.Method == http.MethodDelete:
+			fmt.Fprint(w, `{"data": "UPID:pve1:00000E5B:01C9EC9E:5FAB1EC4:qmdestroy:200:root@pam:"}`)
+		case strings.HasPrefix(r.URL.Path, "/nodes/pve1/tasks/") && strings.HasSuffix(r.URL.Path, "/status"):
+			// DestroyVM 内部会等待销毁任务结束。
+			fmt.Fprint(w, `{"data": {"upid": "UPID:pve1:0:0:0:qmdestroy:200:root@pam:", "node": "pve1", "type": "qmdestroy", "id": "200", "user": "root@pam", "status": "stopped", "exitstatus": "OK"}}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ipRepo := &fakeVMIPPoolRepository{}
+	vmRepo := &fakeVMRepository{}
+	opRepo := &fakeVMOperationRepository{}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 3, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
+	svc := newVMServiceWithOps(t, opRepo, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	if err := svc.Destroy(context.Background(), "ext-3-200"); err != nil {
+		t.Fatalf("Destroy external: %v", err)
+	}
+	// 无本地行/IP 清理；操作记录照写（外部操作同样记录，spec）。
+	if len(ipRepo.released) != 0 || len(vmRepo.deleted) != 0 {
+		t.Fatalf("released = %v, deleted = %v, want untouched", ipRepo.released, vmRepo.deleted)
+	}
+	if len(opRepo.ops) != 1 || opRepo.ops[0].Action != model.VMOpActionDestroy ||
+		opRepo.ops[0].Result != model.VMOpResultAccepted || opRepo.ops[0].NodeID != 3 ||
+		opRepo.ops[0].PVEVmid != 200 {
+		t.Fatalf("operations = %+v, want the accepted external destroy record", opRepo.ops)
+	}
+}
+
+// TestDestroyExternalManagedRoutesLocal 覆盖 G1：ext- 标识指向已有本地托管
+// 行时，destroy 必须路由到本地销毁流程（PVE 销毁 + 事务内释放 IP + 删除行
+// + accepted 记录）——绝不走 destroyExternal 直调路径，否则 PVE VM 被销毁
+// 后本地行会滞留、IP 池地址会永久处于 used 状态。
+func TestDestroyExternalManagedRoutesLocal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/nodes/pve1/qemu/200" && r.Method == http.MethodDelete:
+			fmt.Fprint(w, `{"data": "UPID:pve1:00000E5B:01C9EC9E:5FAB1EC4:qmdestroy:200:root@pam:"}`)
+		case strings.HasPrefix(r.URL.Path, "/nodes/pve1/tasks/") && strings.HasSuffix(r.URL.Path, "/status"):
+			fmt.Fprint(w, `{"data": {"upid": "UPID:pve1:0:0:0:qmdestroy:200:root@pam:", "node": "pve1", "type": "qmdestroy", "id": "200", "user": "root@pam", "status": "stopped", "exitstatus": "OK"}}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// 本地托管行：id 5，节点 3 / PVE vmid 200。
+	managed := &model.VM{ID: 5, NodeID: 3, PVEVmid: 200, Name: "managed"}
+	vmRepo := &fakeVMRepository{getByNodeVMID: managed, get: &repository.VMWithIP{VM: *managed, IP: "10.0.0.5"}}
+	ipRepo := &fakeVMIPPoolRepository{}
+	opRepo := &fakeVMOperationRepository{}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 3, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
+	svc := newVMServiceWithOps(t, opRepo, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	if err := svc.Destroy(context.Background(), "ext-3-200"); err != nil {
+		t.Fatalf("Destroy external-managed: %v", err)
+	}
+	// 本地清理执行：PVE 销毁 + IP 释放 + 行删除（按本地行 id 5）。
+	if len(ipRepo.released) != 1 || ipRepo.released[0] != 5 {
+		t.Fatalf("released = %v, want [5]", ipRepo.released)
+	}
+	if len(vmRepo.deleted) != 1 || vmRepo.deleted[0] != 5 {
+		t.Fatalf("deleted = %v, want [5]", vmRepo.deleted)
+	}
+	// accepted 销毁记录按本地行 (node 3, vmid 200) 写入。
+	if len(opRepo.ops) != 1 || opRepo.ops[0].Action != model.VMOpActionDestroy ||
+		opRepo.ops[0].Result != model.VMOpResultAccepted || opRepo.ops[0].NodeID != 3 ||
+		opRepo.ops[0].PVEVmid != 200 {
+		t.Fatalf("operations = %+v, want the accepted destroy record on node 3 / vmid 200", opRepo.ops)
+	}
+}
+
+// TestStartExternalManagedRoutesLocal 覆盖 G1 的一致性要求：ext- 标识指向
+// 已有本地托管行时，start 路由到本地行路径——PVE 404 映射为 vm_not_ready
+// （本地语义）而非 external 的 vm_not_found_on_node。
+func TestStartExternalManagedRoutesLocal(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"errors": {"_": "VM 200 not found on this node"}}`)
+	}))
+	defer ts.Close()
+
+	managed := &model.VM{ID: 5, NodeID: 3, PVEVmid: 200, Name: "managed"}
+	vmRepo := &fakeVMRepository{getByNodeVMID: managed, get: &repository.VMWithIP{VM: *managed}}
+	opRepo := &fakeVMOperationRepository{}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 3, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
+	svc := newVMServiceWithOps(t, opRepo, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	if err := svc.Start(context.Background(), "ext-3-200"); !isKind(err, KindVMNotReady) {
+		t.Fatalf("err = %v, want KindVMNotReady (local routing), not vm_not_found_on_node", err)
+	}
+	// failed 记录照写，消息为本地语义。
+	if len(opRepo.ops) != 1 || opRepo.ops[0].Result != model.VMOpResultFailed ||
+		!strings.Contains(opRepo.ops[0].ErrorMessage, "does not exist on the pve node") {
+		t.Fatalf("operations = %+v, want the failed local-mapped record", opRepo.ops)
+	}
+}
+
+// TestExternalLifecycleOpTemplateRejected 覆盖 C2：external 生命周期操作
+// 指向 PVE 模板（template==1）时拒绝（400），与列表不并入、认领拒绝的
+// 语义一致。
+func TestExternalLifecycleOpTemplateRejected(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/nodes/pve1/qemu" && r.Method == http.MethodGet {
+			fmt.Fprint(w, `{"data": [{"vmid": 200, "name": "ubuntu-cloud", "status": "stopped", "template": 1}]}`)
+			return
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 3, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}}}
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	for _, op := range []func(context.Context, string) error{
+		svc.Start, svc.Stop, svc.Restart,
+		func(ctx context.Context, id string) error { return svc.Destroy(ctx, id) },
+	} {
+		if err := op(context.Background(), "ext-3-200"); !isKind(err, KindBadRequest) {
+			t.Fatalf("err = %v, want KindBadRequest for a pve template", err)
+		}
+	}
+}
+
 // TestDestroyPVEFailureKeepsRecordAndIP 验证 PVE 失败会中止销毁：IP 和行
-// 都未被触碰。
+// 都未被触碰，且写入 failed 操作记录。
 func TestDestroyPVEFailureKeepsRecordAndIP(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1372,24 +1843,28 @@ func TestDestroyPVEFailureKeepsRecordAndIP(t *testing.T) {
 
 	vmRepo := &fakeVMRepository{get: provisionedVM()}
 	ipRepo := &fakeVMIPPoolRepository{}
+	opRepo := &fakeVMOperationRepository{}
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
-	svc := newVMService(t, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
+	svc := newVMServiceWithOps(t, opRepo, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Destroy(context.Background(), 1); err == nil {
+	if err := svc.Destroy(context.Background(), "1"); err == nil {
 		t.Fatal("Destroy succeeded, want PVE failure")
 	}
 	if len(ipRepo.released) != 0 || len(vmRepo.deleted) != 0 {
 		t.Fatalf("released = %v, deleted = %v, want untouched", ipRepo.released, vmRepo.deleted)
 	}
+	if len(opRepo.ops) != 1 || opRepo.ops[0].Result != model.VMOpResultFailed {
+		t.Fatalf("operations = %+v, want 1 failed record", opRepo.ops)
+	}
 }
 
 // TestDestroyPVE404CleansUpLocal 将销毁时的 PVE 404（VM 已在节点上被移除，
-// 例如被运维删除）视为"已销毁"：本地清理仍然执行且销毁成功。
+// 例如被运维删除）视为"已销毁"：本地清理仍然执行且销毁成功，记录 accepted。
 func TestDestroyPVE404CleansUpLocal(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -1399,15 +1874,16 @@ func TestDestroyPVE404CleansUpLocal(t *testing.T) {
 
 	vmRepo := &fakeVMRepository{get: provisionedVM()}
 	ipRepo := &fakeVMIPPoolRepository{}
+	opRepo := &fakeVMOperationRepository{}
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"}}}
-	svc := newVMService(t, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
+	svc := newVMServiceWithOps(t, opRepo, vmRepo, ipRepo, &fakeVMZoneRepository{}, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Destroy(context.Background(), 1); err != nil {
+	if err := svc.Destroy(context.Background(), "1"); err != nil {
 		t.Fatalf("Destroy with PVE 404: %v", err)
 	}
 	if len(ipRepo.released) != 1 || ipRepo.released[0] != 1 {
@@ -1415,6 +1891,82 @@ func TestDestroyPVE404CleansUpLocal(t *testing.T) {
 	}
 	if len(vmRepo.deleted) != 1 || vmRepo.deleted[0] != 1 {
 		t.Fatalf("deleted = %v, want [1]", vmRepo.deleted)
+	}
+	if len(opRepo.ops) != 1 || opRepo.ops[0].Result != model.VMOpResultAccepted {
+		t.Fatalf("operations = %+v, want the accepted record", opRepo.ops)
+	}
+}
+
+// ---------- 操作记录查询（ListOperations）测试 ----------
+
+// TestListOperations 覆盖数字 id 与 ext- 标识两种查询（设计 D5）：按时间
+// 倒序分页，X-Total-Count 口径为匹配总数；数字 id 无本地行 -> not_found；
+// 非法标识 -> invalid ref。
+func TestListOperations(t *testing.T) {
+	opRepo := &fakeVMOperationRepository{}
+	svc := newVMServiceWithOps(t, opRepo, &fakeVMRepository{get: provisionedVM()}, &fakeVMIPPoolRepository{},
+		&fakeVMZoneRepository{}, &fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+
+	// 预置记录：节点 1 / vmid 100 三条（start、stop、destroy），节点 3 /
+	// vmid 200 一条。
+	for _, op := range []model.VMOperation{
+		{NodeID: 1, PVEVmid: 100, Action: model.VMOpActionStart, Result: model.VMOpResultAccepted},
+		{NodeID: 1, PVEVmid: 100, Action: model.VMOpActionStop, Result: model.VMOpResultAccepted},
+		{NodeID: 1, PVEVmid: 100, Action: model.VMOpActionDestroy, Result: model.VMOpResultAccepted},
+		{NodeID: 3, PVEVmid: 200, Action: model.VMOpActionStart, Result: model.VMOpResultAccepted},
+	} {
+		if _, err := opRepo.CreateOperation(context.Background(), op); err != nil {
+			t.Fatalf("seed operation: %v", err)
+		}
+	}
+
+	// 数字 id：查本地行（节点 1 / vmid 100）的记录，倒序分页。
+	ops, total, err := svc.ListOperations(context.Background(), "1", 25, 0)
+	if err != nil {
+		t.Fatalf("ListOperations (numeric): %v", err)
+	}
+	if total != 3 || len(ops) != 3 {
+		t.Fatalf("total = %d, ops = %d, want 3/3", total, len(ops))
+	}
+	if ops[0].Action != model.VMOpActionDestroy || ops[1].Action != model.VMOpActionStop || ops[2].Action != model.VMOpActionStart {
+		t.Fatalf("ops = %+v, want destroy/stop/start in descending time order", ops)
+	}
+	// 分页：limit 2 offset 1 -> [stop, start]（中间两条），total 不变。
+	ops, total, err = svc.ListOperations(context.Background(), "1", 2, 1)
+	if err != nil {
+		t.Fatalf("ListOperations page: %v", err)
+	}
+	if total != 3 || len(ops) != 2 || ops[0].Action != model.VMOpActionStop || ops[1].Action != model.VMOpActionStart {
+		t.Fatalf("page ops = %+v total = %d, want stop/start with total 3", ops, total)
+	}
+
+	// ext- 标识：直接按 node+vmid 查询，不要求本地行。
+	ops, total, err = svc.ListOperations(context.Background(), "ext-3-200", 25, 0)
+	if err != nil {
+		t.Fatalf("ListOperations (external): %v", err)
+	}
+	if total != 1 || len(ops) != 1 || ops[0].PVEVmid != 200 {
+		t.Fatalf("external ops = %+v total = %d, want the single node-3 record", ops, total)
+	}
+
+	// 无记录的 VM：空列表。
+	ops, total, err = svc.ListOperations(context.Background(), "ext-1-999", 25, 0)
+	if err != nil {
+		t.Fatalf("ListOperations (empty): %v", err)
+	}
+	if total != 0 || len(ops) != 0 {
+		t.Fatalf("empty ops = %+v total = %d, want empty", ops, total)
+	}
+
+	// 本地不存在的 VM id -> not_found（spec：查询本地不存在的 VM -> 资源不存在）。
+	svc.vmRepo = &fakeVMRepository{}
+	if _, _, err := svc.ListOperations(context.Background(), "404", 25, 0); !isKind(err, KindNotFound) {
+		t.Fatalf("missing vm err = %v, want KindNotFound", err)
+	}
+
+	// 非法标识 -> invalid ref。
+	if _, _, err := svc.ListOperations(context.Background(), "ext-bad", 25, 0); !isKind(err, KindInvalidVMRef) {
+		t.Fatalf("bad id err = %v, want KindInvalidVMRef", err)
 	}
 }
 

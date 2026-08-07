@@ -439,6 +439,12 @@ async function openClaimModal(vm: VMListItem): Promise<void> {
   claimForm.ip = ''
   claimForm.name = ''
   await loadZones()
+  // 预填值双源校验：预填值来自 catalog 缓存，下拉选项来自页面级 zones；
+  // catalog 过期或 loadZones 失败时预填值不在 zoneOptions 中，置空走"请选择可用区"校验路径，
+  // 避免前端校验通过、请求发出后由后端 404 兜底
+  if (claimForm.zone_id !== undefined && !zoneOptions.value.some(opt => opt.value === claimForm.zone_id)) {
+    claimForm.zone_id = undefined
+  }
 }
 
 // 表单校验：可用区必选；IP 非空时须为 IPv4/IPv6 形式（宽松预检，格式细节由后端 400 兜底）；
@@ -530,6 +536,8 @@ async function loadOperations(first = false): Promise<void> {
   const target = opsTarget.value
   if (!target) return
   const seq = ++opsSeq
+  // 每次发起请求前重置错误：避免"加载更多"失败后再次成功时旧错误条残留（对齐 submitClaim/fetchVMs 模式）
+  opsError.value = null
   if (first) {
     operations.value = []
     opsLoading.value = true

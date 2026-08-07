@@ -13,7 +13,8 @@
 # - 未匹配路由的 404（not_found）与 405（method_not_allowed，带 Allow 头）
 #   为全局兜底，覆盖全部路径。
 # - 生命周期操作（start/stop/restart）202 响应携带 Location 指向状态终结点
-#   GET /vms/{id}。
+#   GET /vms/{id}（external 合成标识 ext-{nodeID}-{vmid} 省略 Location 头，
+#   详情端点仅支持数字本地行 id）。
 openapi: 3.0.3
 # 许可证说明：内部项目尚未确定 LICENSE 声明，暂不声明 license 字段
 #（info-license 豁免记录于 .redocly.lint-ignore.yaml）。
@@ -507,10 +508,16 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
     get:
       tags: [vms]
-      summary: VM 列表（穿透式合并各节点实时状态）
+      summary: VM 列表（穿透式合并各节点实时状态，含 external 虚拟机）
       description: |
-        每个启用节点一次 PVE 调用，合并本地元数据后返回；查询失败的节点不出现在
-        vms 中，而是记录在 warnings。X-Total-Count 为本地 VM 总行数（分页前）。
+        每个启用节点一次 PVE 调用，与本地元数据合并后按 (node_id, pve_vmid)
+        升序稳定排序、内存分页返回（设计 D1/D2）。PVE 上存在而本地无记录的
+        虚拟机以 external 条目并入（id 为合成标识 ext-{nodeID}-{vmid}，
+        uuid/created_at/updated_at 为空字符串，source 为 external）。
+        查询失败或被禁用/移除的节点不出现在 vms 中，而是记录在 warnings
+        （Node 为节点名，error 为脱敏原因）。X-Total-Count 为合并后条目
+        总数（含 external，剔除故障/禁用节点的虚拟机），与本地 vms 行数
+        不再相等。
       operationId: listVMs
       parameters:
         - $ref: "#/components/parameters/QueryLimit"
@@ -528,43 +535,20 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
 
-  /vms/unmanaged:
-    get:
-      tags: [vms]
-      summary: 节点未托管 VM 候选列表
-      description: |
-        返回指定节点 PVE 上尚未被托管的虚拟机候选（供导入选择）。
-        节点不存在返回 404 not_found；节点不可达或查询失败返回 503
-        node_unavailable。
-      operationId: listUnmanagedVMs
-      parameters:
-        - $ref: "#/components/parameters/QueryNodeID"
-      responses:
-        "200":
-          description: 该节点未托管的 VM 候选列表
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/UnmanagedVMListResponse"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "503":
-          $ref: "#/components/responses/ServiceUnavailable"
-
   /vms/import:
     post:
       tags: [vms]
-      summary: 导入已有 VM（纳管）
+      summary: 认领已有 VM（原导入）
       description: |
-        将 PVE 节点上已有的虚拟机导入为托管虚拟机：读取 PVE 配置规格，
-        IP 优先复用 ipconfig0 静态 IP（属于池且空闲时直接占用），否则从
-        池分配。导入不修改 PVE 侧配置。
+        将 PVE 节点上已有的虚拟机认领为托管虚拟机：校验区域/节点/幂等性，
+        读取 PVE 配置提取规格，按请求可选分配 IP（ip 为 IP 地址字符串，
+        不传则不分配 IP，虚拟机网络由 PVE 侧配置决定）。认领成功后该虚拟机
+        出现在列表与详情中，source 为 claimed；不修改 PVE 侧配置。
 
-        错误场景：400 参数非法；404 区域/节点不存在（not_found）或 PVE 上
-        无此 VM（vm_not_found_on_node）；409 已托管（vm_already_managed）
-        或 IP 池耗尽（ip_exhausted）；503 节点不可达/禁用（node_unavailable）。
+        错误场景：400 参数非法（含 ip 格式非法）；404 区域/节点不存在
+        （not_found）或 PVE 上无此 VM（vm_not_found_on_node）；409 已托管
+        （vm_already_managed）或指定 IP 不可用（ip_exhausted）；503 节点
+        不可达/禁用（node_unavailable）。
       operationId: importVM
       requestBody:
         required: true
@@ -574,7 +558,7 @@ paths:
               $ref: "#/components/schemas/ImportVMRequest"
       responses:
         "201":
-          description: 导入成功
+          description: 认领成功（source 为 claimed；Location 指向详情）
           headers:
             Location:
               $ref: "#/components/headers/Location"
@@ -596,7 +580,9 @@ paths:
       tags: [vms]
       summary: VM 详情（穿透实时状态）
       description: |
-        PVE 节点查询失败（节点不可达、被禁用或已被移除）返回 503 node_unavailable，
+        :id 仅支持数字本地行 id（external 虚拟机没有详情端点；其列表条目带
+        ext- 合成标识，可用于生命周期操作与操作记录查询）。PVE 节点查询失败
+        （节点不可达、被禁用或已被移除）返回 503 node_unavailable，
         不会伪装成 creating。
       operationId: getVM
       parameters:
@@ -655,12 +641,19 @@ paths:
       tags: [vms]
       summary: 销毁 VM（同步，幂等）
       description: |
-        PVE 侧删除（含 purge）→ 释放 IP → 删本地记录，同步完成后返回 204。
-        重复销毁：本地行已不存在返回 404 not_found；PVE 侧 VM 已不存在视为
-        已销毁，仅执行本地清理。
+        :id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}
+        （格式非法返回 400 invalid_vm_id）。
+
+        数字 id：PVE 侧删除（含 purge）→ 释放 IP → 删本地记录，同步完成后
+        返回 204；本地行已不存在返回 404 not_found；PVE 侧 VM 已不存在视为
+        已销毁，仅执行本地清理（幂等）。
+
+        ext- 标识：直接销毁 PVE VM（无本地行/IP 清理）；PVE 侧 VM 不存在
+        返回 404 vm_not_found_on_node。PVE 已受理但操作记录写失败返回 500
+        operation_log_failed。
       operationId: destroyVM
       parameters:
-        - $ref: "#/components/parameters/PathID"
+        - $ref: "#/components/parameters/PathVMRef"
       responses:
         "204":
           description: 销毁成功，无响应体
@@ -668,20 +661,26 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
 
   /vms/{id}/start:
     post:
       tags: [vms]
       summary: 启动 VM（异步派发）
       description: |
-        VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
-        节点/PVE 调用失败按全局兜底返回 500 internal_error。
+        :id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}
+        （格式非法返回 400 invalid_vm_id）。本地行不存在返回 404 not_found；
+        external 目标在节点 PVE 上不存在返回 404 vm_not_found_on_node。
+        本地行尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409
+        vm_not_ready；PVE 调用失败按全局兜底返回 500 internal_error；
+        PVE 已受理但操作记录写失败返回 500 operation_log_failed。
       operationId: startVM
       parameters:
-        - $ref: "#/components/parameters/PathID"
+        - $ref: "#/components/parameters/PathVMRef"
       responses:
         "202":
-          description: 已受理；Location 指向状态终结点 GET /vms/{id}
+          description: 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头）
           headers:
             Location:
               $ref: "#/components/headers/Location"
@@ -703,14 +702,18 @@ paths:
       tags: [vms]
       summary: 关闭 VM（ACPI 优雅关机，异步派发）
       description: |
-        VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
-        节点/PVE 调用失败按全局兜底返回 500 internal_error。
+        :id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}
+        （格式非法返回 400 invalid_vm_id）。本地行不存在返回 404 not_found；
+        external 目标在节点 PVE 上不存在返回 404 vm_not_found_on_node。
+        本地行尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409
+        vm_not_ready；PVE 调用失败按全局兜底返回 500 internal_error；
+        PVE 已受理但操作记录写失败返回 500 operation_log_failed。
       operationId: stopVM
       parameters:
-        - $ref: "#/components/parameters/PathID"
+        - $ref: "#/components/parameters/PathVMRef"
       responses:
         "202":
-          description: 已受理；Location 指向状态终结点 GET /vms/{id}
+          description: 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头）
           headers:
             Location:
               $ref: "#/components/headers/Location"
@@ -732,14 +735,18 @@ paths:
       tags: [vms]
       summary: 重启 VM（异步派发）
       description: |
-        VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
-        节点/PVE 调用失败按全局兜底返回 500 internal_error。
+        :id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}
+        （格式非法返回 400 invalid_vm_id）。本地行不存在返回 404 not_found；
+        external 目标在节点 PVE 上不存在返回 404 vm_not_found_on_node。
+        本地行尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409
+        vm_not_ready；PVE 调用失败按全局兜底返回 500 internal_error；
+        PVE 已受理但操作记录写失败返回 500 operation_log_failed。
       operationId: restartVM
       parameters:
-        - $ref: "#/components/parameters/PathID"
+        - $ref: "#/components/parameters/PathVMRef"
       responses:
         "202":
-          description: 已受理；Location 指向状态终结点 GET /vms/{id}
+          description: 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头）
           headers:
             Location:
               $ref: "#/components/headers/Location"
@@ -753,6 +760,39 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /vms/{id}/operations:
+    get:
+      tags: [vms]
+      summary: 查询 VM 操作记录（审计轨迹，按时间倒序分页）
+      description: |
+        返回该 VM 的生命周期操作记录（启动/停止/重启/销毁，每次 PVE 受理
+        或失败各一条），按时间倒序分页。:id 支持数字本地行 id（本地行不存在
+        返回 404 not_found）与 external 合成标识 ext-{nodeID}-{vmid}（直接
+        按 node+vmid 查询，不校验 VM 当前是否存在：记录是审计历史，PVE 侧
+        可能已销毁该 VM）。格式非法返回 400 invalid_vm_id。分页语义与列表
+        一致：limit 默认 25 上限 100，X-Total-Count 报告匹配总数。
+      operationId: listVMOperations
+      parameters:
+        - $ref: "#/components/parameters/PathVMRef"
+        - $ref: "#/components/parameters/QueryLimit"
+        - $ref: "#/components/parameters/QueryOffset"
+      responses:
+        "200":
+          description: 分页后的操作记录（按时间倒序）
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/XTotalCount"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VMOperationsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -802,15 +842,18 @@ components:
         type: integer
         format: int64
         minimum: 1
-    QueryNodeID:
-      name: node_id
-      in: query
+    PathVMRef:
+      name: id
+      in: path
       required: true
-      description: 节点 ID（正整数；缺失或格式非法返回 400）
+      description: |
+        VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+        （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+        正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
       schema:
-        type: integer
-        format: int64
-        minimum: 1
+        type: string
+        pattern: ^([1-9][0-9]*|ext-[1-9][0-9]*-[1-9][0-9]*)$
+        example: ext-3-100
 
   headers:
     XTotalCount:
@@ -834,7 +877,7 @@ components:
 
   responses:
     BadRequest:
-      description: 请求参数非法（bad_request；也用于 image_not_available_in_zone）
+      description: 请求参数非法（bad_request / invalid_vm_id；也用于 image_not_available_in_zone）
       headers:
         x-ms-error-code:
           $ref: "#/components/headers/XMSErrorCode"
@@ -847,7 +890,7 @@ components:
               code: bad_request
               message: invalid limit query parameter
     NotFound:
-      description: 资源不存在，或路径未匹配任何路由的全局 404 兜底（not_found）
+      description: 资源不存在（not_found / vm_not_found_on_node），或路径未匹配任何路由的全局 404 兜底（not_found）
       headers:
         x-ms-error-code:
           $ref: "#/components/headers/XMSErrorCode"
@@ -860,7 +903,7 @@ components:
               code: not_found
               message: vm 42 not found
     Conflict:
-      description: 与现有状态冲突（conflict / ip_exhausted / vm_not_ready）
+      description: 与现有状态冲突（conflict / ip_exhausted / vm_not_ready / vm_already_managed）
       headers:
         x-ms-error-code:
           $ref: "#/components/headers/XMSErrorCode"
@@ -899,7 +942,7 @@ components:
               code: node_unavailable
               message: no available node
     InternalError:
-      description: 服务器内部错误（internal_error，统一兜底，不暴露内部细节）
+      description: 服务器内部错误（internal_error / operation_log_failed，统一兜底，不暴露内部细节）
       headers:
         x-ms-error-code:
           $ref: "#/components/headers/XMSErrorCode"
@@ -955,6 +998,8 @@ components:
             - image_not_available_in_zone
             - vm_already_managed
             - vm_not_found_on_node
+            - invalid_vm_id
+            - operation_log_failed
         message:
           type: string
           description: 仅供人阅读，不可被程序解析
@@ -1235,18 +1280,21 @@ components:
           type: integer
           format: int64
           description: PVE 侧 VMID（必填）
-        ip_pool_id:
-          type: integer
-          format: int64
-          description: IP 池 ID，可选；0 表示自动选池（默认按静态 IP 匹配/回退分配）
+        ip:
+          type: string
+          description: |
+            IP 地址（IPv4/IPv6 均可），可选；不传则不分配 IP（本地 ip_id
+            为空，虚拟机网络由 PVE 侧配置决定）。传入时按区域 IP 池中
+            CIDR 包含该地址且节点在白名单内的池精确占用，不可用返回 409
+            ip_exhausted。
         name:
           type: string
           maxLength: 128
-          description: 导入后的 VM 名称，可选；空则取 PVE 配置名。名称须匹配 ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$；PVE 配置名超长时截断到 128 字符而非拒绝
+          description: 认领后的 VM 名称，可选；空则取 PVE 配置名。名称须匹配 ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$；PVE 配置名超长时截断到 128 字符而非拒绝
 
     VMResponse:
       type: object
-      required: [id, uuid, name, cpu, mem_mb, disk_gb, zone_id, node_id, status, created_at, updated_at]
+      required: [id, uuid, name, cpu, mem_mb, disk_gb, zone_id, node_id, status, source, created_at, updated_at]
       properties:
         id:
           type: integer
@@ -1293,6 +1341,13 @@ components:
           type: string
           description: creating/failed 为本地过渡状态；ready 及以后为 PVE 穿透状态
           example: creating
+        source:
+          type: string
+          description: |
+            虚拟机来源：spark_created（由 Spark 镜像创建）、claimed（已认领的
+            外部虚拟机）、external（PVE 上存在而本地无记录，仅列表条目出现；
+            由 PVE 全量虚拟机与本地记录实时比对得出，不落库）
+          enum: [spark_created, claimed, external]
         provision_error:
           type: string
           description: 异步供给链失败原因（仅失败时出现）
@@ -1304,10 +1359,38 @@ components:
           format: date-time
 
     VMListItem:
+      description: |
+        透传 VM 负载：VMResponse 元数据 + PVE 实时运行部分。external 条目
+        （source=external）id 为合成标识 ext-{nodeID}-{vmid}（字符串），
+        uuid/created_at/updated_at 返回空字符串，规格取 PVE 摘要值。
       allOf:
         - $ref: "#/components/schemas/VMResponse"
         - type: object
           properties:
+            id:
+              description: |
+                本地行（source 为 spark_created/claimed）为数字本地行 id；
+                external 条目（source=external）为合成标识 ext-{nodeID}-{vmid}
+                （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID）
+              oneOf:
+                - type: integer
+                  format: int64
+                  minimum: 1
+                - type: string
+                  pattern: ^ext-[1-9][0-9]*-[1-9][0-9]*$
+                  example: ext-3-100
+            uuid:
+              type: string
+              format: uuid
+              description: external 条目（source=external）返回空字符串
+            created_at:
+              type: string
+              format: date-time
+              description: 本地行时间戳；external 条目（source=external）返回空字符串
+            updated_at:
+              type: string
+              format: date-time
+              description: 本地行时间戳；external 条目（source=external）返回空字符串
             cpu_usage:
               type: number
               format: float
@@ -1339,10 +1422,10 @@ components:
       properties:
         node:
           type: string
-          description: 查询失败的 PVE 节点名
+          description: 查询失败或被禁用/移除的 PVE 节点名（绝不暴露内部节点 id）
         error:
           type: string
-          description: 失败原因
+          description: 失败原因（已脱敏，不包含内部地址/API 路径等细节）
 
     VMListResponse:
       type: object
@@ -1357,42 +1440,6 @@ components:
           description: 节点查询失败告警（恒为数组，无失败时为空数组）
           items:
             $ref: "#/components/schemas/NodeWarning"
-
-    UnmanagedVM:
-      type: object
-      required: [vmid, name, status, cpu, mem_mb, disk_gb]
-      properties:
-        vmid:
-          type: integer
-          format: int64
-          description: PVE 侧 VMID
-        name:
-          type: string
-          description: PVE 配置中的 VM 名称
-        status:
-          type: string
-          description: PVE 运行时状态，如 running/stopped
-        cpu:
-          type: integer
-          format: int32
-          description: vCPU 核数
-        mem_mb:
-          type: integer
-          format: int64
-          description: 内存（MB）
-        disk_gb:
-          type: integer
-          format: int64
-          description: 磁盘总量（GiB）
-
-    UnmanagedVMListResponse:
-      type: object
-      required: [vms]
-      properties:
-        vms:
-          type: array
-          items:
-            $ref: "#/components/schemas/UnmanagedVM"
 
     ResizeRequest:
       type: object
@@ -1419,5 +1466,49 @@ components:
       properties:
         accepted:
           type: boolean
-          description: 恒为 true；实际结果通过 Location 指向的 GET /vms/{id} 观察
+          description: |
+            恒为 true；实际结果通过 Location 指向的 GET /vms/{id} 观察
+            （external 合成标识省略 Location 头，可刷新 VM 列表观察状态）
           example: true
+
+    VMOperation:
+      type: object
+      required: [id, node_id, pve_vmid, action, result, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: 操作记录 ID
+        node_id:
+          type: integer
+          format: int64
+          description: PVE 节点（本地 pve_nodes.id）
+        pve_vmid:
+          type: integer
+          format: int64
+          description: PVE 侧 VMID
+        action:
+          type: string
+          description: 操作动作
+          enum: [start, stop, reboot, destroy]
+        result:
+          type: string
+          description: accepted=PVE 已受理；failed=PVE 返回错误（error_message 记录原因）
+          enum: [accepted, failed]
+        error_message:
+          type: string
+          description: 失败原因（已脱敏）；受理成功时省略
+        created_at:
+          type: string
+          format: date-time
+          description: 操作发生时间
+
+    VMOperationsResponse:
+      type: object
+      required: [operations]
+      properties:
+        operations:
+          type: array
+          description: 该 VM 的操作记录（按时间倒序）
+          items:
+            $ref: "#/components/schemas/VMOperation"
