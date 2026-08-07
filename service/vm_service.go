@@ -757,7 +757,13 @@ func sanitizeProvisionError(err error, secrets ...string) string {
 //
 //	*pve.UpstreamError -> PVE 返回的 errors 对象（或响应体）消息；
 //	传输层错误 -> 错误链最末的原因段（如 "connection refused"）。
+//
+// 返回前统一经 truncatePVEErrorMsg 按 rune 截断（maxPVEErrorLen）：PVE
+// 错误体最大可达 1MiB，脱敏后若不截断，超长错误体会进入详情 503、列表
+// warnings 与节点状态降级等一切对外消息（红线：对外错误消息不得暴露内部
+// 细节，且放大响应体）。
 func sanitizePVEError(err error) string {
+	var msg string
 	var upErr *pve.UpstreamError
 	if errors.As(err, &upErr) {
 		if len(upErr.Errors) > 0 {
@@ -770,24 +776,23 @@ func sanitizePVEError(err error) string {
 			for _, k := range keys {
 				parts = append(parts, fmt.Sprintf("%s: %s", k, upErr.Errors[k]))
 			}
-			return strings.Join(parts, ", ")
+			msg = strings.Join(parts, ", ")
+		} else if msg = strings.TrimSpace(upErr.Body); msg == "" {
+			msg = "empty response"
 		}
-		if msg := strings.TrimSpace(upErr.Body); msg != "" {
-			return msg
+	} else {
+		// 网络层错误（节点不可达/TLS/超时）：取错误链最末一个冒号之后的段
+		//（"connect: connection refused" 的最后段是 "connection refused"），
+		// 剥离其中的内部地址与 URL。
+		msg = err.Error()
+		if i := strings.LastIndex(msg, ":"); i >= 0 {
+			msg = strings.TrimSpace(msg[i+1:])
 		}
-		return "empty response"
+		if msg == "" {
+			msg = "unreachable"
+		}
 	}
-	// 网络层错误（节点不可达/TLS/超时）：取错误链最末一个冒号之后的段
-	//（"connect: connection refused" 的最后段是 "connection refused"），
-	// 剥离其中的内部地址与 URL。
-	msg := err.Error()
-	if i := strings.LastIndex(msg, ":"); i >= 0 {
-		msg = strings.TrimSpace(msg[i+1:])
-	}
-	if msg == "" {
-		msg = "unreachable"
-	}
-	return msg
+	return truncatePVEErrorMsg(msg)
 }
 
 // sanitizeOperationError 生成失败操作审计记录（vm_operations.error_message）

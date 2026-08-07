@@ -358,8 +358,85 @@ func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListIte
 	return page, warnings, total, nil
 }
 
-// GetVM 实现透传详情（任务 8.2，设计 D5/D6）：本地元数据加上从 VM 所在节点
-// 读取的实时状态。
+// GetVM 实现透传详情（任务 8.2 + 设计 D5/D6）：id 为数字本地行 id 或 external
+// 合成标识 ext-{nodeID}-{vmid}（parseVMRef 校验，非法标识 -> KindInvalidVMRef
+// -> 400）。数字 id 走本地路径（getLocalVM）；external 分支实时读取该节点
+// PVE 状态并复用 externalVMListItem 构建详情条目——但 ext- 标识指向已托管
+// 的 VM 时改走本地形态返回（与列表差集一致，G1）。
+func (s *VMService) GetVM(ctx context.Context, id string) (*VMListItem, error) {
+	t, err := parseVMRef(id)
+	if err != nil {
+		return nil, err
+	}
+	if t.external {
+		return s.getExternalVM(ctx, t.nodeID, t.vmid)
+	}
+	return s.getLocalVM(ctx, t.localID)
+}
+
+// getExternalVM 实现 external 合成标识的详情查询（设计 D6）：按 nodeID 反查
+// 节点行，实时读取该节点 PVE 状态（单节点 ListVMs + findVM），复用
+// externalVMListItem 构建条目——uuid/ip/created_at/updated_at 为空、规格取
+// PVE 摘要、实时指标透传。
+//
+// 错误映射（复用现有错误 Kind，无新增）：
+//
+//	节点行缺失、节点被禁用或节点调用失败 -> node_unavailable (503)，绝不伪造状态
+//	节点可达但 VM 已移除               -> vm_not_found_on_node (404)
+//
+// ext- 标识指向的 (nodeID, pve_vmid) 已有本地托管行时改走本地形态路径返回
+// （数字 id、含 uuid/ip 等本地字段，与列表差集语义一致），绝不返回 external
+// 形态——与 resolveVMTarget 的生命周期路由先例相同（G1）。
+//
+// PVE 模板同样以 vm_not_found_on_node 呈现：模板是供克隆使用的基础镜像而非
+// 可查看的运行实体（与列表不并入、生命周期拒绝的语义一致）。
+func (s *VMService) getExternalVM(ctx context.Context, nodeID, vmid int64) (*VMListItem, error) {
+	node, err := s.nodeRepo.GetNode(ctx, nodeID)
+	if err != nil {
+		// 节点行已消失（与 vms 行相互独立地被禁用/移除）无法报告实时状态：
+		// 与本地详情路径相同的 node_unavailable 语义，绝不是伪造的状态。
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nodeUnavailablef("node %d of external vm %d not found", nodeID, vmid)
+		}
+		return nil, fmt.Errorf("get external vm %d on node %d: get node: %w", vmid, nodeID, err)
+	}
+	if !node.Enabled {
+		// 节点已被禁用：无法报告实时状态，与 resolveVMTarget 相同的
+		// node_unavailable 语义（S1）。
+		return nil, nodeUnavailablef("node %q is disabled", nodeName(*node))
+	}
+	// 本地托管检查：ext- 标识指向的 (nodeID, pve_vmid) 可能已有本地行
+	//（列表以 PVE 全量摘要与本地记录做差集，两者可能并存）。命中时改走
+	// 本地形态路径（getLocalVM 按数字行 id 读取并合并实时状态），与列表的
+	// 差集呈现、resolveVMTarget 的生命周期路由保持一致（G1）。
+	local, err := s.vmRepo.GetVMByNodeVMID(ctx, nodeID, vmid)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("get external vm %d on node %d: check managed vm: %w", vmid, nodeID, err)
+	}
+	if local != nil {
+		return s.getLocalVM(ctx, local.ID)
+	}
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	vms, err := client.ListVMs(ctx, nodeName(*node))
+	if err != nil {
+		// 节点调用失败是显式错误而非伪造状态。消息经 sanitizePVEError 脱敏
+		//（去掉内部 base URL/host:port 与 API 路径），只保留 PVE 返回的错误
+		// 消息或传输层原因摘要。
+		return nil, nodeUnavailablef("node %q unavailable: %s", nodeName(*node), sanitizePVEError(err))
+	}
+	st, found := findVM(vms, vmid)
+	if !found {
+		return nil, vmNotFoundOnNodef("vm %d not found on node %q", vmid, nodeName(*node))
+	}
+	if st.Template == 1 {
+		return nil, vmNotFoundOnNodef("vm %d on node %q is a pve template", vmid, nodeName(*node))
+	}
+	item := externalVMListItem(nodeID, node.ZoneID, st)
+	return &item, nil
+}
+
+// getLocalVM 是数字本地行 id 的透传详情实现（任务 8.2，设计 D5）：本地元数据
+// 加上从 VM 所在节点读取的实时状态。
 //
 //	VM 行不存在                 -> not_found
 //	pve_vmid == 0               -> creating（已设置 provision_error 时为 failed）
@@ -367,7 +444,7 @@ func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListIte
 //	节点列表调用失败            -> node_unavailable (503)，绝不伪装成
 //	                               creating（任务 8.3）
 //	节点有响应但 VM 不存在      -> creating（设计 D5：PVE 不存在 → 创建中）
-func (s *VMService) GetVM(ctx context.Context, id int64) (*VMListItem, error) {
+func (s *VMService) getLocalVM(ctx context.Context, id int64) (*VMListItem, error) {
 	vm, err := s.vmRepo.GetVM(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

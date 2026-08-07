@@ -1,12 +1,18 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
+
 	"spark/model"
+	"spark/pve"
 	"spark/repository"
 	"spark/service"
 )
@@ -156,5 +162,258 @@ func TestVMListItemExternalSerialization(t *testing.T) {
 		m["cpu"] != float64(4) || m["mem_mb"] != float64(8192) || m["disk_gb"] != float64(100) ||
 		m["node_id"] != float64(3) || m["pve_vmid"] != float64(200) {
 		t.Errorf("external fields = %v, want the PVE summary values", m)
+	}
+}
+
+// ---------- Get handler 测试（vm-page-experience，设计 D6） ----------
+
+// handlerVMStubs 是 handler Get 测试的 VMService 依赖替身集合：仅
+// GetVM（vmRepo）、GetNode（nodeRepo）与 PVE 客户端被使用，其余方法按
+// 未使用处理，返回零值。
+type handlerVMStubs struct {
+	vmRepoGet    *repository.VMWithIP
+	vmRepoGetErr error
+	nodes        []model.PVENode
+	nodeErr      error
+}
+
+func (s *handlerVMStubs) Begin(ctx context.Context) (pgx.Tx, error) { return nil, nil }
+func (s *handlerVMStubs) CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error) {
+	return nil, nil
+}
+func (s *handlerVMStubs) ImportVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error) {
+	return nil, nil
+}
+func (s *handlerVMStubs) GetVMByNodeVMID(ctx context.Context, nodeID, vmid int64) (*model.VM, error) {
+	return nil, pgx.ErrNoRows
+}
+func (s *handlerVMStubs) GetVM(ctx context.Context, id int64) (*repository.VMWithIP, error) {
+	if s.vmRepoGetErr != nil {
+		return nil, s.vmRepoGetErr
+	}
+	if s.vmRepoGet == nil {
+		return nil, pgx.ErrNoRows
+	}
+	return s.vmRepoGet, nil
+}
+func (s *handlerVMStubs) ListVMs(ctx context.Context) ([]repository.VMWithIP, error) { return nil, nil }
+func (s *handlerVMStubs) SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error {
+	return nil
+}
+func (s *handlerVMStubs) UpdateVMPVEVMID(ctx context.Context, id, vmid, diskGB int64) error {
+	return nil
+}
+func (s *handlerVMStubs) SetProvisionError(ctx context.Context, id int64, message string) error {
+	return nil
+}
+func (s *handlerVMStubs) UpdateSpec(ctx context.Context, id int64, newCPU int, newMemMB, newDiskGB int64, oldCPU int, oldMemMB, oldDiskGB int64) error {
+	return nil
+}
+func (s *handlerVMStubs) DeleteVMTx(ctx context.Context, tx pgx.Tx, id int64) error { return nil }
+func (s *handlerVMStubs) CreateOperation(ctx context.Context, op model.VMOperation) (*model.VMOperation, error) {
+	return nil, nil
+}
+func (s *handlerVMStubs) ListOperations(ctx context.Context, nodeID, vmid int64, limit, offset int) ([]model.VMOperation, int, error) {
+	return nil, 0, nil
+}
+func (s *handlerVMStubs) GetPool(ctx context.Context, id int64) (*model.IPPool, error) {
+	return nil, nil
+}
+func (s *handlerVMStubs) ListPoolsByZone(ctx context.Context, zoneID int64) ([]model.IPPool, error) {
+	return nil, nil
+}
+func (s *handlerVMStubs) GetPoolNodes(ctx context.Context, poolID int64) ([]model.PVENode, error) {
+	return nil, nil
+}
+func (s *handlerVMStubs) ClaimFreeIP(ctx context.Context, tx pgx.Tx, poolID int64, vmID *int64) (model.IP, error) {
+	return model.IP{}, nil
+}
+func (s *handlerVMStubs) ClaimIPByAddressTx(ctx context.Context, tx pgx.Tx, poolID int64, ipAddr string, vmID *int64) (model.IP, error) {
+	return model.IP{}, nil
+}
+func (s *handlerVMStubs) ReleaseIPByVMTx(ctx context.Context, tx pgx.Tx, vmID int64) error {
+	return nil
+}
+func (s *handlerVMStubs) GetZone(ctx context.Context, id int64) (*model.Zone, error) { return nil, nil }
+func (s *handlerVMStubs) ListZones(ctx context.Context) ([]model.Zone, error)        { return nil, nil }
+func (s *handlerVMStubs) GetNode(ctx context.Context, id int64) (*model.PVENode, error) {
+	if s.nodeErr != nil {
+		return nil, s.nodeErr
+	}
+	for i := range s.nodes {
+		if s.nodes[i].ID == id {
+			n := s.nodes[i]
+			return &n, nil
+		}
+	}
+	return nil, pgx.ErrNoRows
+}
+func (s *handlerVMStubs) ListEnabledNodesByZone(ctx context.Context, zoneID int64) ([]model.PVENode, error) {
+	return nil, nil
+}
+func (s *handlerVMStubs) ListNodesByIDs(ctx context.Context, ids []int64) ([]model.PVENode, error) {
+	return nil, nil
+}
+
+// stubImageRepo 与 stubStorageRepo 是 VMImageRepository/VMStorageTypeRepository
+// 的最小替身（Get 路径不使用，返回零值）。
+type stubImageRepo struct{}
+
+func (stubImageRepo) Get(ctx context.Context, id int64) (*model.Image, error) { return nil, nil }
+
+type stubStorageRepo struct{}
+
+func (stubStorageRepo) Get(ctx context.Context, id int64) (*model.StorageType, error) {
+	return nil, nil
+}
+
+// newVMGetTestService 装配 handler Get 测试的 VMService：stub 替身集合 +
+// 指向假 PVE 服务器的客户端工厂（cipher 传 nil——Get 路径不触碰密码器）。
+func newVMGetTestService(t *testing.T, stubs *handlerVMStubs, pveSrv *httptest.Server) *service.VMService {
+	t.Helper()
+	svc := service.NewVMService(stubs, stubs, stubs, stubs, stubs, stubs, stubImageRepo{}, stubStorageRepo{}, nil)
+	if pveSrv != nil {
+		svc.SetClientFactory(func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+			return pve.NewClient(host, apiUser, apiTokenSecret,
+				pve.WithBaseURL(pveSrv.URL), pve.WithHTTPClient(pveSrv.Client()), pve.WithTimeout(5*time.Second))
+		})
+	}
+	return svc
+}
+
+// newVMGetEngine 构建挂载 /vms 路由的 gin 引擎（Get 路径测试用）。
+func newVMGetEngine(svc *service.VMService) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	RegisterVMsRoutes(r.Group("/vms"), svc)
+	return r
+}
+
+// TestVMGetExternal 覆盖 GET /vms/ext-{nodeID}-{vmid}：200 + external 条目
+// 形态（合成 id、uuid/created_at 为空、source=external、规格取 PVE 摘要、
+// 实时指标透传）。
+func TestVMGetExternal(t *testing.T) {
+	pveSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data": [{"vmid": 200, "name": "ext-vm", "status": "running", "cpus": 2, "maxmem": 4294967296, "maxdisk": 21474836480, "cpu": 0.5, "mem": 2147483648, "uptime": 77}]}`))
+	}))
+	defer pveSrv.Close()
+
+	stubs := &handlerVMStubs{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 3, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	svc := newVMGetTestService(t, stubs, pveSrv)
+	r := newVMGetEngine(svc)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/ext-1-200", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /vms/ext-1-200 status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["id"] != "ext-1-200" || body["source"] != model.VMSourceExternal {
+		t.Fatalf("id/source = %v / %v, want ext-1-200 / external", body["id"], body["source"])
+	}
+	if body["uuid"] != "" || body["created_at"] != "" || body["updated_at"] != "" {
+		t.Fatalf("uuid/created_at/updated_at = %v/%v/%v, want all empty", body["uuid"], body["created_at"], body["updated_at"])
+	}
+	if body["name"] != "ext-vm" || body["node_id"] != float64(1) || body["pve_vmid"] != float64(200) {
+		t.Fatalf("identity fields = %+v, want ext-vm on node 1 vmid 200", body)
+	}
+	if body["cpu"] != float64(2) || body["mem_mb"] != float64(4096) || body["disk_gb"] != float64(20) {
+		t.Fatalf("spec = %+v, want 2/4096/20 from the PVE summary", body)
+	}
+	if body["status"] != "running" || body["cpu_usage"] != 0.5 || body["uptime"] != float64(77) {
+		t.Fatalf("live = %+v, want running with pass-through metrics", body)
+	}
+}
+
+// TestVMGetNumericNoRegression 覆盖数字 id 不回归：GET /vms/7 -> 200 本地
+// 形态（数字 id、creating 过渡状态）；GET /vms/007 经 parseIDParam 解析后
+// 规范化，与 /vms/7 等价（前导零兼容，保持原路径语义）——规范化后走正常
+// 查询路径：行不存在时与 /vms/7 同样返回 404 not_found，而非 handler 层
+// 的 400。
+func TestVMGetNumericNoRegression(t *testing.T) {
+	stubs := &handlerVMStubs{vmRepoGet: &repository.VMWithIP{
+		VM: model.VM{ID: 7, UUID: "u-7", Name: "vm7", NodeID: 1, PVEVmid: 0,
+			CPU: 2, MemMB: 2048, DiskGB: 10, Source: model.VMSourceSparkCreated},
+		IP: "10.0.0.5",
+	}}
+	svc := newVMGetTestService(t, stubs, nil)
+	r := newVMGetEngine(svc)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/7", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /vms/7 status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["id"] != float64(7) || body["status"] != model.VMStateCreating {
+		t.Fatalf("id/status = %v / %v, want numeric 7 with creating", body["id"], body["status"])
+	}
+	if body["uuid"] != "u-7" || body["source"] != model.VMSourceSparkCreated {
+		t.Fatalf("uuid/source = %v / %v, want the local row values", body["uuid"], body["source"])
+	}
+
+	// GET /vms/007：前导零经 parseIDParam 解析后规范化为 7 再传入服务层，
+	// 与 /vms/7 走同一条查询路径——行不存在时同样 404 not_found，绝不落到
+	// handler 层的 400（规范化是数字 id 的既有语义，非格式拒绝）。
+	svc2 := newVMGetTestService(t, &handlerVMStubs{}, nil)
+	r2 := newVMGetEngine(svc2)
+	w = httptest.NewRecorder()
+	r2.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/007", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GET /vms/007 status = %d, want 404 not_found (body: %s)", w.Code, w.Body.String())
+	}
+	var errBody map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("decode error body of /vms/007: %v", err)
+	}
+	apiErr, ok := errBody["error"].(map[string]any)
+	if !ok || apiErr["code"] != CodeNotFound {
+		t.Fatalf("GET /vms/007 error = %+v, want code %s", errBody, CodeNotFound)
+	}
+}
+
+// TestVMGetInvalidRefs 覆盖 handler 层的 id 格式校验：数字 id 走
+// parseIDParam 原路径（0/负数 400 bad_request）；非数字须匹配 ext- 正则，
+// 非法格式 400 bad_request——包括 /vms/unmanaged 等旧形态请求的契约保持。
+func TestVMGetInvalidRefs(t *testing.T) {
+	svc := newVMGetTestService(t, &handlerVMStubs{}, nil)
+	r := newVMGetEngine(svc)
+	cases := []string{
+		"ext-0-100",  // nodeID 为 0
+		"ext-1-0",    // vmid 为 0
+		"ext-01-100", // nodeID 前导零
+		"ext-1-01",   // vmid 前导零
+		"ext-1",      // 缺段
+		"ext-1-2-3",  // 多余段
+		"ext--1-2",   // 负数
+		"ext-abc-100",
+		"unmanaged", // 已下线接口的旧路径形态，保持 400 bad_request
+		"abc",
+		"0",
+		"-1",
+	}
+	for _, id := range cases {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/"+id, nil))
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("GET /vms/%s status = %d, want 400 (body: %s)", id, w.Code, w.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode error body of %s: %v", id, err)
+		}
+		apiErr, ok := body["error"].(map[string]any)
+		if !ok || apiErr["code"] != "bad_request" {
+			t.Fatalf("GET /vms/%s error = %+v, want code bad_request", id, body)
+		}
 	}
 }

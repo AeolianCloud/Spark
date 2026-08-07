@@ -488,7 +488,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if _, err := svc.GetVM(context.Background(), 404); !isKind(err, KindNotFound) {
+	if _, err := svc.GetVM(context.Background(), "404"); !isKind(err, KindNotFound) {
 		t.Fatalf("missing vm err = %v, want KindNotFound", err)
 	}
 
@@ -499,7 +499,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	item, err := svc2.GetVM(context.Background(), 1)
+	item, err := svc2.GetVM(context.Background(), "1")
 	if err != nil {
 		t.Fatalf("GetVM (creating): %v", err)
 	}
@@ -514,7 +514,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	item, err = svc3.GetVM(context.Background(), 1)
+	item, err = svc3.GetVM(context.Background(), "1")
 	if err != nil {
 		t.Fatalf("GetVM (failed): %v", err)
 	}
@@ -557,7 +557,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{get: vm}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = newClient(ok)
-	item, err := svc.GetVM(context.Background(), 1)
+	item, err := svc.GetVM(context.Background(), "1")
 	if err != nil {
 		t.Fatalf("GetVM: %v", err)
 	}
@@ -573,7 +573,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 	svc2 := newVMService(t, &fakeVMRepository{get: gone}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc2.newClient = newClient(ok)
-	item, err = svc2.GetVM(context.Background(), 1)
+	item, err = svc2.GetVM(context.Background(), "1")
 	if err != nil {
 		t.Fatalf("GetVM (absent): %v", err)
 	}
@@ -586,7 +586,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 	svc3 := newVMService(t, &fakeVMRepository{get: vm2}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc3.newClient = newClient(down)
-	_, err = svc3.GetVM(context.Background(), 1)
+	_, err = svc3.GetVM(context.Background(), "1")
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
@@ -612,7 +612,7 @@ func TestGetVMDetailGetNodeFails(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{get: vm}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = newClient
-	_, err := svc.GetVM(context.Background(), 1)
+	_, err := svc.GetVM(context.Background(), "1")
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable for a missing node row", err)
 	}
@@ -623,8 +623,249 @@ func TestGetVMDetailGetNodeFails(t *testing.T) {
 	svc2 := newVMService(t, &fakeVMRepository{get: vm2}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo2, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc2.newClient = newClient
-	_, err = svc2.GetVM(context.Background(), 1)
+	_, err = svc2.GetVM(context.Background(), "1")
 	if err == nil || isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want a plain error, not node_unavailable", err)
+	}
+}
+
+// ---------- external 详情测试（vm-page-experience，设计 D6） ----------
+
+// TestGetExternalVMDetail 覆盖 ext- 合成标识的详情成功分支：节点 PVE 实时
+// 状态读取、externalVMListItem 字段形态（uuid/ip/created_at/updated_at
+// 为空、规格取 PVE 摘要）与实时指标透传。
+func TestGetExternalVMDetail(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data": [{"vmid": 300, "name": "ext-vm", "status": "running", "cpus": 2, "maxmem": 4294967296, "maxdisk": 21474836480, "cpu": 0.75, "mem": 2147483648, "disk": 1073741824, "uptime": 99}]}`)
+	}))
+	defer ok.Close()
+
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 5, Name: "pve1", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("x", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ok.URL), pve.WithHTTPClient(ok.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	item, err := svc.GetVM(context.Background(), "ext-1-300")
+	if err != nil {
+		t.Fatalf("GetVM ext-1-300: %v", err)
+	}
+	if item.ExternalID != "ext-1-300" || item.Status != "running" {
+		t.Fatalf("item = %+v, want ExternalID ext-1-300 with running status", item)
+	}
+	// 本地行字段保持零值：uuid/ip/created_at/updated_at 空、无镜像/存储绑定。
+	vm := item.VM.VM
+	if vm.UUID != "" || vm.Name != "ext-vm" || vm.Source != model.VMSourceExternal {
+		t.Fatalf("vm fields = %+v, want external source with name from PVE summary", vm)
+	}
+	if vm.ZoneID != 5 || vm.NodeID != 1 || vm.PVEVmid != 300 {
+		t.Fatalf("vm placement = zone %d node %d vmid %d, want zone 5 node 1 vmid 300", vm.ZoneID, vm.NodeID, vm.PVEVmid)
+	}
+	// 规格取 PVE 摘要：2 核 / 4096 MiB / 20 GiB（字节换算）。
+	if vm.CPU != 2 || vm.MemMB != 4096 || vm.DiskGB != 20 {
+		t.Fatalf("spec = %+v, want 2/4096/20 from the PVE summary", vm)
+	}
+	// 实时指标透传。
+	if item.Live == nil || item.Live.CPUUsage != 0.75 || item.Live.Mem != 2147483648 ||
+		item.Live.MaxMem != 4294967296 || item.Live.Uptime != 99 {
+		t.Fatalf("live = %+v, want the pass-through metrics", item.Live)
+	}
+}
+
+// TestGetExternalVMNodeMissing 覆盖 ext- 详情的节点行缺失分支：与本地详情
+// 路径相同的 node_unavailable（503）语义，绝不伪造状态。
+func TestGetExternalVMNodeMissing(t *testing.T) {
+	ts := noCallServer(t)
+	defer ts.Close()
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{{ID: 1, Name: "pve1"}}}
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("x", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	_, err := svc.GetVM(context.Background(), "ext-99-300")
+	if !isKind(err, KindNodeUnavailable) {
+		t.Fatalf("err = %v, want KindNodeUnavailable for a missing node row", err)
+	}
+}
+
+// TestGetExternalVMNodeUnreachable 覆盖 ext- 详情的节点调用失败分支：
+// node_unavailable（503），错误消息带节点名与脱敏原因，绝不伪装状态。
+func TestGetExternalVMNodeUnreachable(t *testing.T) {
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"errors": {"_": "bad gateway"}}`)
+	}))
+	defer down.Close()
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 5, Name: "pve1", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("x", apiUser, apiTokenSecret,
+			pve.WithBaseURL(down.URL), pve.WithHTTPClient(down.Client()), pve.WithTimeout(5*time.Second))
+	}
+	_, err := svc.GetVM(context.Background(), "ext-1-300")
+	if !isKind(err, KindNodeUnavailable) {
+		t.Fatalf("err = %v, want KindNodeUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "pve1") || !strings.Contains(err.Error(), "bad gateway") {
+		t.Fatalf("err = %q, want the node name and the sanitized reason", err)
+	}
+}
+
+// TestGetExternalVMRemoved 覆盖 ext- 详情的两个 404 场景：节点可达但 VM 已
+// 从 PVE 移除 -> vm_not_found_on_node；PVE 模板同样以 vm_not_found_on_node
+// 呈现（模板不是可查看的运行实体）。
+func TestGetExternalVMRemoved(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data": [{"vmid": 300, "name": "vm1", "status": "running", "cpus": 1, "maxmem": 1073741824, "maxdisk": 10737418240}]}`)
+	}))
+	defer ok.Close()
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 5, Name: "pve1", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	newClient := func(srv *httptest.Server) func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+			return pve.NewClient("x", apiUser, apiTokenSecret,
+				pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
+		}
+	}
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = newClient(ok)
+
+	// VM 已从 PVE 移除（vmid 不在列表中）。
+	_, err := svc.GetVM(context.Background(), "ext-1-999")
+	if !isKind(err, KindVMNotFoundOnNode) {
+		t.Fatalf("err = %v, want KindVMNotFoundOnNode for a removed vm", err)
+	}
+
+	// PVE 模板：同样 404，不对外提供详情。
+	tpl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data": [{"vmid": 400, "name": "base-template", "status": "stopped", "cpus": 1, "maxmem": 1073741824, "maxdisk": 10737418240, "template": 1}]}`)
+	}))
+	defer tpl.Close()
+	svc2 := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc2.newClient = newClient(tpl)
+	_, err = svc2.GetVM(context.Background(), "ext-1-400")
+	if !isKind(err, KindVMNotFoundOnNode) {
+		t.Fatalf("err = %v, want KindVMNotFoundOnNode for a pve template", err)
+	}
+}
+
+// TestGetExternalVMManagedRoutesLocal 覆盖 G1：ext- 标识指向的
+// (nodeID, pve_vmid) 已有本地托管行时，详情改走本地形态路径返回——数字
+// 行 id、uuid/ip 等本地字段齐全、规格取本地 DB 值（而非 PVE 摘要），与
+// 列表差集与 resolveVMTarget 的生命周期路由语义一致。
+func TestGetExternalVMManagedRoutesLocal(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data": [{"vmid": 300, "name": "pve-name", "status": "running", "cpus": 2, "maxmem": 1073741824, "maxdisk": 10737418240, "cpu": 0.75, "mem": 536870912, "uptime": 99}]}`)
+	}))
+	defer ok.Close()
+
+	managed := &repository.VMWithIP{
+		VM: model.VM{ID: 7, UUID: "u-7", Name: "vm7", NodeID: 1, PVEVmid: 300,
+			CPU: 4, MemMB: 4096, DiskGB: 30, Source: model.VMSourceClaimed},
+		IP: "10.0.0.7",
+	}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 5, Name: "pve1", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	// getByNodeVMID 命中本地托管行（ID 7），GetVM 按行 id 返回本地形态。
+	vmRepo := &fakeVMRepository{getByNodeVMID: &managed.VM, get: managed}
+	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("x", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ok.URL), pve.WithHTTPClient(ok.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	item, err := svc.GetVM(context.Background(), "ext-1-300")
+	if err != nil {
+		t.Fatalf("GetVM ext-1-300 (managed): %v", err)
+	}
+	// 本地形态：无 ExternalID，数字行 id 与本地字段（uuid/ip/source）齐全。
+	if item.ExternalID != "" {
+		t.Fatalf("ExternalID = %q, want empty for a managed vm", item.ExternalID)
+	}
+	if item.VM.VM.ID != 7 || item.VM.VM.UUID != "u-7" || item.VM.VM.Name != "vm7" ||
+		item.VM.VM.Source != model.VMSourceClaimed || item.VM.IP != "10.0.0.7" {
+		t.Fatalf("vm = %+v, want the local row values (id 7 / uuid u-7 / claimed / ip)", item.VM)
+	}
+	// 规格取本地 DB 值（4/4096/30）而非 PVE 摘要（cpus 2）。
+	if item.VM.VM.CPU != 4 || item.VM.VM.MemMB != 4096 || item.VM.VM.DiskGB != 30 {
+		t.Fatalf("spec = %+v, want the local row spec 4/4096/30", item.VM.VM)
+	}
+	// 实时状态照常从 PVE 合并。
+	if item.Status != "running" || item.Live == nil || item.Live.CPUUsage != 0.75 {
+		t.Fatalf("live = %+v, want running with pass-through metrics", item)
+	}
+}
+
+// TestGetExternalVMNodeDisabled 覆盖 S1：ext- 详情的节点已被禁用时返回
+// node_unavailable（503），与 resolveVMTarget 的先例一致，绝不报告状态。
+func TestGetExternalVMNodeDisabled(t *testing.T) {
+	ts := noCallServer(t)
+	defer ts.Close()
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 5, Name: "pve1", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: false},
+	}}
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("x", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	_, err := svc.GetVM(context.Background(), "ext-1-300")
+	if !isKind(err, KindNodeUnavailable) {
+		t.Fatalf("err = %v, want KindNodeUnavailable for a disabled node", err)
+	}
+}
+
+// TestGetVMInvalidRefs 覆盖 ext- 合成标识与数字 id 的格式校验边界：前导零、
+// 0 段、缺段、多余段、负数、非数字、int64 溢出段、非 ASCII 数字等一律
+// KindInvalidVMRef（400 invalid_vm_id）。
+func TestGetVMInvalidRefs(t *testing.T) {
+	ts := noCallServer(t)
+	defer ts.Close()
+	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
+		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("x", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+	cases := []string{
+		"ext-0-100",                    // nodeID 为 0
+		"ext-1-0",                      // vmid 为 0
+		"ext-01-100",                   // nodeID 前导零
+		"ext-1-01",                     // vmid 前导零
+		"ext-1",                        // 缺段
+		"ext-1-2-3",                    // 多余段
+		"ext--1-2",                     // 负数（nodeID 段为空）
+		"ext-1--2",                     // 负数（vmid 段为空）
+		"ext-abc-100",                  // 非数字段
+		"ext-",                         // 空 rest
+		"ext-9999999999999999999999-2", // nodeID 段超出 int64 范围（ParseInt 溢出）
+		"ext-1-9999999999999999999999", // vmid 段超出 int64 范围（ParseInt 溢出）
+		"ext-１-２",                      // 全角数字（非 ASCII，正则不匹配）
+		"-1",                           // 负数数字 id
+		"0",                            // 0 数字 id
+		"007",                          // 数字 id 前导零
+		"9223372036854775808",          // 数字 id 超出 int64 范围（MaxInt64+1，ParseInt 溢出）
+		"abc",                          // 非数字非 ext-
+	}
+	for _, id := range cases {
+		_, err := svc.GetVM(context.Background(), id)
+		if !isKind(err, KindInvalidVMRef) {
+			t.Fatalf("GetVM(%q) err = %v, want KindInvalidVMRef", id, err)
+		}
 	}
 }
