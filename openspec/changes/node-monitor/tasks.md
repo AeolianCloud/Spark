@@ -23,7 +23,7 @@
 - [x] 4.2 同步 `api/swagger/openapi.yaml` 双副本并校验字节一致
 - [x] 4.3 `npx --yes @redocly/cli lint docs/openapi.yaml` 通过
 - [x] 4.4 契约同步：NodeStatusField 新增 `net_io`（NodeNetIO：net_in/net_out，number，bytes/s），NodeNetStatus 删除 rx_bytes/tx_bytes（active 保持 nullable boolean），双副本字节一致
-- [ ] 4.5 前端 `npm run api:check` 通过（生成的 client 已用 `npm run api:gen` 重新生成且与契约一致；api:check 的 git diff 校验需生成物提交入库后通过，待提交）
+- [x] 4.5 前端 `npm run api:check` 通过（生成的 client 已用 `npm run api:gen` 重新生成且与契约一致；生成物已提交，api:check 通过）
 
 ## 5. 前端
 
