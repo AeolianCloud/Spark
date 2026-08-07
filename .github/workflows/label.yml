@@ -1,0 +1,15 @@
+# 自动打标签：PR 打开/更新时按变更路径添加 area 标签（配置见 .github/labeler.yml）
+name: labeler
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          configuration-path: .github/labeler.yml
