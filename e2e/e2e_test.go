@@ -68,10 +68,29 @@ type fakePVE struct {
 	// PVE 错误（HTTP 500 + errors 封装）：模拟 PVE 拒绝操作，供"失败
 	// 操作也写入审计记录"的端到端断言使用。值为 PVE 错误消息。
 	statusErrors map[int64]string
+	// importFiles 模拟各存储上已下载完成的镜像文件（键为存储名，如
+	// "local"）。镜像重构后节点上的镜像存在性由 PVE 实时扫描
+	// GET /nodes/{node}/storage/{storage}/content?content=import 得出，
+	// 下载经 POST .../download-url 异步完成——fake 用该 map 模拟下载
+	// 结果，创建 VM 时的节点选择（selectPoolAndNode 按文件名匹配）与
+	// 镜像存在状态查询都依赖它。当前 fake 只有单节点 pve1，按存储名
+	// 存即可；若将来模拟多节点，需改为按"节点名+存储名"存储（不同
+	// 节点的存储互不可见）。
+	importFiles map[string][]string
 }
 
 func newFakePVE(t *testing.T) *fakePVE {
-	return &fakePVE{t: t, nextVMID: 100, vms: map[int64]*fakePVEVM{}, statusErrors: map[int64]string{}}
+	return &fakePVE{t: t, nextVMID: 100, vms: map[int64]*fakePVEVM{}, statusErrors: map[int64]string{}, importFiles: map[string][]string{}}
+}
+
+// addImportFile 向指定存储登记一个已下载完成的镜像文件（模拟 PVE 侧
+// 下载任务完成后的结果，与 handleDownloadURL 写入同一份 importFiles
+// 状态）。之后对 /content?content=import 的扫描即可看到该文件，创建 VM
+// 的节点选择才会放行。
+func (f *fakePVE) addImportFile(storage, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.importFiles[storage] = append(f.importFiles[storage], name)
 }
 
 // upid 构造一个可解析的 UPID，其节点段为发起请求的节点，这样
@@ -136,6 +155,10 @@ func (f *fakePVE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.handleStatus(w, parts[1], parts[3], parts[5])
 	case len(parts) == 4 && parts[0] == "nodes" && parts[2] == "qemu" && r.Method == http.MethodDelete:
 		f.handleDelete(w, parts[1], parts[3])
+	case len(parts) == 5 && parts[0] == "nodes" && parts[2] == "storage" && parts[4] == "content" && r.Method == http.MethodGet:
+		f.handleStorageContent(w, r, parts[3])
+	case len(parts) == 5 && parts[0] == "nodes" && parts[2] == "storage" && parts[4] == "download-url" && r.Method == http.MethodPost:
+		f.handleDownloadURL(w, r, parts[1], parts[3])
 	case len(parts) == 5 && parts[0] == "nodes" && parts[2] == "tasks" && parts[4] == "status" && r.Method == http.MethodGet:
 		// 所有 fake 任务都会立即以 exitstatus OK 完成。
 		f.writeJSON(w, map[string]any{
@@ -219,6 +242,56 @@ func (f *fakePVE) handleList(w http.ResponseWriter, node string) {
 	}
 	f.mu.Unlock()
 	f.writeJSON(w, list)
+}
+
+// handleStorageContent 实现 GET /nodes/{node}/storage/{storage}/content：
+// content=import（或未指定）时返回该存储上"已下载完成"的镜像文件条目
+// （importFiles 模拟的 PVE 下载结果，volid 为 {storage}:import/{name}），
+// 其它 content 类型（iso/vztmpl 等）返回空数组——本仓库只关心 import
+// 目录。响应条目按真实 PVE 格式返回（无 name 字段，已实测），文件名由
+// pve 层从 volid 推导，以覆盖真实环境形态、防止回归。
+func (f *fakePVE) handleStorageContent(w http.ResponseWriter, r *http.Request, storage string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ct := r.URL.Query().Get("content"); ct != "" && ct != "import" {
+		f.writeJSON(w, []any{})
+		return
+	}
+	items := make([]map[string]any, 0, len(f.importFiles[storage]))
+	for _, name := range f.importFiles[storage] {
+		items = append(items, map[string]any{
+			"volid":   fmt.Sprintf("%s:import/%s", storage, name),
+			"content": "import",
+			"format":  "qcow2",
+			"size":    0,
+		})
+	}
+	f.writeJSON(w, items)
+}
+
+// handleDownloadURL 实现 POST /nodes/{node}/storage/{storage}/download-url：
+// 解析 form 参数（content/filename/url），把 filename 加入 importFiles
+// 模拟下载任务立即完成，并返回一个 download 类型的 UPID（WaitTask 轮询
+// status 端点会立即得到 done）。filename 以 "e2e-fail-" 开头时返回
+// HTTP 500 + errors 封装，模拟 PVE 拒绝受理，供下载失败路径的端到端
+// 断言使用。
+func (f *fakePVE) handleDownloadURL(w http.ResponseWriter, r *http.Request, node, storage string) {
+	if err := r.ParseForm(); err != nil {
+		f.t.Errorf("fake pve: parse download-url form: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		f.writeJSON(w, map[string]any{"_": "bad form"})
+		return
+	}
+	filename := r.FormValue("filename")
+	if strings.HasPrefix(filename, "e2e-fail-") {
+		w.WriteHeader(http.StatusInternalServerError)
+		f.writeJSON(w, map[string]any{"errors": map[string]string{"_": "simulated download failure"}})
+		return
+	}
+	if filename != "" {
+		f.addImportFile(storage, filename)
+	}
+	f.writeJSON(w, f.upid(node, "download", 0))
 }
 
 func (f *fakePVE) handleGetConfig(w http.ResponseWriter, vmid string) {
@@ -584,8 +657,11 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	stID := int64(st["id"].(float64))
 
 	img := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/images", map[string]any{
-		"name": "debian-12-cloud", "default_user": "debian",
-		"node_images": map[string]string{"pve1": "/var/lib/vz/images/debian-12-cloud.qcow2"},
+		"name":         "debian-12-cloud",
+		"default_user": "debian",
+		// 镜像重构后登记改为 download_url：文件由节点代发下载，创建 VM 的
+		// scsi0 import-from 使用下载出的文件名对应的 volid。
+		"download_url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2",
 	}, http.StatusCreated))
 	imgID := int64(img["id"].(float64))
 
@@ -598,6 +674,25 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 		vmMemMB = int64(2048)
 		vmDisk  = int64(10)
 	)
+
+	// 1b. 镜像尚未下载到节点上：创建 VM 被 400 image_not_available_in_zone
+	// 拒绝（selectPoolAndNode 扫描节点 content 无匹配），此时不落库、不占 IP。
+	notAvail := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms", map[string]any{
+		"name": vmName, "cpu": vmCPU, "mem_mb": vmMemMB, "disk_gb": vmDisk,
+		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": vmPW,
+	}, http.StatusBadRequest))
+	notAvailErr := e2eObj(t, notAvail["error"])
+	if code, _ := notAvailErr["code"].(string); code != "image_not_available_in_zone" {
+		t.Fatalf("create vm without image on node: error code = %q, want image_not_available_in_zone", code)
+	}
+
+	// 预置节点上的镜像文件（模拟 download 异步完成后 PVE 侧已存在，与 fake
+	// download-url 端点写入同一份 importFiles 状态）：创建 VM 的节点选择
+	// 扫描 local/import 才能命中镜像并生成 volid。
+	fakePVE.addImportFile("local", "debian-12-genericcloud-amd64.qcow2")
+
+	// 2. 创建虚拟机：201、已分配 IP、过渡状态 "creating"
+	// （PVE 侧此时还不存在）。
 	created := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms", map[string]any{
 		"name": vmName, "cpu": vmCPU, "mem_mb": vmMemMB, "disk_gb": vmDisk,
 		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": vmPW,
@@ -653,8 +748,8 @@ provisioned:
 		}
 	}
 	scsi0 := fmt.Sprintf("%v", body["scsi0"])
-	if !strings.HasPrefix(scsi0, "local-lvm:") || !strings.Contains(scsi0, "import-from=/var/lib/vz/images/debian-12-cloud.qcow2") {
-		t.Fatalf("scsi0 = %q, want local-lvm storage with import-from", scsi0)
+	if !strings.HasPrefix(scsi0, "local-lvm:") || !strings.Contains(scsi0, "import-from=local:import/debian-12-genericcloud-amd64.qcow2") {
+		t.Fatalf("scsi0 = %q, want local-lvm storage with import-from volid", scsi0)
 	}
 	assertCreate("ide2", "local-lvm:cloudinit")
 	if net0 := fmt.Sprintf("%v", body["net0"]); !strings.Contains(net0, "vmbr0") {
@@ -1171,5 +1266,238 @@ provisioned:
 	noOpsErr := e2eObj(t, noOpsVM["error"])
 	if code, _ := noOpsErr["code"].(string); code != "not_found" {
 		t.Fatalf("operations of missing vm: error code = %q, want not_found", code)
+	}
+}
+
+// TestE2EImageDownloadLifecycle 覆盖镜像重构后的登记-下载-调度链路
+// （镜像任务 8.1）：注册镜像（download_url，不再有 node_images）后节点上
+// 尚未存在该文件（nodes-status downloaded=false、区域可用镜像列表为空），
+// POST download（zone 模式）受理后轮询 operations 直至 success，节点状态
+// 翻转为 downloaded=true（volid 可见），随后创建 VM 被调度到持有镜像的
+// 节点（scsi0 import-from 使用 volid 而非路径）；下载失败路径（fake 注入
+// download-url 500）落 failed 记录且错误消息经脱敏（不含内部 host:port）。
+func TestE2EImageDownloadLifecycle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+
+	pool, err := database.New(ctx, e2eDSN())
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	defer pool.Close()
+
+	if err := database.Migrate(ctx, pool, database.MigrationFS); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	truncateBusinessTables(t, ctx, pool)
+	defer truncateBusinessTables(t, ctx, pool)
+
+	fakePVE := newFakePVE(t)
+	pveServer := httptest.NewTLSServer(fakePVE)
+	defer pveServer.Close()
+	pvePort := pveServer.Listener.Addr().(*net.TCPAddr).Port
+
+	// 镜像服务同样需要指向 fake PVE 的客户端工厂（WithImageClientFactory），
+	// 否则存在性扫描与下载编排会连接节点登记的默认端口（8006）。
+	newFakeClient := func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient(host, apiUser, apiTokenSecret,
+			pve.WithPort(port),
+			pve.WithHTTPClient(pveServer.Client()),
+			pve.WithTimeout(5*time.Second))
+	}
+	router := api.NewRouter(pool, e2eCipher(t),
+		api.WithVMClientFactory(newFakeClient),
+		api.WithImageClientFactory(newFakeClient))
+	app := httptest.NewServer(router)
+	defer app.Close()
+
+	client := app.Client()
+	base := app.URL
+
+	// 注册部署环境：zone、node、IP 池 + 节点白名单、存储类型。
+	zone := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/zones", map[string]any{"name": "e2e-img-zone"}, http.StatusCreated))
+	zoneID := int64(zone["id"].(float64))
+	node := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
+		fmt.Sprintf("/zones/%d/nodes", zoneID),
+		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
+		http.StatusCreated))
+	nodeID := int64(node["id"].(float64))
+	poolRes := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/ip-pools", map[string]any{
+		"zone_id": zoneID, "name": "e2e-img-pool", "network_cidr": "10.8.0.0/24",
+		"gateway": "10.8.0.1", "dns": "1.1.1.1",
+	}, http.StatusCreated))
+	poolID := int64(poolRes["id"].(float64))
+	e2eDo(t, client, base, http.MethodPut, fmt.Sprintf("/ip-pools/%d/nodes", poolID),
+		map[string]any{"node_ids": []int64{nodeID}}, http.StatusOK)
+	st := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/storage-types", map[string]any{
+		"name": "ssd", "display_name": "SSD", "pve_storage": "local-lvm",
+	}, http.StatusCreated))
+	stID := int64(st["id"].(float64))
+
+	// 1. 登记镜像（download_url）：登记本身不产生任何节点上的文件。
+	const imgURL = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+	img := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/images", map[string]any{
+		"name": "e2e-image-download", "default_user": "debian", "download_url": imgURL,
+	}, http.StatusCreated))
+	imgID := int64(img["id"].(float64))
+
+	// 2. 登记后节点状态：pve1 上 downloaded=false（PVE 实时扫描 import 目录）。
+	statuses := e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/images/%d/nodes-status?zone_id=%d", imgID, zoneID), nil, http.StatusOK).([]any)
+	if len(statuses) != 1 {
+		t.Fatalf("nodes-status = %+v, want 1 status", statuses)
+	}
+	st0 := e2eObj(t, statuses[0])
+	if st0["node_id"] != float64(nodeID) || st0["node_name"] != "pve1" || st0["downloaded"] != false {
+		t.Fatalf("nodes-status[0] = %+v, want pve1 not downloaded", st0)
+	}
+
+	// 3. 区域可用镜像列表为空（没有任何节点持有该镜像）。
+	if zoneImgs := e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/images?zone_id=%d", zoneID), nil, http.StatusOK).([]any); len(zoneImgs) != 0 {
+		t.Fatalf("GET /images?zone_id=%d = %+v, want empty (image not downloaded yet)", zoneID, zoneImgs)
+	}
+
+	// 4. 受理下载（zone 模式）：202 + Location 指向 operations + 一条
+	// running 记录（每节点一条）。
+	dlReq, err := http.NewRequest(http.MethodPost, base+fmt.Sprintf("/images/%d/download", imgID),
+		strings.NewReader(fmt.Sprintf(`{"zone_id":%d}`, zoneID)))
+	if err != nil {
+		t.Fatalf("build image download request: %v", err)
+	}
+	dlReq.Header.Set("Content-Type", "application/json")
+	dlResp, err := client.Do(dlReq)
+	if err != nil {
+		t.Fatalf("POST /images/%d/download: %v", imgID, err)
+	}
+	defer dlResp.Body.Close()
+	if dlResp.StatusCode != http.StatusAccepted {
+		raw := make([]byte, 4096)
+		n, _ := dlResp.Body.Read(raw)
+		t.Fatalf("POST /images/%d/download: status %d, want 202 (body: %s)", imgID, dlResp.StatusCode, strings.TrimSpace(string(raw[:n])))
+	}
+	if loc := dlResp.Header.Get("Location"); loc != fmt.Sprintf("/images/%d/operations", imgID) {
+		t.Fatalf("download Location = %q, want /images/%d/operations", loc, imgID)
+	}
+	var dlOps []any
+	if err := json.NewDecoder(dlResp.Body).Decode(&dlOps); err != nil {
+		t.Fatalf("decode download response: %v", err)
+	}
+	if len(dlOps) != 1 {
+		t.Fatalf("download response ops = %+v, want 1 running record", dlOps)
+	}
+	dlOp := e2eObj(t, dlOps[0])
+	if dlOp["node_id"] != float64(nodeID) || dlOp["action"] != "download" || dlOp["result"] != "running" {
+		t.Fatalf("download op = %+v, want node %d download running", dlOp, nodeID)
+	}
+
+	// 5. 轮询 operations 直至 download 终态 success（后台 goroutine 先
+	// 受理再 WaitTask，fake 任务立即 done）。
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		raw := e2eDo(t, client, base, http.MethodGet,
+			fmt.Sprintf("/images/%d/operations", imgID), nil, http.StatusOK)
+		ops := raw.([]any)
+		if len(ops) > 0 {
+			op := e2eObj(t, ops[0])
+			if op["result"] == "success" {
+				if op["node_id"] != float64(nodeID) || op["action"] != "download" {
+					t.Fatalf("success op = %+v, want node %d download", op, nodeID)
+				}
+				if upid, _ := op["upid"].(string); !strings.HasPrefix(upid, "UPID:") {
+					t.Fatalf("success op upid = %v, want a UPID", op["upid"])
+				}
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("image download did not finish within 10s (ops: %+v)", raw)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// 6. 节点状态翻转：downloaded=true 且 volid 为 local:import/... 卷 ID
+	//（fake 的 download-url 端点把文件写入了 importFiles）。
+	statuses = e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/images/%d/nodes-status?zone_id=%d", imgID, zoneID), nil, http.StatusOK).([]any)
+	if len(statuses) != 1 {
+		t.Fatalf("nodes-status after download = %+v, want 1 status", statuses)
+	}
+	st0 = e2eObj(t, statuses[0])
+	if st0["downloaded"] != true || st0["volid"] != "local:import/debian-12-genericcloud-amd64.qcow2" {
+		t.Fatalf("nodes-status[0] after download = %+v, want downloaded=true with volid", st0)
+	}
+
+	// 7. 创建 VM：调度到持有镜像的节点（pve1），scsi0 import-from 使用
+	// volid 而非文件路径（与旧版 node_images 路径语义不同）。
+	created := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms", map[string]any{
+		"name": "e2e-img-vm", "cpu": 1, "mem_mb": 1024, "disk_gb": 10,
+		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": "s3cret-pw",
+	}, http.StatusCreated))
+	vmID := int64(created["id"].(float64))
+	deadline = time.Now().Add(15 * time.Second)
+	for {
+		detail := e2eObj(t, e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
+		if detail["status"] == "failed" {
+			t.Fatalf("provisioning failed: %v", detail["provision_error"])
+		}
+		if detail["status"] != "creating" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provisioning did not finish within 15s")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if vm := fakePVE.get(100); vm == nil {
+		t.Fatal("fake pve has no VM 100 after image-scheduled create")
+	} else {
+		scsi0 := fmt.Sprintf("%v", vm.createBody["scsi0"])
+		if !strings.Contains(scsi0, "import-from=local:import/debian-12-genericcloud-amd64.qcow2") {
+			t.Fatalf("scsi0 = %q, want import-from volid of the downloaded image", scsi0)
+		}
+	}
+	detail := e2eObj(t, e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
+	if detail["node_id"] != float64(nodeID) || detail["pve_vmid"] != float64(100) {
+		t.Fatalf("scheduled vm = node_id=%v pve_vmid=%v, want node %d vmid 100",
+			detail["node_id"], detail["pve_vmid"], nodeID)
+	}
+	// 销毁，保持数据干净。
+	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusNoContent)
+
+	// 8. 下载失败路径：fake 对 e2e-fail- 前缀的文件名拒绝受理
+	//（HTTP 500 + errors），操作落 failed 且 upid 为空、错误消息脱敏
+	//（不含内部 host:port）。
+	failImg := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/images", map[string]any{
+		"name": "e2e-image-fail", "default_user": "debian",
+		"download_url": "https://cloud.debian.org/images/cloud/bookworm/latest/e2e-fail-image.qcow2",
+	}, http.StatusCreated))
+	failImgID := int64(failImg["id"].(float64))
+	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/images/%d/download", failImgID),
+		map[string]any{"node_ids": []int64{nodeID}}, http.StatusAccepted)
+	deadline = time.Now().Add(10 * time.Second)
+	var failedOp map[string]any
+	for {
+		raw := e2eDo(t, client, base, http.MethodGet,
+			fmt.Sprintf("/images/%d/operations", failImgID), nil, http.StatusOK)
+		ops := raw.([]any)
+		if len(ops) > 0 {
+			failedOp = e2eObj(t, ops[0])
+			if failedOp["result"] == "failed" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("failed image download did not settle within 10s (ops: %+v)", raw)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	msg, _ := failedOp["error_message"].(string)
+	if !strings.Contains(msg, "simulated download failure") || strings.Contains(msg, "127.0.0.1") {
+		t.Fatalf("failed op error_message = %q, want sanitized message containing simulated download failure", msg)
+	}
+	if upid, ok := failedOp["upid"]; ok && upid != "" {
+		t.Fatalf("failed op upid = %v, want empty (受理失败)", upid)
 	}
 }
