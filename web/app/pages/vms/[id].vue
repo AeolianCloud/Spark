@@ -1,18 +1,22 @@
 <script setup lang="ts">
 /**
- * VM 详情页（4.3/4.5）：
+ * VM 详情页（4.3/4.5 + design D7）：
  * - 信息区：名称/状态/UUID/PVE VMID/IP/规格/所属 Zone 与节点/创建更新时间/provision_error
  * - 实时状态区：cpu_usage/内存/磁盘/uptime（穿透字段缺省表示停机或无 PVE 对端）
  *   PVE 不可达时 getVM 返回 503 node_unavailable，展示降级提示而非伪造状态
- * - 生命周期操作：启动/停止/重启（202 受理即成功）、调整规格（部分更新语义，磁盘只增）、
- *   销毁（二次确认）；失败均展示后端错误且状态不变
+ * - 路由参数支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}；
+ *   external 条目（未纳管）：本地字段（UUID/IP/创建更新时间）展示「—」+ 认领入口，
+ *   无调整规格入口；认领成功后 ext- 标识按本地形态返回，就地刷新为本地形态
+ * - 生命周期操作：启动/停止/重启（受理后观察轮询 useVMPendingAction 直至 PVE 生效，
+ *   两段式 toast）、调整规格（部分更新语义，磁盘只增）、销毁（二次确认）；
+ *   失败均展示后端错误且状态不变
  */
 import type { ResizeRequest, VMListItem } from '~/api'
-import { ApiError, destroyVM, getVM, resizeVM, restartVM, startVM, stopVM } from '~/api'
+import { ApiError, destroyVM, getVM, resizeVM } from '~/api'
 import { useCatalog } from '~/composables/useCatalog'
+import { useVMPendingAction } from '~/composables/useVMPendingAction'
 import { formatDateTime } from '~/utils/format'
 import {
-  canResizeVM,
   formatBytes,
   formatMemMB,
   formatUptime
@@ -23,16 +27,29 @@ const router = useRouter()
 const toast = useToast()
 const { refresh: refreshCatalog, zoneName, nodeName } = useCatalog()
 
-// 路由参数：/vms/:id；非法值（NaN/非正整数）防御：不向 API 发请求（与 zones/[zoneId]/nodes.vue 模式一致）
-const vmId = computed(() => {
-  const n = Number(route.params.id)
-  return Number.isInteger(n) && n > 0 ? n : 0
+// 路由参数：/vms/:id；数字本地行 id 或 external 合成标识 ext-{nodeID}-{vmid}
+// （nodeID/vmid 均为无前导零正整数，契约 PathVMID 同款 pattern）；
+// 非法值（NaN/非正整数）防御：不向 API 发请求（与 zones/[zoneId]/nodes.vue 模式一致）
+const EXTERNAL_ID_PATTERN = /^ext-[1-9][0-9]*-[1-9][0-9]*$/
+const vmId = computed<string | number>(() => {
+  const raw = String(route.params.id ?? '')
+  if (EXTERNAL_ID_PATTERN.test(raw)) return raw
+  if (/^[1-9][0-9]*$/.test(raw)) {
+    // 数字 id 精度防御：超出 JS 安全整数范围时不做 Number 转换（精度损失会让
+    // 请求目标与用户输入不一致），按非法值处理（后端 int64 兜底）
+    const n = Number(raw)
+    return Number.isSafeInteger(n) ? n : 0
+  }
+  return 0
 })
 
 // ---- 详情数据 ----
 const vm = ref<VMListItem | null>(null)
 const loading = ref(true)
 const error = ref<ApiError | null>(null)
+
+// 未纳管（external）判定：本地字段缺省展示占位、无调整规格入口、展示认领提示
+const isExternal = computed(() => vm.value?.source === 'external')
 
 // 请求序号守卫：快速切换路由（组件复用）时丢弃过期响应，防止旧 VM 数据覆盖新 VM
 let fetchSeq = 0
@@ -43,8 +60,8 @@ async function fetchVM(): Promise<void> {
   loading.value = true
   error.value = null
   try {
-    // 路由参数非法：直接展示错误，避免以 NaN/0 发起请求
-    if (!id) {
+    // 路由参数非法：直接展示错误，避免以 0 发起请求
+    if (id === 0) {
       error.value = new ApiError(400, 'bad_request', 'VM ID 不合法')
       return
     }
@@ -61,8 +78,11 @@ async function fetchVM(): Promise<void> {
   }
 }
 
-// 路由参数变化（如从列表进入另一台 VM 时组件复用）→ 清空旧数据并重新拉取
+// 路由参数变化（如从列表进入另一台 VM 时组件复用）→ 先终止上一台 VM 的在途观察
+// （清 pending/停轮询/递增序号丢弃在途响应，防止旧 VM 观测结果回写新 VM 页面、
+// destroyVM/resizeVM 误作用于旧 VM），再清空旧数据并重新拉取
 watch(() => route.params.id, () => {
+  stopPendingAction()
   vm.value = null
   error.value = null
   void fetchVM()
@@ -102,33 +122,24 @@ const diskPercent = computed(() => {
   return clampPercent((v.disk / v.maxdisk) * 100)
 })
 
-// ---- 生命周期操作（4.5）：202 受理即成功；失败展示后端错误且状态不变 ----
-const actionBusy = ref(false)
-const actionError = ref<ApiError | null>(null)
-
-const ACTION_LABELS = { start: '启动', stop: '关闭', restart: '重启' } as const
-type LifecycleAction = keyof typeof ACTION_LABELS
-
-async function runLifecycle(action: LifecycleAction): Promise<void> {
-  if (!vm.value || actionBusy.value) return
-  actionBusy.value = true
-  actionError.value = null
-  try {
-    const fn = action === 'start' ? startVM : action === 'stop' ? stopVM : restartVM
-    await fn(vm.value.id)
-    toast.add({
-      title: '操作已受理',
-      description: `已提交${ACTION_LABELS[action]}，异步生效，稍后可点击刷新查看最新状态`,
-      color: 'success',
-      icon: 'i-lucide-check-circle-2'
-    })
+// ---- 生命周期操作（4.5 + design D1/D2/D3/D5）：受理 → 观察轮询 → 结果 toast ----
+// 观察轮询单查目标 VM（3s），与页面刷新互不干扰（fetchSeq 守卫最后意图胜出）
+const { pending, pendingError, run, stop: stopPendingAction } = useVMPendingAction({
+  // 当前条目 getter：判定基准与受理 toast 名称来源
+  getVMState: () => vm.value,
+  // 观测快照就地更新详情数据（PVE 状态尽快可见，不等手动刷新）
+  onSnapshot: (v) => {
+    vm.value = v
+  },
+  // 受理后立即刷新一次（原 runLifecycle 行为，让 PVE 状态尽快可见）
+  onAccepted: () => {
     void fetchVM()
-  } catch (err) {
-    actionError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
-  } finally {
-    actionBusy.value = false
   }
-}
+})
+
+// ---- 认领外部 VM（design D7）：详情页认领入口，弹窗复用列表页 ClaimVmModal；
+// 认领成功后 ext- 标识经后端按本地形态返回，就地刷新为本地形态 ----
+const claimTarget = ref<VMListItem | null>(null)
 
 // ---- 调整规格（4.5）：部分更新语义，仅提交有变化的字段；磁盘只增，缩小提交前即提示 ----
 const resizeOpen = ref(false)
@@ -173,7 +184,8 @@ async function submitResize(): Promise<void> {
   resizing.value = true
   resizeError.value = null
   try {
-    await resizeVM(vmId.value, body)
+    // 调整规格仅本地行可用（external 无入口，design D7）：取条目数字 id 而非路由参数
+    await resizeVM(vm.value.id, body)
     resizeOpen.value = false
     toast.add({ title: '规格已更新', description: '调整规格请求已生效', color: 'success', icon: 'i-lucide-check-circle-2' })
     void fetchVM()
@@ -276,26 +288,50 @@ async function confirmDestroy(): Promise<void> {
               :description="vm.provision_error"
             />
 
-            <!-- 生命周期操作区：creating/failed 状态禁用（后端 vm_not_ready 兜底） -->
+            <!-- 未纳管提示（design D7）：external 无本地元数据，提示可认领；
+                 creating/failed 状态禁用操作（后端 vm_not_ready 兜底） -->
+            <UAlert
+              v-if="isExternal"
+              color="warning"
+              variant="subtle"
+              icon="i-lucide-hand"
+              title="未纳管虚拟机"
+              description="该虚拟机来自 PVE 外部来源，尚未纳入平台托管，本地元数据（UUID/IP/创建时间等）暂不可用；认领后即可获得完整管理能力。"
+            >
+              <template #actions>
+                <UButton
+                  size="sm"
+                  color="warning"
+                  icon="i-lucide-hand"
+                  @click="claimTarget = vm"
+                >
+                  认领
+                </UButton>
+              </template>
+            </UAlert>
+
+            <!-- 生命周期操作区：启动/停止/重启/销毁恒显，不可用禁用，仅触发按钮转圈；
+                 external 不提供调整规格入口（design D7，后端 PATCH 仅支持数字 id） -->
             <VmActions
               :status="vm.status"
-              :busy="actionBusy"
-              :busy-any="actionBusy"
-              :show-resize="canResizeVM(vm.status)"
+              :busy="pending !== null"
+              :busy-any="pending !== null"
+              :pending-action="pending?.action ?? null"
+              :show-resize="!isExternal"
               variant="soft"
               show-badge
-              @start="runLifecycle('start')"
-              @stop="runLifecycle('stop')"
-              @restart="runLifecycle('restart')"
+              @start="run('start', vmId)"
+              @stop="run('stop', vmId)"
+              @restart="run('restart', vmId)"
               @resize="openResize"
               @destroy="openDestroy"
             />
 
             <!-- 操作失败：展示后端错误，VM 状态不变 -->
             <AppErrorAlert
-              v-if="actionError"
-              :code="actionError.code"
-              :message="actionError.message"
+              v-if="pendingError"
+              :code="pendingError.code"
+              :message="pendingError.message"
               title="操作失败"
             />
 
@@ -305,12 +341,13 @@ async function confirmDestroy(): Promise<void> {
                 基本信息
               </template>
               <div class="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
+                <!-- external（未纳管）无本地元数据：UUID/创建/更新时间展示「—」占位 -->
                 <div>
                   <div class="text-xs text-muted">
                     UUID
                   </div>
                   <div class="font-mono text-sm">
-                    {{ vm.uuid }}
+                    {{ isExternal ? '—' : vm.uuid }}
                   </div>
                 </div>
                 <div>
@@ -326,7 +363,7 @@ async function confirmDestroy(): Promise<void> {
                     IP 地址
                   </div>
                   <div class="text-sm">
-                    {{ vm.ip ?? '—' }}
+                    {{ vm.ip || '—' }}
                   </div>
                 </div>
                 <div>
@@ -374,7 +411,7 @@ async function confirmDestroy(): Promise<void> {
                     创建时间
                   </div>
                   <div class="text-sm">
-                    {{ formatDateTime(vm.created_at) }}
+                    {{ isExternal ? '—' : formatDateTime(vm.created_at) }}
                   </div>
                 </div>
                 <div>
@@ -382,7 +419,7 @@ async function confirmDestroy(): Promise<void> {
                     更新时间
                   </div>
                   <div class="text-sm">
-                    {{ formatDateTime(vm.updated_at) }}
+                    {{ isExternal ? '—' : formatDateTime(vm.updated_at) }}
                   </div>
                 </div>
               </div>
@@ -605,6 +642,14 @@ async function confirmDestroy(): Promise<void> {
           </UButton>
         </template>
       </UModal>
+
+      <!-- 认领外部 VM（design D7）：复用列表页 ClaimVmModal；
+           认领成功后 ext- 标识按本地形态返回，就地刷新为本地形态（source 转 claimed） -->
+      <ClaimVmModal
+        :vm="claimTarget"
+        @close="claimTarget = null"
+        @claimed="void fetchVM()"
+      />
     </template>
   </UDashboardPanel>
 </template>
