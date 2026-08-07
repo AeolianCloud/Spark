@@ -28,7 +28,7 @@
     "@nuxt/eslint": "1.17.0",
     "eslint": "10.8.0",
     "openapi-typescript": "^7.13.0",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "vue-tsc": "3.3.9"
   }
 }
