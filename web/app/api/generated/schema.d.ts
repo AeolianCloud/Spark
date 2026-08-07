@@ -377,10 +377,12 @@ export interface paths {
         };
         /**
          * VM 详情（穿透实时状态）
-         * @description :id 仅支持数字本地行 id（external 虚拟机没有详情端点；其列表条目带
-         *     ext- 合成标识，可用于生命周期操作与操作记录查询）。PVE 节点查询失败
-         *     （节点不可达、被禁用或已被移除）返回 503 node_unavailable，
-         *     不会伪装成 creating。
+         * @description :id 为数字本地行 id 或 external 合成标识 ext-{nodeID}-{vmid}（格式
+         *     非法返回 400）。数字 id：本地元数据 + PVE 实时状态；external 标识：
+         *     实时读取该节点 PVE 状态，返回实时状态与 PVE 摘要规格，本地元数据
+         *     字段（uuid/created_at/updated_at）为空。PVE 节点查询失败（节点不可达、
+         *     被禁用或已被移除）返回 503 node_unavailable，不会伪装成 creating；
+         *     节点可达但 VM 已从 PVE 移除返回 404 vm_not_found_on_node。
          */
         get: operations["getVM"];
         put?: never;
@@ -946,8 +948,8 @@ export interface components {
             status: string;
             /**
              * @description 虚拟机来源：spark_created（由 Spark 镜像创建）、claimed（已认领的
-             *     外部虚拟机）、external（PVE 上存在而本地无记录，仅列表条目出现；
-             *     由 PVE 全量虚拟机与本地记录实时比对得出，不落库）
+             *     外部虚拟机）、external（PVE 上存在而本地无记录，列表与详情均可
+             *     呈现；由 PVE 全量虚拟机与本地记录实时比对得出，不落库）
              * @enum {string}
              */
             source: "spark_created" | "claimed" | "external";
@@ -961,7 +963,8 @@ export interface components {
         /**
          * @description 透传 VM 负载：VMResponse 元数据 + PVE 实时运行部分。external 条目
          *     （source=external）id 为合成标识 ext-{nodeID}-{vmid}（字符串），
-         *     uuid/created_at/updated_at 返回空字符串，规格取 PVE 摘要值。
+         *     uuid/created_at/updated_at 返回空字符串，规格取 PVE 摘要值；
+         *     列表与详情（GET /vms/{id} 的 ext- 标识）均以此形态呈现。
          */
         VMListItem: components["schemas"]["VMResponse"] & {
             /**
@@ -1042,7 +1045,7 @@ export interface components {
         AcceptedResponse: {
             /**
              * @description 恒为 true；实际结果通过 Location 指向的 GET /vms/{id} 观察
-             *     （external 合成标识省略 Location 头，可刷新 VM 列表观察状态）
+             *     （数字与 external 标识均可，external 详情实时读取 PVE 状态）
              * @example true
              */
             accepted: boolean;
@@ -1218,6 +1221,14 @@ export interface components {
     parameters: {
         /** @description 资源 ID（正整数） */
         PathID: number;
+        /**
+         * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+         *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+         *     正整数；external 虚拟机详情实时读取 PVE 状态，本地元数据字段为空；
+         *     ext- 标识指向已托管的 VM 时按本地形态返回）。
+         *     格式非法返回 400（bad_request / invalid_vm_id）。
+         */
+        PathVMID: string;
         /** @description 区域 ID（正整数） */
         PathZoneID: number;
         /** @description 每页条数；默认 25，上限 100，超出会被服务端截断，负数/非数字返回 400 */
@@ -1229,7 +1240,8 @@ export interface components {
         /**
          * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
          *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
-         *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+         *     正整数；external 条目以合成标识呈现于列表与详情）。格式非法返回
+         *     400 invalid_vm_id。
          */
         PathVMRef: string;
     };
@@ -1952,8 +1964,14 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源 ID（正整数） */
-                id: components["parameters"]["PathID"];
+                /**
+                 * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+                 *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+                 *     正整数；external 虚拟机详情实时读取 PVE 状态，本地元数据字段为空；
+                 *     ext- 标识指向已托管的 VM 时按本地形态返回）。
+                 *     格式非法返回 400（bad_request / invalid_vm_id）。
+                 */
+                id: components["parameters"]["PathVMID"];
             };
             cookie?: never;
         };
@@ -1981,7 +1999,8 @@ export interface operations {
                 /**
                  * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
                  *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
-                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 *     正整数；external 条目以合成标识呈现于列表与详情）。格式非法返回
+                 *     400 invalid_vm_id。
                  */
                 id: components["parameters"]["PathVMRef"];
             };
@@ -2041,7 +2060,8 @@ export interface operations {
                 /**
                  * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
                  *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
-                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 *     正整数；external 条目以合成标识呈现于列表与详情）。格式非法返回
+                 *     400 invalid_vm_id。
                  */
                 id: components["parameters"]["PathVMRef"];
             };
@@ -2049,7 +2069,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头） */
+            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（数字与 external 标识均可） */
             202: {
                 headers: {
                     Location: components["headers"]["Location"];
@@ -2073,7 +2093,8 @@ export interface operations {
                 /**
                  * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
                  *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
-                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 *     正整数；external 条目以合成标识呈现于列表与详情）。格式非法返回
+                 *     400 invalid_vm_id。
                  */
                 id: components["parameters"]["PathVMRef"];
             };
@@ -2081,7 +2102,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头） */
+            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（数字与 external 标识均可） */
             202: {
                 headers: {
                     Location: components["headers"]["Location"];
@@ -2105,7 +2126,8 @@ export interface operations {
                 /**
                  * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
                  *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
-                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 *     正整数；external 条目以合成标识呈现于列表与详情）。格式非法返回
+                 *     400 invalid_vm_id。
                  */
                 id: components["parameters"]["PathVMRef"];
             };
@@ -2113,7 +2135,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头） */
+            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（数字与 external 标识均可） */
             202: {
                 headers: {
                     Location: components["headers"]["Location"];
@@ -2142,7 +2164,8 @@ export interface operations {
                 /**
                  * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
                  *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
-                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 *     正整数；external 条目以合成标识呈现于列表与详情）。格式非法返回
+                 *     400 invalid_vm_id。
                  */
                 id: components["parameters"]["PathVMRef"];
             };
