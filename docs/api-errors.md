@@ -47,7 +47,7 @@ x-ms-error-code: not_found
 | `internal_error` | 500 | 服务器内部错误 | 未归类异常的统一兜底，不暴露内部细节 |
 | `service_unavailable` | 503 | 服务不可用 | `/healthz` 数据库探活失败时的 degraded 状态（业务 API 暂无触发） |
 | `dependency_failed` | — | 依赖子系统失败 | 未使用（预留），已定义、暂未接线 |
-| `node_unavailable` | 503 | 无可用的 PVE 节点 | 创建 VM 时所有候选节点不可达或被禁用 |
+| `node_unavailable` | 503 | 无可用的 PVE 节点 | 创建 VM 时所有候选节点不可达或被禁用；节点实时状态查询（GET /nodes/:id/status）时 PVE 不可达/API 令牌无效/超时 |
 | `ip_exhausted` | 409 | IP 池无空闲地址 | 所有候选 IP 池的地址均已分配完毕 |
 | `vm_not_ready` | 409 | VM 尚不可操作 | 供给未完成或 PVE 侧 VM 已不存在时执行生命周期操作 |
 | `disk_shrink_not_allowed` | 422 | 磁盘不支持缩小 | resize 请求中 `disk_gb` 小于当前磁盘大小 |

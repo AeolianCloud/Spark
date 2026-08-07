@@ -45,7 +45,7 @@ web/
 
 ## API Client（由契约生成）
 
-`docs/openapi.yaml` 是 API 契约的唯一事实来源（25 个端点）。前端请求层由 `openapi-typescript` 生成类型 + 自写轻量 fetch 封装组成，两层分离：
+`docs/openapi.yaml` 是 API 契约的唯一事实来源（32 个端点）。前端请求层由 `openapi-typescript` 生成类型 + 自写轻量 fetch 封装组成，两层分离：
 
 ```
 web/app/api/
@@ -59,7 +59,7 @@ web/app/api/
 ```
 
 - 契约变更后执行 `npm run api:gen` 重新生成并提交生成物；生成物 diff 是契约同步的机器证据
-- `contract-verify.ts` 在 `npm run typecheck` 中编译期校验：25 个端点齐全；全部写操作（createZone/createNode/createPool/createStorageType/createImage/createVM/updateNode/updateStorageType/setPoolNodes/resizeVM/destroyVM）的请求体必填字段与响应体、列表端点的 query 参数、X-Total-Count/Location 响应头均与契约 schema 一一对应（契约增删改字段时断言失败）
+- `contract-verify.ts` 在 `npm run typecheck` 中编译期校验：32 个端点齐全；节点实时状态端点 GET /nodes/:id/status 的路径参数与 200/503 响应体、全部写操作（createZone/createNode/createPool/createStorageType/createImage/createVM/updateNode/updateStorageType/setPoolNodes/resizeVM/destroyVM）的请求体必填字段与响应体、列表端点的 query 参数、X-Total-Count/Location 响应头均与契约 schema 一一对应（契约增删改字段时断言失败）
 - 错误统一为 `ApiError`：`status`（HTTP 状态码）、`code`（契约错误码，唯一可依赖）、`message`（脱敏后的可读信息）
 
 ## CI（契约一致性保障）

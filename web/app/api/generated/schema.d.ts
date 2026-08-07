@@ -81,6 +81,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/nodes/{id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 查询节点实时状态
+         * @description 实时拉取 PVE 节点状态并聚合返回：节点配置字段（与 NodeResponse
+         *     平铺一致）+ 嵌套 status 对象（在线状态、PVE 版本/内核、在线时长、
+         *     CPU/内存/根分区使用率与负载、网络接口列表及实时吞吐）。
+         *     :id 为本地 pve_nodes.id。节点不存在返回 404 not_found；PVE
+         *     不可达/令牌无效/超时返回 503 node_unavailable（错误消息脱敏）。
+         */
+        get: operations["getNodeStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ip-pools": {
         parameters: {
             query?: never;
@@ -566,6 +590,127 @@ export interface components {
             enabled: boolean;
             /** Format: date-time */
             created_at: string;
+        };
+        NodeStatusResponse: {
+            /**
+             * Format: int64
+             * @description 本地 pve_nodes.id
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @description 所属区域 ID
+             */
+            zone_id: number;
+            /** @description 节点业务名 */
+            name: string;
+            /** @description PVE 集群节点名，空值表示沿用业务名 name */
+            pve_name: string;
+            /** @description 节点主机地址（纯地址，端口见 port 字段） */
+            host: string;
+            /** @description 节点 API 端口，默认 8006 */
+            port: number;
+            /** @description PVE API 用户，如 spark@pve */
+            api_user: string;
+            /** @description 是否已存储 API token（token 本身永不返回） */
+            api_token_set: boolean;
+            /** @description 是否启用 */
+            enabled: boolean;
+            /**
+             * Format: date-time
+             * @description 节点登记时间
+             */
+            created_at: string;
+            status: components["schemas"]["NodeStatusField"];
+        };
+        NodeStatusField: {
+            /** @description PVE 节点在线状态（如 online/offline/unknown；PVE 9 无该字段，请求成功时恒为 online） */
+            status: string;
+            /**
+             * Format: int64
+             * @description 节点在线时长（秒）
+             */
+            uptime_seconds: number;
+            /** @description PVE 版本号，如 8.2.4 / pve-manager/9.1.1/1（PVE 9 的 pveversion 字段，7/8 为 version） */
+            pve_version: string;
+            /** @description 内核版本，如 6.8.4-2-pve */
+            kernel_version: string;
+            cpu: components["schemas"]["NodeCPUStatus"];
+            memory: components["schemas"]["NodeMemoryStatus"];
+            disk: components["schemas"]["NodeDiskStatus"];
+            /** @description 网络接口列表（接口信息，不含接口级流量） */
+            network: components["schemas"]["NodeNetStatus"][];
+            net_io: components["schemas"]["NodeNetIO"];
+        };
+        NodeCPUStatus: {
+            /**
+             * Format: int32
+             * @description CPU 核数（PVE 9 取 cpuinfo.cpus，7/8 取 cpus 或 maxcpu）
+             */
+            cores: number;
+            /**
+             * Format: float
+             * @description CPU 使用率（0-1 小数，PVE 原文）
+             */
+            usage: number;
+            /** @description 系统负载（PVE 原文，字符串数组，透传不数值化） */
+            loadavg: string[];
+        };
+        NodeMemoryStatus: {
+            /**
+             * Format: int64
+             * @description 总内存（字节；PVE 9 取 memory.total，7/8 取 maxmem）
+             */
+            total: number;
+            /**
+             * Format: int64
+             * @description 已用内存（字节；PVE 9 取 memory.used，7/8 取 mem）
+             */
+            used: number;
+            /**
+             * Format: float
+             * @description 内存使用率（0-1 小数）
+             */
+            usage: number;
+        };
+        NodeDiskStatus: {
+            /**
+             * Format: int64
+             * @description 根分区总容量（字节；PVE 7 取 maxrootfs，8/9 取 rootfs.total）
+             */
+            total: number;
+            /**
+             * Format: int64
+             * @description 根分区已用（字节；rootfs.used 或 PVE 7 裸数字）
+             */
+            used: number;
+            /**
+             * Format: float
+             * @description 根分区使用率（0-1 小数）
+             */
+            usage: number;
+        };
+        NodeNetStatus: {
+            /** @description 接口名，如 eth0 */
+            iface: string;
+            /** @description 接口类型（如 ethernet、bridge、bond） */
+            type: string;
+            /** @description 接口地址（如 192.168.1.10） */
+            address: string;
+            /** @description 接口是否活跃（PVE 返回布尔或数字 1/0，统一输出 boolean）；PVE 未返回时为 null */
+            active: boolean | null;
+        };
+        NodeNetIO: {
+            /**
+             * Format: float
+             * @description 节点当前接收吞吐（bytes/s，取自 PVE rrddata 最近采样点）
+             */
+            net_in: number;
+            /**
+             * Format: float
+             * @description 节点当前发送吞吐（bytes/s，取自 PVE rrddata 最近采样点）
+             */
+            net_out: number;
         };
         CreatePoolRequest: {
             /**
@@ -1271,6 +1416,32 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+        };
+    };
+    getNodeStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 节点配置 + 实时状态 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeStatusResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listPools: {

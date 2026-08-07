@@ -12,6 +12,11 @@ import type { FormValidateError } from '~/utils/format'
 const route = useRoute()
 const toast = useToast()
 
+// BUG-2 修复：本页存在子路由 /zones/:zoneId/nodes/:nodeId（节点详情页），
+// 父页面只在自身路由下渲染列表，子路由访问时仅渲染子页面（NuxtPage 出口），
+// 避免两个 UDashboardPanel 堆叠（nodeId 参数仅子路由存在，以此判别）
+const isParentRoute = computed(() => route.params.nodeId === undefined)
+
 // 路由参数：/zones/:zoneId/nodes；非法值（NaN/非正整数）防御：不向 API 发请求
 const zoneId = computed(() => {
   const n = Number(route.params.zoneId)
@@ -51,7 +56,21 @@ async function load(): Promise<void> {
   loading.value = false
 }
 
-onMounted(load)
+onMounted(() => {
+  // 子路由访问时父页面不加载列表（列表区域不渲染，避免无谓请求）
+  if (!isParentRoute.value) return
+  void load()
+})
+
+// 路由切换时刷新：①从子路由（/zones/:zoneId/nodes/:nodeId 详情页）返回本页，父页面常驻
+// 不重挂载（onMounted 不触发），需刷新保持数据新鲜；②跨区域切换（/zones/1/nodes → /zones/2/nodes）
+// 组件复用仅 path 变化，需重新加载。两者旧路径均含 /nodes 段（含尾斜杠与否均命中），以此判别；
+// 与 zones.vue 的 path watch 模式一致
+watch(() => route.path, (_path, oldPath) => {
+  if (oldPath && oldPath.includes('/nodes') && isParentRoute.value) {
+    void load()
+  }
+})
 
 // 节点表单（创建/编辑共用）：api_token 为只写字段，编辑时留空 = 保留原密钥
 interface NodeFormState {
@@ -171,7 +190,7 @@ async function onSubmitForm(): Promise<void> {
 </script>
 
 <template>
-  <UDashboardPanel>
+  <UDashboardPanel v-if="isParentRoute">
     <template #header>
       <UDashboardNavbar :title="`节点 · ${zoneName}`">
         <template #leading>
@@ -420,4 +439,6 @@ async function onSubmitForm(): Promise<void> {
       </UModal>
     </template>
   </UDashboardPanel>
+
+  <NuxtPage v-else />
 </template>
