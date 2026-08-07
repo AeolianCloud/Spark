@@ -30,6 +30,25 @@ export function vmStatusBadge(status: string): VMStatusBadge {
   return { color: color ?? 'neutral', label: vmStatusLabel(status) }
 }
 
+// ---- 本地过渡状态（生命周期操作在途，design D2/D3）----
+// 操作受理后由 useVMPendingAction 标记 pending_* 状态，观察轮询期间展示
+// 「启动中/关闭中/重启中」info 徽章；列表页与详情页共用，与 vmStatusBadge 同风格。
+
+/** 生命周期操作类型（与 VmActions 的 pendingAction prop 一致） */
+export type PendingAction = 'start' | 'stop' | 'restart'
+
+/** 操作中文标签：受理/结果 toast 与 pending 徽章共用（如「正在启动」「已启动」） */
+export const PENDING_ACTION_LABELS: Record<PendingAction, string> = {
+  start: '启动',
+  stop: '关闭',
+  restart: '重启'
+}
+
+/** 过渡状态徽章：一律 info 色，文案为「动作 + 中」 */
+export function vmPendingStatusBadge(action: PendingAction): VMStatusBadge {
+  return { color: 'info', label: `${PENDING_ACTION_LABELS[action]}中` }
+}
+
 /** 本地过渡状态：供给未完成（creating）或供给失败（failed），PVE 对端尚不可操作 */
 export function isProvisioningStatus(status: string): boolean {
   return status === 'creating' || status === 'failed'

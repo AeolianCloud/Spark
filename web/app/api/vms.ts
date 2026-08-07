@@ -22,8 +22,12 @@ export function importVM(body: ImportVMRequest): Promise<LocatedResponse<VMListI
   return request<VMListItem>('/vms/import', { method: 'POST', body }) as Promise<LocatedResponse<VMListItem>>
 }
 
-/** VM 详情（PVE 实时穿透状态） */
-export function getVM(id: number): Promise<ApiResponse<VMListItem>> {
+/**
+ * VM 详情（PVE 实时穿透状态）。
+ * id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}（字符串）；
+ * ext- 标识指向已托管的 VM 时按本地形态返回。
+ */
+export function getVM(id: string | number): Promise<ApiResponse<VMListItem>> {
   return request<VMListItem>(`/vms/${id}`)
 }
 

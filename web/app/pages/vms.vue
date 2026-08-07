@@ -4,34 +4,30 @@
  * - 分页：limit/offset + X-Total-Count 总数（合并后条目数，含 external），页码与每页条数由 URL query 驱动（?page=&size=）
  * - 刷新策略（design D5）：手动刷新按钮 + 可选 ≥10s 低频自动刷新；节点故障（warnings）渲染醒目 banner
  * - 创建虚拟机：列表页内 UModal 表单，Zone 联动过滤镜像；密码一次性提交不存储不回显
- * - 来源标识三态徽章（spark_created/claimed/external）；external 条目（id 为 ext- 字符串）无详情页，
- *   行内可认领（zone + 可选 IP/名称）并执行生命周期操作；本地行有详情页
- * - 行内生命周期操作：启动/停止/重启/销毁（销毁二次确认），失败展示后端错误且状态不变
- * - 操作记录：行内入口弹窗，按时间倒序展示（数字 id 与 ext- 标识均支持，limit 25 加载更多）
+ * - 来源标识三态徽章（spark_created/claimed/external）；external 条目（id 为 ext- 字符串）
+ *   有详情页（/vms/ext-{nodeID}-{vmid}），行内可认领（ClaimVmModal）并执行生命周期操作；本地行有详情页
+ * - 行内生命周期操作：启动/停止/重启/销毁（销毁二次确认），受理后观察轮询（useVMPendingAction）
+ *   直至 PVE 状态生效，两段式 toast；失败展示后端错误且状态不变
+ * - 操作记录弹窗已移除（后端审计端点保留，见 design D8）
  */
-import type { Image, NodeWarning, StorageType, VMListItem, VMOperation, ZoneResponse } from '~/api'
+import type { Image, NodeWarning, StorageType, VMListItem, ZoneResponse } from '~/api'
 import {
   ApiError,
   createVM,
   destroyVM,
-  importVM,
   listImagesByZone,
   listStorageTypes,
-  listVMOperations,
   listVMs,
-  listZones,
-  restartVM,
-  startVM,
-  stopVM
+  listZones
 } from '~/api'
 import { useCatalog } from '~/composables/useCatalog'
-import { formatDateTime } from '~/utils/format'
-import { formatMemMB, vmSourceBadge, vmStatusBadge } from '~/utils/vm'
+import { useVMPendingAction } from '~/composables/useVMPendingAction'
+import { formatMemMB, vmPendingStatusBadge, vmSourceBadge, vmStatusBadge, type PendingAction, type VMStatusBadge } from '~/utils/vm'
 
 const route = useRoute()
 const router = useRouter()
 const toast = useToast()
-const { refresh: refreshCatalog, zoneName, nodeName, zoneIdOfNode } = useCatalog()
+const { refresh: refreshCatalog, zoneName, nodeName } = useCatalog()
 
 // BUG-2 修复：本页存在子路由 /vms/:id，父页面只在自身路由下渲染列表，
 // 子路由访问时仅渲染子页面（NuxtPage 出口），避免两个 UDashboardPanel 堆叠
@@ -178,38 +174,36 @@ function nodeLabel(id: number): string {
   return nodeName(id) ?? `节点 #${id}（名称未加载）`
 }
 
-// external 条目（id 为 ext- 字符串）：本地无记录、无详情页，仅可认领/操作/查记录
+// external 条目（id 为 ext- 字符串）：本地无记录，可认领/操作/查看详情（ext- 详情页）
 function isExternal(vm: VMListItem): boolean {
   return vm.source === 'external'
 }
 
-// ---- 行内生命周期操作（4.5）：202 受理即成功；失败展示后端错误且状态不变 ----
-// busy 标识：本地行为数字 id，external 条目为 ext- 字符串，统一用 string | number
-const actionBusyId = ref<string | number | null>(null)
-const actionError = ref<ApiError | null>(null)
-
-const ACTION_LABELS = { start: '启动', stop: '关闭', restart: '重启' } as const
-type LifecycleAction = keyof typeof ACTION_LABELS
-
-async function runLifecycle(action: LifecycleAction, vm: VMListItem): Promise<void> {
-  actionError.value = null
-  actionBusyId.value = vm.id
-  try {
-    const fn = action === 'start' ? startVM : action === 'stop' ? stopVM : restartVM
-    await fn(vm.id)
-    toast.add({
-      title: '操作已受理',
-      description: `已提交${ACTION_LABELS[action]}「${vm.name}」，异步生效，可稍后刷新查看最新状态`,
-      color: 'success',
-      icon: 'i-lucide-check-circle-2'
-    })
-    // 受理后立即刷新一次，让 PVE 状态尽快可见
+// ---- 行内生命周期操作（4.5 + design D1/D2/D3/D5）：受理 → 观察轮询 → 结果 toast ----
+// pending 按行定位在途操作（busy-any 语义保留：任一行动作在途时全部操作按钮禁用）；
+// 观察轮询单查目标 VM（3s），整页 15s 自动刷新逻辑不动
+const { pending, pendingError, run } = useVMPendingAction({
+  // 目标行条目 getter：判定基准与受理 toast 名称来源
+  getVMState: id => vms.value.find(v => v.id === id) ?? null,
+  // 观测快照就地更新行数据（PVE 状态尽快可见，不等整页刷新）
+  onSnapshot: (vm) => {
+    vms.value = vms.value.map(v => (v.id === vm.id ? vm : v))
+  },
+  // 受理后立即刷新一次（原 runLifecycle 行为，让 PVE 状态尽快可见）
+  onAccepted: () => {
     void fetchVMs()
-  } catch (err) {
-    actionError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
-  } finally {
-    actionBusyId.value = null
   }
+})
+
+/** 目标行的在途操作类型（无则 null）：驱动行内按钮 loading 与状态徽章 */
+function rowPendingAction(vm: VMListItem): PendingAction | null {
+  return pending.value !== null && pending.value.id === vm.id ? pending.value.action : null
+}
+
+/** 行状态徽章：在途操作期间展示「启动中/关闭中/重启中」过渡徽章，否则按实际状态 */
+function rowStatusBadge(vm: VMListItem): VMStatusBadge {
+  const action = rowPendingAction(vm)
+  return action ? vmPendingStatusBadge(action) : vmStatusBadge(vm.status)
 }
 
 // ---- 销毁：必须二次确认（输入 VM 名称，警示不可恢复）----
@@ -407,164 +401,12 @@ watch(createOpen, (open) => {
   if (!open) password.value = ''
 })
 
-// ---- 认领外部 VM（6.2）：入口为列表 external 条目行内按钮（原导入弹窗候选流程已随
-// GET /vms/unmanaged 下线移除）。目标节点/PVE VMID 取自 external 条目（只读），
-// 表单仅需确认 zone + 可选 IP/名称；IP 不传则不分配（网络由 PVE 侧配置决定） ----
+// ---- 认领外部 VM（6.2）：入口为列表 external 条目行内按钮；弹窗逻辑抽为
+// ClaimVmModal 复用组件（zone + 可选 IP/名称，目标节点/PVE VMID 取自条目只读） ----
 const claimTarget = ref<VMListItem | null>(null)
-const claiming = ref(false)
-const claimError = ref<ApiError | null>(null)
-// 表单实例引用：footer 提交按钮经由 form.submit() 触发校验与 @submit
-const claimFormRef = ref<{ submit: () => Promise<void> }>()
 
-// 表单状态：zone 必选；ip/name 可选
-const claimForm = reactive({
-  zone_id: undefined as number | undefined,
-  ip: '',
-  name: ''
-})
-
-// 弹窗开关：以 claimTarget 为准（setter 处理各类关闭路径，与 destroyOpen 同模式）
-const claimOpen = computed({
-  get: () => claimTarget.value !== null,
-  set: (open: boolean) => {
-    if (!open) claimTarget.value = null
-  }
-})
-
-// 打开认领弹窗：表单重置 + 可用区选项懒加载（与创建弹窗共用 zones ref）；
-// 目录映射就绪时按节点预填可用区（节点必属某可用区），未就绪则留空由用户手选
-async function openClaimModal(vm: VMListItem): Promise<void> {
-  claimTarget.value = vm
-  claimError.value = null
-  claimForm.zone_id = zoneIdOfNode(vm.node_id) ?? undefined
-  claimForm.ip = ''
-  claimForm.name = ''
-  await loadZones()
-  // 预填值双源校验：预填值来自 catalog 缓存，下拉选项来自页面级 zones；
-  // catalog 过期或 loadZones 失败时预填值不在 zoneOptions 中，置空走"请选择可用区"校验路径，
-  // 避免前端校验通过、请求发出后由后端 404 兜底
-  if (claimForm.zone_id !== undefined && !zoneOptions.value.some(opt => opt.value === claimForm.zone_id)) {
-    claimForm.zone_id = undefined
-  }
-}
-
-// 表单校验：可用区必选；IP 非空时须为 IPv4/IPv6 形式（宽松预检，格式细节由后端 400 兜底）；
-// 名称上限 128 字符与后端契约 ImportVMRequest.name maxLength 对齐；留空时不做长度校验
-const IP_PATTERN = /^(\d{1,3}\.){3}\d{1,3}$|^[0-9a-fA-F:]+$/
-function validateClaimForm(): { name?: string, message: string }[] {
-  const errors: { name?: string, message: string }[] = []
-  if (claimForm.zone_id === undefined) errors.push({ name: 'zone_id', message: '请选择可用区' })
-  const ip = claimForm.ip.trim()
-  if (ip && !IP_PATTERN.test(ip)) errors.push({ name: 'ip', message: 'IP 格式非法（仅支持 IPv4/IPv6）' })
-  if (claimForm.name.trim().length > 128) errors.push({ name: 'name', message: '名称最多 128 字符' })
-  return errors
-}
-
-// 提交认领：zone 必传（校验保证非空）；node/pve_vmid 取自 external 条目；ip/name 留空不传
-async function submitClaim(): Promise<void> {
-  const target = claimTarget.value
-  if (!target || claiming.value) return
-  // 防御性二次校验（UForm 校验之外的最后防线）：不通过则不发起请求
-  const residualErrors = validateClaimForm()
-  if (residualErrors.length > 0) {
-    claimError.value = new ApiError(400, 'bad_request', residualErrors.map(e => e.message).join('；'))
-    return
-  }
-  const pveVmid = target.pve_vmid
-  if (pveVmid === undefined) {
-    // external 条目按契约恒携带 pve_vmid；此处防御异常数据，避免以 undefined 发请求
-    claimError.value = new ApiError(400, 'bad_request', '该虚拟机缺少 PVE VMID，无法认领')
-    return
-  }
-  claiming.value = true
-  claimError.value = null
-  try {
-    // 校验已保证 zone_id 非空；external 条目 node_id 恒存在
-    await importVM({
-      zone_id: claimForm.zone_id!,
-      node_id: target.node_id,
-      pve_vmid: pveVmid,
-      ip: claimForm.ip.trim() || undefined,
-      name: claimForm.name.trim() || undefined
-    })
-    // 成功后关闭弹窗并刷新列表，external 条目转为 claimed（进入详情/规格能力）
-    claimTarget.value = null
-    toast.add({ title: '已认领', description: `「${target.name}」已认领为托管虚拟机`, color: 'success', icon: 'i-lucide-check-circle-2' })
-    void fetchVMs()
-  } catch (err) {
-    // 契约错误（含 vm_already_managed / vm_not_found_on_node / ip_exhausted 等）由 AppErrorAlert 展示错误码与后端描述
-    claimError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
-  } finally {
-    claiming.value = false
-  }
-}
-
-// ---- 操作记录（6.3）：行内入口弹窗，按时间倒序分页（limit 25 加载更多），
-// 数字 id 与 ext- 标识均支持（external 条目无详情页，从列表行内查看） ----
-const opsTarget = ref<VMListItem | null>(null)
-const opsOpen = computed({
-  get: () => opsTarget.value !== null,
-  set: (open: boolean) => {
-    if (!open) opsTarget.value = null
-  }
-})
-const operations = ref<VMOperation[]>([])
-const opsTotal = ref(0)
-const opsLimit = 25 // 契约 QueryLimit 默认值（上限 100）
-const opsLoading = ref(false)
-const opsLoadingMore = ref(false)
-const opsError = ref<ApiError | null>(null)
-// 请求序号守卫：弹窗目标切换/刷新时丢弃过期响应
-let opsSeq = 0
-
-// 操作动作/结果中文标签（契约 VMOperation.action/result 枚举）
-const OPERATION_ACTION_LABELS = { start: '启动', stop: '关闭', reboot: '重启', destroy: '销毁' } as const
-const OPERATION_RESULT_BADGES = {
-  accepted: { color: 'success', label: '成功' },
-  failed: { color: 'error', label: '失败' }
-} as const
-
-function openOpsModal(vm: VMListItem): void {
-  opsTarget.value = vm
-  operations.value = []
-  opsTotal.value = 0
-  opsError.value = null
-  void loadOperations(true)
-}
-
-// 拉取操作记录：first=true 重置分页，否则在末尾追加下一页（接口按时间倒序）
-async function loadOperations(first = false): Promise<void> {
-  const target = opsTarget.value
-  if (!target) return
-  const seq = ++opsSeq
-  // 每次发起请求前重置错误：避免"加载更多"失败后再次成功时旧错误条残留（对齐 submitClaim/fetchVMs 模式）
-  opsError.value = null
-  if (first) {
-    operations.value = []
-    opsLoading.value = true
-  } else {
-    opsLoadingMore.value = true
-  }
-  try {
-    // 追加模式下以当前已加载条数为 offset，保证页间不重不漏
-    const res = await listVMOperations(target.id, { limit: opsLimit, offset: operations.value.length })
-    // 过期响应丢弃：期间弹窗已切换目标或重新加载
-    if (seq !== opsSeq) return
-    operations.value = [...operations.value, ...res.data.operations]
-    opsTotal.value = res.total
-  } catch (err) {
-    if (seq !== opsSeq) return
-    opsError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
-  } finally {
-    if (seq === opsSeq) {
-      opsLoading.value = false
-      opsLoadingMore.value = false
-    }
-  }
-}
-
-// 是否还有更多记录：已加载条数小于服务端总数
-const hasMoreOps = computed(() => operations.value.length < opsTotal.value)
+// ---- 操作记录（6.3）：已移除行内入口与弹窗（design D8），后端审计端点与
+// vm_operations 表保留（未来统一日志系统复用），此处不再有任何引用 ----
 
 // 表格列定义（accessorKey 对应 VMListItem 字段，插槽按列 id 覆盖渲染）
 const columns = [
@@ -646,9 +488,9 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
 
         <!-- 行内操作失败：展示后端错误，VM 状态不变 -->
         <AppErrorAlert
-          v-if="actionError"
-          :code="actionError.code"
-          :message="actionError.message"
+          v-if="pendingError"
+          :code="pendingError.code"
+          :message="pendingError.message"
           title="操作失败"
         />
 
@@ -671,23 +513,16 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
             :data="vms"
             :columns="columns"
           >
-            <!-- 名称：本地行（spark_created/claimed）为详情链接；external 条目无详情页仅展示名称；
+            <!-- 名称：本地行与 external 行均为详情链接（external 为 ext- 合成标识详情页）；
              failed 时行内展示 provision_error -->
             <template #name-cell="{ row }">
               <div class="min-w-40">
                 <NuxtLink
-                  v-if="!isExternal(row.original)"
                   :to="`/vms/${row.original.id}`"
                   class="font-medium text-primary hover:underline"
                 >
                   {{ row.original.name }}
                 </NuxtLink>
-                <span
-                  v-else
-                  class="font-medium"
-                >
-                  {{ row.original.name }}
-                </span>
                 <p
                   v-if="row.original.provision_error"
                   class="mt-0.5 truncate text-xs text-error"
@@ -715,12 +550,13 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
               {{ row.original.disk_gb }} GB
             </template>
 
-            <!-- 状态徽章：未知状态中性样式 -->
+            <!-- 状态徽章：在途操作期间展示「启动中/关闭中/重启中」过渡徽章（design D2），
+                 否则按实际状态（未知状态中性样式） -->
             <template #status-cell="{ row }">
               <UBadge
-                :color="vmStatusBadge(row.original.status).color"
+                :color="rowStatusBadge(row.original).color"
                 variant="soft"
-                :label="vmStatusBadge(row.original.status).label"
+                :label="rowStatusBadge(row.original).label"
               />
             </template>
 
@@ -733,16 +569,16 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
             </template>
 
             <template #ip-cell="{ row }">
-              {{ row.original.ip ?? '—' }}
+              {{ row.original.ip || '—' }}
             </template>
 
-            <!-- 操作列（显隐+禁用混合口径）：详情仅本地行（external 无详情端点）；
-             认领仅 external 条目（6.2）；启动/停止/重启按状态显隐（v-if，creating/failed 无按钮）；
-             操作记录全部行可查（6.3）；销毁恒显（alwaysShowDestroy），仅状态可销毁时可用（后端 vm_not_ready 兜底） -->
+            <!-- 操作列（恒显 + 禁用口径，design D4）：详情本地行与 external 行均有
+             （external 为 ext- 合成标识详情页）；认领仅 external 条目（6.2）；
+             启动/停止/重启/销毁恒显，不可用禁用，仅触发中的按钮转圈；
+             记录按钮已移除（design D8） -->
             <template #id-cell="{ row }">
               <div class="flex items-center gap-1">
                 <UButton
-                  v-if="!isExternal(row.original)"
                   size="sm"
                   variant="ghost"
                   color="primary"
@@ -757,28 +593,20 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
                   variant="ghost"
                   color="warning"
                   icon="i-lucide-hand"
-                  @click="openClaimModal(row.original)"
+                  @click="claimTarget = row.original"
                 >
                   认领
                 </UButton>
-                <UButton
-                  size="sm"
-                  variant="ghost"
-                  icon="i-lucide-history"
-                  @click="openOpsModal(row.original)"
-                >
-                  记录
-                </UButton>
                 <VmActions
                   :status="row.original.status"
-                  :busy="actionBusyId === row.original.id"
-                  :busy-any="actionBusyId !== null"
+                  :busy="rowPendingAction(row.original) !== null"
+                  :busy-any="pending !== null"
+                  :pending-action="rowPendingAction(row.original)"
                   size="sm"
                   variant="ghost"
-                  always-show-destroy
-                  @start="runLifecycle('start', row.original)"
-                  @stop="runLifecycle('stop', row.original)"
-                  @restart="runLifecycle('restart', row.original)"
+                  @start="run('start', row.original.id)"
+                  @stop="run('stop', row.original.id)"
+                  @restart="run('restart', row.original.id)"
                   @destroy="openDestroyConfirm(row.original)"
                 />
               </div>
@@ -1046,195 +874,13 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
         </template>
       </UModal>
 
-      <!-- BUG-1：UModal 移出 panel 作为兄弟节点；认领基于列表 external 条目，
-           节点/PVE VMID 只读展示，zone + 可选 IP/名称，无密码字段 -->
-      <UModal
-        v-model:open="claimOpen"
-        title="认领虚拟机"
-        description="将 PVE 上的外部虚拟机认领为本平台托管虚拟机（不修改 PVE 侧配置）"
-        :dismissible="!claiming"
-        :ui="{ footer: 'justify-end' }"
-      >
-        <template #body>
-          <UForm
-            ref="claimFormRef"
-            :state="claimForm"
-            :validate="validateClaimForm"
-            class="space-y-4"
-            @submit="submitClaim"
-          >
-            <!-- 认领目标信息（只读）：来自 external 条目，认领请求固定指向该节点/PVE VMID -->
-            <div class="rounded-md border border-dashed border-muted px-3 py-2 text-sm">
-              <div class="flex flex-wrap gap-x-6 gap-y-1">
-                <span>
-                  <span class="text-muted">目标：</span>
-                  {{ claimTarget?.name }}
-                </span>
-                <span>
-                  <span class="text-muted">节点：</span>
-                  {{ claimTarget ? nodeLabel(claimTarget.node_id) : '—' }}
-                </span>
-                <span>
-                  <span class="text-muted">PVE VMID：</span>
-                  {{ claimTarget?.pve_vmid ?? '—' }}
-                </span>
-              </div>
-            </div>
-
-            <UFormField
-              name="zone_id"
-              label="可用区"
-              required
-              :description="zonesLoadError
-                ? `可用区列表加载失败（${zonesLoadError.code}），请关闭弹窗后重新打开重试`
-                : (claimForm.zone_id === undefined ? '节点所在可用区未知，请选择' : '已按节点所在可用区预填，可修改')"
-            >
-              <USelect
-                :model-value="claimForm.zone_id"
-                :items="zoneOptions"
-                placeholder="选择认领到哪个可用区"
-                class="w-full"
-                @update:model-value="(v: number | undefined) => { claimForm.zone_id = v }"
-              />
-            </UFormField>
-
-            <UFormField
-              name="ip"
-              label="IP 地址"
-              description="可选；不填则不分配 IP，虚拟机网络由 PVE 侧配置决定"
-            >
-              <UInput
-                v-model="claimForm.ip"
-                placeholder="不填则不分配 IP"
-                autocomplete="off"
-              />
-            </UFormField>
-
-            <UFormField
-              name="name"
-              label="名称"
-              description="可选；留空使用 PVE 上的名称"
-            >
-              <UInput
-                v-model="claimForm.name"
-                maxlength="128"
-                placeholder="留空使用 PVE 上的名称"
-                autocomplete="off"
-              />
-            </UFormField>
-          </UForm>
-
-          <!-- 认领失败（含 vm_already_managed / vm_not_found_on_node / ip_exhausted 等契约错误码） -->
-          <AppErrorAlert
-            v-if="claimError"
-            class="mt-4"
-            :code="claimError.code"
-            :message="claimError.message"
-            title="认领失败"
-          />
-        </template>
-
-        <template #footer>
-          <UButton
-            variant="outline"
-            :disabled="claiming"
-            @click="claimTarget = null"
-          >
-            取消
-          </UButton>
-          <UButton
-            color="primary"
-            :loading="claiming"
-            @click="claimFormRef?.submit()"
-          >
-            认领
-          </UButton>
-        </template>
-      </UModal>
-
-      <!-- 操作记录（6.3）：行内入口弹窗，按时间倒序（数字 id 与 ext- 标识均支持；
-           external 条目无详情页，从列表行内查看） -->
-      <UModal
-        v-model:open="opsOpen"
-        :title="opsTarget ? `操作记录（${opsTarget.name}）` : '操作记录'"
-        :description="opsTotal > 0 ? `共 ${opsTotal} 条，按时间倒序` : undefined"
-      >
-        <template #body>
-          <div class="space-y-3">
-            <AppLoading
-              v-if="opsLoading"
-              :rows="5"
-            />
-
-            <template v-else>
-              <AppErrorAlert
-                v-if="opsError"
-                :code="opsError.code"
-                :message="opsError.message"
-                title="操作记录加载失败"
-              />
-
-              <AppEmpty
-                v-else-if="operations.length === 0"
-                title="暂无操作记录"
-                description="对该虚拟机的生命周期操作（启动/停止/重启/销毁）将记录于此。"
-                icon="i-lucide-history"
-              />
-
-              <div
-                v-else
-                class="space-y-2"
-              >
-                <div
-                  v-for="op in operations"
-                  :key="op.id"
-                  class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-muted px-3 py-2 text-sm"
-                >
-                  <div class="flex items-center gap-2">
-                    <UBadge
-                      :color="OPERATION_RESULT_BADGES[op.result].color"
-                      variant="soft"
-                      :label="OPERATION_RESULT_BADGES[op.result].label"
-                    />
-                    <span class="font-medium">{{ OPERATION_ACTION_LABELS[op.action] }}</span>
-                    <span class="text-muted">节点 {{ nodeLabel(op.node_id) }}</span>
-                  </div>
-                  <div class="flex items-center gap-2">
-                    <span
-                      v-if="op.error_message"
-                      class="max-w-56 truncate text-xs text-error"
-                      :title="op.error_message"
-                    >
-                      {{ op.error_message }}
-                    </span>
-                    <span class="text-xs text-muted">{{ formatDateTime(op.created_at) }}</span>
-                  </div>
-                </div>
-
-                <!-- 加载更多：倒序分页追加（limit 25） -->
-                <UButton
-                  v-if="hasMoreOps"
-                  block
-                  variant="outline"
-                  :loading="opsLoadingMore"
-                  @click="loadOperations(false)"
-                >
-                  加载更多
-                </UButton>
-              </div>
-            </template>
-          </div>
-        </template>
-
-        <template #footer>
-          <UButton
-            variant="outline"
-            @click="opsTarget = null"
-          >
-            关闭
-          </UButton>
-        </template>
-      </UModal>
+      <!-- 认领外部 VM（6.2）：弹窗逻辑抽为 ClaimVmModal 复用组件（详情页共用）；
+           目标节点/PVE VMID 只读展示，zone + 可选 IP/名称，无密码字段 -->
+      <ClaimVmModal
+        :vm="claimTarget"
+        @close="claimTarget = null"
+        @claimed="void fetchVMs()"
+      />
     </template>
   </UDashboardPanel>
 
