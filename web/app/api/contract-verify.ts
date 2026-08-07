@@ -9,11 +9,11 @@ import type { components, operations } from './generated/schema'
 import type { createVM, destroyVM, getVM, importVM, listVMOperations, listVMs, resizeVM, restartVM, startVM, stopVM } from './vms'
 import type { createNode, updateNode } from './nodes'
 import type { createPool, listPools, setPoolNodes } from './pools'
-import type { createImage, listImages } from './images'
+import type { createImage, downloadImage, getImage, getImageNodeStatus, listImageOperations, listImages, listImagesByZone } from './images'
 import type { createStorageType, listStorageTypes, updateStorageType } from './storage-types'
 import type { createZone, listZones } from './zones'
 import type { ApiResponse, LocatedResponse, ListResponse } from './client'
-import type { AcceptedResponse, Image, NodeResponse, StorageType, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
+import type { AcceptedResponse, Image, ImageDownloadRequest, ImageOperation, ImageZoneItem, NodeImageStatus, NodeResponse, StorageType, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
 
 /** 恒真断言：约束类型推导结果必须为 true */
 type Assert<T extends true> = T
@@ -24,16 +24,16 @@ type RequiredKeys<T> = { [K in keyof T]-?: undefined extends T[K] ? never : K }[
 /** 取对象可选键 */
 type OptionalKeys<T> = Exclude<keyof T, RequiredKeys<T>>
 
-/* ---------------------------------- 2.2：27 端点全覆盖 ---------------------------------- */
+/* ---------------------------------- 2.2：31 端点全覆盖 ---------------------------------- */
 
 type OpKeys = keyof operations
-type _Assert27Ops = Assert<
+type _Assert31Ops = Assert<
   Equal<
     OpKeys,
     | 'healthz' | 'createZone' | 'listZones' | 'createNode' | 'listNodesByZone' | 'updateNode'
     | 'createPool' | 'listPools' | 'setPoolNodes' | 'getPoolNodes'
     | 'createStorageType' | 'listStorageTypes' | 'getStorageType' | 'updateStorageType' | 'deleteStorageType'
-    | 'createImage' | 'listImages'
+    | 'createImage' | 'listImages' | 'getImage' | 'listImageNodeStatus' | 'downloadImage' | 'listImageOperations'
     | 'createVM' | 'listVMs' | 'getVM' | 'resizeVM' | 'destroyVM' | 'startVM' | 'stopVM' | 'restartVM'
     | 'listVMOperations' | 'importVM'
   >
@@ -105,17 +105,87 @@ type _AssertZoneContent = Assert<Equal<
   components['schemas']['ZoneResponse']
 >>
 
-// createImage：ImageRequest 全字段必填（name/default_user/node_images）；响应 201 为 Image + Location
+// createImage：ImageRequest 全字段必填（name/default_user/download_url，无 node_images）；
+// 响应 201 为 Image + Location
 type _AssertImageReq = Assert<Equal<keyof components['schemas']['ImageRequest'],
-  'name' | 'default_user' | 'node_images'>>
+  'name' | 'default_user' | 'download_url'>>
 type _AssertImageReqRequired = Assert<Equal<RequiredKeys<components['schemas']['ImageRequest']>,
-  'name' | 'default_user' | 'node_images'>>
+  'name' | 'default_user' | 'download_url'>>
+type _AssertImageReqNoNodeImages = Assert<'node_images' extends keyof components['schemas']['ImageRequest'] ? false : true>
 type _AssertCreateImageFn = Assert<Equal<Parameters<typeof createImage>[0], components['schemas']['ImageRequest']>>
 type _AssertCreateImageRes = Assert<Equal<ReturnType<typeof createImage>, Promise<LocatedResponse<Image>>>>
 type _AssertImageContent = Assert<Equal<
   operations['createImage']['responses'][201]['content']['application/json'],
   components['schemas']['Image']
 >>
+
+// Image 元数据：不再携带 node_images，仅 id/name/default_user/download_url/created_at
+// （节点存在状态由 nodes-status 实时扫描与 ImageZoneItem.nodes 承载）
+type _AssertImageFields = Assert<Equal<keyof components['schemas']['Image'],
+  'id' | 'name' | 'default_user' | 'download_url' | 'created_at'>>
+
+// NodeImageStatus：节点存在状态（downloaded 布尔，volid 可选）
+type _AssertNodeImageStatusFields = Assert<Equal<keyof components['schemas']['NodeImageStatus'],
+  'node_id' | 'node_name' | 'pve_name' | 'downloaded' | 'volid'>>
+type _AssertNodeImageStatusDownloaded = Assert<Equal<components['schemas']['NodeImageStatus']['downloaded'], boolean>>
+
+// ImageZoneItem：image 元数据 + 该区域各启用节点存在状态
+type _AssertImageZoneItemFields = Assert<Equal<keyof components['schemas']['ImageZoneItem'], 'image' | 'nodes'>>
+type _AssertImageZoneItemNodes = Assert<Equal<components['schemas']['ImageZoneItem']['nodes'],
+  components['schemas']['NodeImageStatus'][]>>
+
+// ImageDownloadRequest：node_ids 与 zone_id 互斥二选一（均可选）
+type _AssertImageDownloadReqFields = Assert<Equal<keyof components['schemas']['ImageDownloadRequest'],
+  'node_ids' | 'zone_id'>>
+type _AssertImageDownloadReqOptional = Assert<Equal<OptionalKeys<components['schemas']['ImageDownloadRequest']>,
+  'node_ids' | 'zone_id'>>
+
+// ImageOperation：下载操作记录（result 为 running/success/failed 终态流转）
+type _AssertImageOperationFields = Assert<Equal<keyof components['schemas']['ImageOperation'],
+  'id' | 'image_id' | 'node_id' | 'action' | 'result' | 'error_message' | 'upid' | 'created_at' | 'updated_at'>>
+type _AssertImageOperationResult = Assert<Equal<components['schemas']['ImageOperation']['result'],
+  'running' | 'success' | 'failed'>>
+
+// getImage：200 响应体为 Image
+type _AssertGetImageContent = Assert<Equal<
+  operations['getImage']['responses'][200]['content']['application/json'],
+  components['schemas']['Image']
+>>
+type _AssertGetImageFn = Assert<Equal<ReturnType<typeof getImage>, Promise<ApiResponse<Image>>>>
+
+// listImageNodeStatus：200 响应体为 NodeImageStatus[]
+type _AssertListNodeStatusContent = Assert<Equal<
+  operations['listImageNodeStatus']['responses'][200]['content']['application/json'],
+  components['schemas']['NodeImageStatus'][]
+>>
+type _AssertListNodeStatusFn = Assert<Equal<ReturnType<typeof getImageNodeStatus>,
+  Promise<ApiResponse<NodeImageStatus[]>>>>
+
+// downloadImage：202 响应体为 ImageOperation[] 且带 Location 头（指向操作历史端点）
+type _AssertDownload202Content = Assert<Equal<
+  operations['downloadImage']['responses'][202]['content']['application/json'],
+  components['schemas']['ImageOperation'][]
+>>
+type _AssertDownload202LocationHeader = Assert<
+  'Location' extends keyof operations['downloadImage']['responses'][202]['headers'] ? true : false
+>
+type _AssertDownloadFn = Assert<Equal<ReturnType<typeof downloadImage>,
+  Promise<LocatedResponse<ImageOperation[]>>>>
+
+// listImageOperations：200 响应体为 ImageOperation[]，带 X-Total-Count 分页头
+type _AssertListImageOpsQuery = Assert<Equal<
+  Exclude<operations['listImageOperations']['parameters']['query'], undefined>,
+  Exclude<Parameters<typeof listImageOperations>[1], undefined>
+>>
+type _AssertListImageOpsBody = Assert<Equal<
+  operations['listImageOperations']['responses'][200]['content']['application/json'],
+  components['schemas']['ImageOperation'][]
+>>
+type _AssertListImageOpsFn = Assert<Equal<ReturnType<typeof listImageOperations>,
+  Promise<ListResponse<ImageOperation[]>>>>
+type _AssertListImageOpsTotalHeader = Assert<
+  'X-Total-Count' extends keyof operations['listImageOperations']['responses'][200]['headers'] ? true : false
+>
 
 // createStorageType/updateStorageType：StorageTypeRequest 全字段必填（name/display_name/pve_storage）
 type _AssertStorageTypeReq = Assert<Equal<keyof components['schemas']['StorageTypeRequest'],
@@ -135,7 +205,9 @@ type _AssertStorageTypeContent = Assert<Equal<
   components['schemas']['StorageType']
 >>
 
-// 列表端点 query 参数：limit/offset 可选；listPools/listImages 另有可选 zone_id
+// 列表端点 query 参数：limit/offset 可选；listImages 契约 query 另有可选 zone_id（区域过滤）。
+// 无区域封装（listImages）不带 zone_id；区域过滤由 listImagesByZone（首位必填 zoneId 参数）承载，
+// 两者共享 limit/offset 分页参数，与契约 query 的 limit/offset 类型一致
 // （契约 query 类型为 `{...} | undefined`；封装函数参数带默认值故 Parameters 亦含 undefined，
 //   两侧均 Exclude 后逐一比对）
 type _AssertListZonesQuery = Assert<Equal<
@@ -150,9 +222,24 @@ type _AssertListStorageTypesQuery = Assert<Equal<
   Exclude<operations['listStorageTypes']['parameters']['query'], undefined>,
   Exclude<Parameters<typeof listStorageTypes>[0], undefined>
 >>
+type _AssertListImagesQueryHasZoneId = Assert<
+  'zone_id' extends keyof Exclude<operations['listImages']['parameters']['query'], undefined> ? true : false
+>
 type _AssertListImagesQuery = Assert<Equal<
   Exclude<operations['listImages']['parameters']['query'], undefined>,
-  Exclude<Parameters<typeof listImages>[0], undefined>
+  { zone_id?: components['parameters']['QueryZoneID'], limit?: components['parameters']['QueryLimit'], offset?: components['parameters']['QueryOffset'] }
+>>
+type _AssertListImagesFn = Assert<Equal<
+  Exclude<Parameters<typeof listImages>[0], undefined>,
+  { limit?: components['parameters']['QueryLimit'], offset?: components['parameters']['QueryOffset'] }
+>>
+type _AssertListImagesByZoneFn = Assert<Equal<
+  Exclude<Parameters<typeof listImagesByZone>[1], undefined>,
+  { limit?: components['parameters']['QueryLimit'], offset?: components['parameters']['QueryOffset'] }
+>>
+type _AssertListImagesByZoneZoneId = Assert<Equal<
+  Parameters<typeof listImagesByZone>[0],
+  components['parameters']['QueryZoneID']
 >>
 
 // 带 X-Total-Count 头的 4 个列表端点（zones/pools/storage-types/images）响应头断言
@@ -231,9 +318,15 @@ type _AssertVMOperationIdRef = Assert<Equal<
   string
 >>
 
+// types.ts 别名与契约镜像一致（镜像下载相关）
+type _AssertImageZoneItemAlias = Assert<Equal<ImageZoneItem, components['schemas']['ImageZoneItem']>>
+type _AssertNodeImageStatusAlias = Assert<Equal<NodeImageStatus, components['schemas']['NodeImageStatus']>>
+type _AssertImageDownloadReqAlias = Assert<Equal<ImageDownloadRequest, components['schemas']['ImageDownloadRequest']>>
+type _AssertImageOperationAlias = Assert<Equal<ImageOperation, components['schemas']['ImageOperation']>>
+
 // 兜底引用：确保以上断言类型被程序包含（import type 已保证在类型图中）
 export type {
-  _Assert27Ops,
+  _Assert31Ops,
   _AssertCreateVMReq,
   _AssertCreateVMReqRequired,
   _AssertCreateVMFn,
@@ -268,9 +361,30 @@ export type {
   _AssertZoneContent,
   _AssertImageReq,
   _AssertImageReqRequired,
+  _AssertImageReqNoNodeImages,
   _AssertCreateImageFn,
   _AssertCreateImageRes,
   _AssertImageContent,
+  _AssertImageFields,
+  _AssertNodeImageStatusFields,
+  _AssertNodeImageStatusDownloaded,
+  _AssertImageZoneItemFields,
+  _AssertImageZoneItemNodes,
+  _AssertImageDownloadReqFields,
+  _AssertImageDownloadReqOptional,
+  _AssertImageOperationFields,
+  _AssertImageOperationResult,
+  _AssertGetImageContent,
+  _AssertGetImageFn,
+  _AssertListNodeStatusContent,
+  _AssertListNodeStatusFn,
+  _AssertDownload202Content,
+  _AssertDownload202LocationHeader,
+  _AssertDownloadFn,
+  _AssertListImageOpsQuery,
+  _AssertListImageOpsBody,
+  _AssertListImageOpsFn,
+  _AssertListImageOpsTotalHeader,
   _AssertStorageTypeReq,
   _AssertStorageTypeReqRequired,
   _AssertCreateStorageTypeFn,
@@ -281,7 +395,11 @@ export type {
   _AssertListZonesQuery,
   _AssertListPoolsQuery,
   _AssertListStorageTypesQuery,
+  _AssertListImagesQueryHasZoneId,
   _AssertListImagesQuery,
+  _AssertListImagesFn,
+  _AssertListImagesByZoneFn,
+  _AssertListImagesByZoneZoneId,
   _AssertListZonesTotalHeader,
   _AssertListPoolsTotalHeader,
   _AssertListStorageTypesTotalHeader,
@@ -306,5 +424,9 @@ export type {
   _AssertVMOperationAlias,
   _AssertVMOperationsResAlias,
   _AssertVMOperationFields,
-  _AssertVMOperationIdRef
+  _AssertVMOperationIdRef,
+  _AssertImageZoneItemAlias,
+  _AssertNodeImageStatusAlias,
+  _AssertImageDownloadReqAlias,
+  _AssertImageOperationAlias
 }
