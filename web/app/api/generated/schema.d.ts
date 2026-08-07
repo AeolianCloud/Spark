@@ -185,9 +185,15 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * VM 列表（穿透式合并各节点实时状态）
-         * @description 每个启用节点一次 PVE 调用，合并本地元数据后返回；查询失败的节点不出现在
-         *     vms 中，而是记录在 warnings。X-Total-Count 为本地 VM 总行数（分页前）。
+         * VM 列表（穿透式合并各节点实时状态，含 external 虚拟机）
+         * @description 每个启用节点一次 PVE 调用，与本地元数据合并后按 (node_id, pve_vmid)
+         *     升序稳定排序、内存分页返回（设计 D1/D2）。PVE 上存在而本地无记录的
+         *     虚拟机以 external 条目并入（id 为合成标识 ext-{nodeID}-{vmid}，
+         *     uuid/created_at/updated_at 为空字符串，source 为 external）。
+         *     查询失败或被禁用/移除的节点不出现在 vms 中，而是记录在 warnings
+         *     （Node 为节点名，error 为脱敏原因）。X-Total-Count 为合并后条目
+         *     总数（含 external，剔除故障/禁用节点的虚拟机），与本地 vms 行数
+         *     不再相等。
          */
         get: operations["listVMs"];
         put?: never;
@@ -207,28 +213,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/vms/unmanaged": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * 节点未托管 VM 候选列表
-         * @description 返回指定节点 PVE 上尚未被托管的虚拟机候选（供导入选择）。
-         *     节点不存在返回 404 not_found；节点不可达或查询失败返回 503
-         *     node_unavailable。
-         */
-        get: operations["listUnmanagedVMs"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/vms/import": {
         parameters: {
             query?: never;
@@ -239,14 +223,16 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 导入已有 VM（纳管）
-         * @description 将 PVE 节点上已有的虚拟机导入为托管虚拟机：读取 PVE 配置规格，
-         *     IP 优先复用 ipconfig0 静态 IP（属于池且空闲时直接占用），否则从
-         *     池分配。导入不修改 PVE 侧配置。
+         * 认领已有 VM（原导入）
+         * @description 将 PVE 节点上已有的虚拟机认领为托管虚拟机：校验区域/节点/幂等性，
+         *     读取 PVE 配置提取规格，按请求可选分配 IP（ip 为 IP 地址字符串，
+         *     不传则不分配 IP，虚拟机网络由 PVE 侧配置决定）。认领成功后该虚拟机
+         *     出现在列表与详情中，source 为 claimed；不修改 PVE 侧配置。
          *
-         *     错误场景：400 参数非法；404 区域/节点不存在（not_found）或 PVE 上
-         *     无此 VM（vm_not_found_on_node）；409 已托管（vm_already_managed）
-         *     或 IP 池耗尽（ip_exhausted）；503 节点不可达/禁用（node_unavailable）。
+         *     错误场景：400 参数非法（含 ip 格式非法）；404 区域/节点不存在
+         *     （not_found）或 PVE 上无此 VM（vm_not_found_on_node）；409 已托管
+         *     （vm_already_managed）或指定 IP 不可用（ip_exhausted）；503 节点
+         *     不可达/禁用（node_unavailable）。
          */
         post: operations["importVM"];
         delete?: never;
@@ -264,7 +250,9 @@ export interface paths {
         };
         /**
          * VM 详情（穿透实时状态）
-         * @description PVE 节点查询失败（节点不可达、被禁用或已被移除）返回 503 node_unavailable，
+         * @description :id 仅支持数字本地行 id（external 虚拟机没有详情端点；其列表条目带
+         *     ext- 合成标识，可用于生命周期操作与操作记录查询）。PVE 节点查询失败
+         *     （节点不可达、被禁用或已被移除）返回 503 node_unavailable，
          *     不会伪装成 creating。
          */
         get: operations["getVM"];
@@ -272,9 +260,16 @@ export interface paths {
         post?: never;
         /**
          * 销毁 VM（同步，幂等）
-         * @description PVE 侧删除（含 purge）→ 释放 IP → 删本地记录，同步完成后返回 204。
-         *     重复销毁：本地行已不存在返回 404 not_found；PVE 侧 VM 已不存在视为
-         *     已销毁，仅执行本地清理。
+         * @description :id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}
+         *     （格式非法返回 400 invalid_vm_id）。
+         *
+         *     数字 id：PVE 侧删除（含 purge）→ 释放 IP → 删本地记录，同步完成后
+         *     返回 204；本地行已不存在返回 404 not_found；PVE 侧 VM 已不存在视为
+         *     已销毁，仅执行本地清理（幂等）。
+         *
+         *     ext- 标识：直接销毁 PVE VM（无本地行/IP 清理）；PVE 侧 VM 不存在
+         *     返回 404 vm_not_found_on_node。PVE 已受理但操作记录写失败返回 500
+         *     operation_log_failed。
          */
         delete: operations["destroyVM"];
         options?: never;
@@ -303,8 +298,12 @@ export interface paths {
         put?: never;
         /**
          * 启动 VM（异步派发）
-         * @description VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
-         *     节点/PVE 调用失败按全局兜底返回 500 internal_error。
+         * @description :id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}
+         *     （格式非法返回 400 invalid_vm_id）。本地行不存在返回 404 not_found；
+         *     external 目标在节点 PVE 上不存在返回 404 vm_not_found_on_node。
+         *     本地行尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409
+         *     vm_not_ready；PVE 调用失败按全局兜底返回 500 internal_error；
+         *     PVE 已受理但操作记录写失败返回 500 operation_log_failed。
          */
         post: operations["startVM"];
         delete?: never;
@@ -324,8 +323,12 @@ export interface paths {
         put?: never;
         /**
          * 关闭 VM（ACPI 优雅关机，异步派发）
-         * @description VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
-         *     节点/PVE 调用失败按全局兜底返回 500 internal_error。
+         * @description :id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}
+         *     （格式非法返回 400 invalid_vm_id）。本地行不存在返回 404 not_found；
+         *     external 目标在节点 PVE 上不存在返回 404 vm_not_found_on_node。
+         *     本地行尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409
+         *     vm_not_ready；PVE 调用失败按全局兜底返回 500 internal_error；
+         *     PVE 已受理但操作记录写失败返回 500 operation_log_failed。
          */
         post: operations["stopVM"];
         delete?: never;
@@ -345,10 +348,39 @@ export interface paths {
         put?: never;
         /**
          * 重启 VM（异步派发）
-         * @description VM 尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409 vm_not_ready；
-         *     节点/PVE 调用失败按全局兜底返回 500 internal_error。
+         * @description :id 支持数字本地行 id 与 external 合成标识 ext-{nodeID}-{vmid}
+         *     （格式非法返回 400 invalid_vm_id）。本地行不存在返回 404 not_found；
+         *     external 目标在节点 PVE 上不存在返回 404 vm_not_found_on_node。
+         *     本地行尚不可操作（未供给完成，或 PVE 对端已不存在）返回 409
+         *     vm_not_ready；PVE 调用失败按全局兜底返回 500 internal_error；
+         *     PVE 已受理但操作记录写失败返回 500 operation_log_failed。
          */
         post: operations["restartVM"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{id}/operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 查询 VM 操作记录（审计轨迹，按时间倒序分页）
+         * @description 返回该 VM 的生命周期操作记录（启动/停止/重启/销毁，每次 PVE 受理
+         *     或失败各一条），按时间倒序分页。:id 支持数字本地行 id（本地行不存在
+         *     返回 404 not_found）与 external 合成标识 ext-{nodeID}-{vmid}（直接
+         *     按 node+vmid 查询，不校验 VM 当前是否存在：记录是审计历史，PVE 侧
+         *     可能已销毁该 VM）。格式非法返回 400 invalid_vm_id。分页语义与列表
+         *     一致：limit 默认 25 上限 100，X-Total-Count 报告匹配总数。
+         */
+        get: operations["listVMOperations"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -364,7 +396,7 @@ export interface components {
              * @description 稳定的机器可读错误码（客户端只可依赖 code）
              * @enum {string}
              */
-            code: "bad_request" | "not_found" | "method_not_allowed" | "conflict" | "unprocessable_entity" | "internal_error" | "service_unavailable" | "dependency_failed" | "node_unavailable" | "ip_exhausted" | "vm_not_ready" | "disk_shrink_not_allowed" | "image_not_available_in_zone" | "vm_already_managed" | "vm_not_found_on_node";
+            code: "bad_request" | "not_found" | "method_not_allowed" | "conflict" | "unprocessable_entity" | "internal_error" | "service_unavailable" | "dependency_failed" | "node_unavailable" | "ip_exhausted" | "vm_not_ready" | "disk_shrink_not_allowed" | "image_not_available_in_zone" | "vm_already_managed" | "vm_not_found_on_node" | "invalid_vm_id" | "operation_log_failed";
             /** @description 仅供人阅读，不可被程序解析 */
             message: string;
         };
@@ -549,11 +581,13 @@ export interface components {
              */
             pve_vmid: number;
             /**
-             * Format: int64
-             * @description IP 池 ID，可选；0 表示自动选池（默认按静态 IP 匹配/回退分配）
+             * @description IP 地址（IPv4/IPv6 均可），可选；不传则不分配 IP（本地 ip_id
+             *     为空，虚拟机网络由 PVE 侧配置决定）。传入时按区域 IP 池中
+             *     CIDR 包含该地址且节点在白名单内的池精确占用，不可用返回 409
+             *     ip_exhausted。
              */
-            ip_pool_id?: number;
-            /** @description 导入后的 VM 名称，可选；空则取 PVE 配置名。名称须匹配 ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$；PVE 配置名超长时截断到 128 字符而非拒绝 */
+            ip?: string;
+            /** @description 认领后的 VM 名称，可选；空则取 PVE 配置名。名称须匹配 ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$；PVE 配置名超长时截断到 128 字符而非拒绝 */
             name?: string;
         };
         VMResponse: {
@@ -597,6 +631,13 @@ export interface components {
              * @example creating
              */
             status: string;
+            /**
+             * @description 虚拟机来源：spark_created（由 Spark 镜像创建）、claimed（已认领的
+             *     外部虚拟机）、external（PVE 上存在而本地无记录，仅列表条目出现；
+             *     由 PVE 全量虚拟机与本地记录实时比对得出，不落库）
+             * @enum {string}
+             */
+            source: "spark_created" | "claimed" | "external";
             /** @description 异步供给链失败原因（仅失败时出现） */
             provision_error?: string;
             /** Format: date-time */
@@ -604,7 +645,33 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /**
+         * @description 透传 VM 负载：VMResponse 元数据 + PVE 实时运行部分。external 条目
+         *     （source=external）id 为合成标识 ext-{nodeID}-{vmid}（字符串），
+         *     uuid/created_at/updated_at 返回空字符串，规格取 PVE 摘要值。
+         */
         VMListItem: components["schemas"]["VMResponse"] & {
+            /**
+             * @description 本地行（source 为 spark_created/claimed）为数字本地行 id；
+             *     external 条目（source=external）为合成标识 ext-{nodeID}-{vmid}
+             *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID）
+             */
+            id?: number | string;
+            /**
+             * Format: uuid
+             * @description external 条目（source=external）返回空字符串
+             */
+            uuid?: string;
+            /**
+             * Format: date-time
+             * @description 本地行时间戳；external 条目（source=external）返回空字符串
+             */
+            created_at?: string;
+            /**
+             * Format: date-time
+             * @description 本地行时间戳；external 条目（source=external）返回空字符串
+             */
+            updated_at?: string;
             /**
              * Format: float
              * @description PVE 实时 CPU 使用率；无 PVE 对端或停机时省略
@@ -637,44 +704,15 @@ export interface components {
             uptime?: number;
         };
         NodeWarning: {
-            /** @description 查询失败的 PVE 节点名 */
+            /** @description 查询失败或被禁用/移除的 PVE 节点名（绝不暴露内部节点 id） */
             node: string;
-            /** @description 失败原因 */
+            /** @description 失败原因（已脱敏，不包含内部地址/API 路径等细节） */
             error: string;
         };
         VMListResponse: {
             vms: components["schemas"]["VMListItem"][];
             /** @description 节点查询失败告警（恒为数组，无失败时为空数组） */
             warnings: components["schemas"]["NodeWarning"][];
-        };
-        UnmanagedVM: {
-            /**
-             * Format: int64
-             * @description PVE 侧 VMID
-             */
-            vmid: number;
-            /** @description PVE 配置中的 VM 名称 */
-            name: string;
-            /** @description PVE 运行时状态，如 running/stopped */
-            status: string;
-            /**
-             * Format: int32
-             * @description vCPU 核数
-             */
-            cpu: number;
-            /**
-             * Format: int64
-             * @description 内存（MB）
-             */
-            mem_mb: number;
-            /**
-             * Format: int64
-             * @description 磁盘总量（GiB）
-             */
-            disk_gb: number;
-        };
-        UnmanagedVMListResponse: {
-            vms: components["schemas"]["UnmanagedVM"][];
         };
         /** @description 至少一个字段必须出现；缺失或 null 的字段保留现值 */
         ResizeRequest: {
@@ -691,13 +729,52 @@ export interface components {
         AcceptedResponse: {
             /**
              * @description 恒为 true；实际结果通过 Location 指向的 GET /vms/{id} 观察
+             *     （external 合成标识省略 Location 头，可刷新 VM 列表观察状态）
              * @example true
              */
             accepted: boolean;
         };
+        VMOperation: {
+            /**
+             * Format: int64
+             * @description 操作记录 ID
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @description PVE 节点（本地 pve_nodes.id）
+             */
+            node_id: number;
+            /**
+             * Format: int64
+             * @description PVE 侧 VMID
+             */
+            pve_vmid: number;
+            /**
+             * @description 操作动作
+             * @enum {string}
+             */
+            action: "start" | "stop" | "reboot" | "destroy";
+            /**
+             * @description accepted=PVE 已受理；failed=PVE 返回错误（error_message 记录原因）
+             * @enum {string}
+             */
+            result: "accepted" | "failed";
+            /** @description 失败原因（已脱敏）；受理成功时省略 */
+            error_message?: string;
+            /**
+             * Format: date-time
+             * @description 操作发生时间
+             */
+            created_at: string;
+        };
+        VMOperationsResponse: {
+            /** @description 该 VM 的操作记录（按时间倒序） */
+            operations: components["schemas"]["VMOperation"][];
+        };
     };
     responses: {
-        /** @description 请求参数非法（bad_request；也用于 image_not_available_in_zone） */
+        /** @description 请求参数非法（bad_request / invalid_vm_id；也用于 image_not_available_in_zone） */
         BadRequest: {
             headers: {
                 "x-ms-error-code": components["headers"]["XMSErrorCode"];
@@ -715,7 +792,7 @@ export interface components {
                 "application/json": components["schemas"]["ErrorBody"];
             };
         };
-        /** @description 资源不存在，或路径未匹配任何路由的全局 404 兜底（not_found） */
+        /** @description 资源不存在（not_found / vm_not_found_on_node），或路径未匹配任何路由的全局 404 兜底（not_found） */
         NotFound: {
             headers: {
                 "x-ms-error-code": components["headers"]["XMSErrorCode"];
@@ -733,7 +810,7 @@ export interface components {
                 "application/json": components["schemas"]["ErrorBody"];
             };
         };
-        /** @description 与现有状态冲突（conflict / ip_exhausted / vm_not_ready） */
+        /** @description 与现有状态冲突（conflict / ip_exhausted / vm_not_ready / vm_already_managed） */
         Conflict: {
             headers: {
                 "x-ms-error-code": components["headers"]["XMSErrorCode"];
@@ -787,7 +864,7 @@ export interface components {
                 "application/json": components["schemas"]["ErrorBody"];
             };
         };
-        /** @description 服务器内部错误（internal_error，统一兜底，不暴露内部细节） */
+        /** @description 服务器内部错误（internal_error / operation_log_failed，统一兜底，不暴露内部细节） */
         InternalError: {
             headers: {
                 "x-ms-error-code": components["headers"]["XMSErrorCode"];
@@ -836,8 +913,12 @@ export interface components {
         QueryOffset: number;
         /** @description 按区域过滤（正整数；格式非法返回 400） */
         QueryZoneID: number;
-        /** @description 节点 ID（正整数；缺失或格式非法返回 400） */
-        QueryNodeID: number;
+        /**
+         * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+         *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+         *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+         */
+        PathVMRef: string;
     };
     requestBodies: never;
     headers: {
@@ -1383,32 +1464,6 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
-    listUnmanagedVMs: {
-        parameters: {
-            query: {
-                /** @description 节点 ID（正整数；缺失或格式非法返回 400） */
-                node_id: components["parameters"]["QueryNodeID"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description 该节点未托管的 VM 候选列表 */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["UnmanagedVMListResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
-            503: components["responses"]["ServiceUnavailable"];
-        };
-    };
     importVM: {
         parameters: {
             query?: never;
@@ -1422,7 +1477,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description 导入成功 */
+            /** @description 认领成功（source 为 claimed；Location 指向详情） */
             201: {
                 headers: {
                     Location: components["headers"]["Location"];
@@ -1469,8 +1524,12 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源 ID（正整数） */
-                id: components["parameters"]["PathID"];
+                /**
+                 * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+                 *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 */
+                id: components["parameters"]["PathVMRef"];
             };
             cookie?: never;
         };
@@ -1485,6 +1544,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
         };
     };
     resizeVM: {
@@ -1524,14 +1584,18 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源 ID（正整数） */
-                id: components["parameters"]["PathID"];
+                /**
+                 * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+                 *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 */
+                id: components["parameters"]["PathVMRef"];
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 已受理；Location 指向状态终结点 GET /vms/{id} */
+            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头） */
             202: {
                 headers: {
                     Location: components["headers"]["Location"];
@@ -1552,14 +1616,18 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源 ID（正整数） */
-                id: components["parameters"]["PathID"];
+                /**
+                 * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+                 *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 */
+                id: components["parameters"]["PathVMRef"];
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 已受理；Location 指向状态终结点 GET /vms/{id} */
+            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头） */
             202: {
                 headers: {
                     Location: components["headers"]["Location"];
@@ -1580,14 +1648,18 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源 ID（正整数） */
-                id: components["parameters"]["PathID"];
+                /**
+                 * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+                 *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 */
+                id: components["parameters"]["PathVMRef"];
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 已受理；Location 指向状态终结点 GET /vms/{id} */
+            /** @description 已受理；Location 指向状态终结点 GET /vms/{id}（external 标识省略该头） */
             202: {
                 headers: {
                     Location: components["headers"]["Location"];
@@ -1600,6 +1672,42 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listVMOperations: {
+        parameters: {
+            query?: {
+                /** @description 每页条数；默认 25，上限 100，超出会被服务端截断，负数/非数字返回 400 */
+                limit?: components["parameters"]["QueryLimit"];
+                /** @description 跳过条数；默认 0，负数/非数字返回 400 */
+                offset?: components["parameters"]["QueryOffset"];
+            };
+            header?: never;
+            path: {
+                /**
+                 * @description VM 标识：正整数本地行 id，或 external 合成标识 ext-{nodeID}-{vmid}
+                 *     （nodeID 为本地 pve_nodes.id，vmid 为 PVE 侧 VMID，均为无前导零的
+                 *     正整数；仅列表中的 external 条目使用）。格式非法返回 400 invalid_vm_id。
+                 */
+                id: components["parameters"]["PathVMRef"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 分页后的操作记录（按时间倒序） */
+            200: {
+                headers: {
+                    "X-Total-Count": components["headers"]["XTotalCount"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VMOperationsResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];
         };
     };
