@@ -693,7 +693,7 @@ export interface components {
         NodeNetStatus: {
             /** @description 接口名，如 eth0 */
             iface: string;
-            /** @description 接口类型（如 ethernet、bridge、bond） */
+            /** @description 接口类型（如 eth、bridge、lo） */
             type: string;
             /** @description 接口地址（如 192.168.1.10） */
             address: string;
