@@ -55,6 +55,12 @@ func (r *NodeRepository) ListEnabledNodesByZone(ctx context.Context, zoneID int6
 	return r.listNodes(ctx, "SELECT "+nodeCols+" FROM pve_nodes WHERE zone_id=$1 AND enabled ORDER BY id", zoneID)
 }
 
+// ListAllEnabledNodes 返回全部已启用的节点（不按区域过滤），按 id 排序。
+// 供镜像服务的全集群节点状态查询（不带区域时的 GetImageNodeStatus）。
+func (r *NodeRepository) ListAllEnabledNodes(ctx context.Context) ([]model.PVENode, error) {
+	return r.listNodes(ctx, "SELECT "+nodeCols+" FROM pve_nodes WHERE enabled ORDER BY id")
+}
+
 // ListNodesByIDs 返回指定 id 集合中的节点（不存在的 id 被忽略），按 id
 // 排序。供列表合并把被禁用/已移除节点的 id 翻译为节点名（警告的 Node
 // 字段），避免对外暴露内部数据库 id。

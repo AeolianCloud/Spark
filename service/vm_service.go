@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -173,7 +175,6 @@ type VMIPPoolRepository interface {
 // VMImageRepository 是 VMService 依赖的镜像数据访问层。
 type VMImageRepository interface {
 	Get(ctx context.Context, id int64) (*model.Image, error)
-	EnabledNodeNamesByZone(ctx context.Context, zoneID int64) ([]string, error)
 }
 
 // VMStorageTypeRepository 是 VMService 依赖的存储类型数据访问层。
@@ -195,8 +196,8 @@ type CreateVMRequest struct {
 }
 
 // validateCreateVMRequest 强制创建校验中与存在性无关的部分：名称、正数规格
-// 以及非空密码。存在性检查（区域、镜像、存储类型、镜像在区域内的可用性）在
-// CreateVM 中先于本函数执行，与文档化的校验顺序一致。
+// 以及非空密码。存在性检查在 CreateVM 中按顺序执行（镜像/存储/区域先查，
+// 镜像可用性由节点选择阶段决定），与文档化的校验顺序一致。
 func validateCreateVMRequest(req CreateVMRequest) error {
 	switch {
 	case strings.TrimSpace(req.Name) == "":
@@ -315,24 +316,16 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 		}
 		return nil, fmt.Errorf("create vm: get storage type: %w", err)
 	}
-	// 4. 镜像在区域每个启用节点上的可用性（复用 6.3 的交集语义：node_images
-	// 映射必须为每个启用节点都包含一个键）。
-	nodeNames, err := s.imageRepo.EnabledNodeNamesByZone(ctx, req.ZoneID)
-	if err != nil {
-		return nil, fmt.Errorf("create vm: enabled nodes by zone: %w", err)
-	}
-	if len(filterImagesAvailableByNodes([]model.Image{*image}, nodeNames)) == 0 {
-		return nil, imageNotAvailablef("image %d is not available on every enabled node of zone %d", req.ImageID, req.ZoneID)
-	}
-	// 5. 校验密码与规格。
+	// 4. 校验密码与规格。
 	if err := validateCreateVMRequest(req); err != nil {
 		return nil, err
 	}
 
-	// 节点与池的选择（D4）：按 id 顺序遍历区域的池；对每个池，其白名单节点与
-	// 区域启用节点求交集，第一个可达节点胜出；不可达的池会被跳过，继续尝试
-	// 下一个池。
-	pool, node, err := s.selectPoolAndNode(ctx, req.ZoneID)
+	// 节点与池的选择（D4，镜像感知调度 5.6）：按 id 顺序遍历区域的池；对每个
+	// 池，其白名单节点与区域启用节点求交集后，先按镜像存在性过滤（仅保留
+	// local/import 存储上存在该镜像的节点），再从过滤结果中挑选第一个可达
+	// 节点；没有可用候选的池会被跳过，继续尝试下一个池。
+	pool, node, volid, err := s.selectPoolAndNode(ctx, req.ZoneID, image)
 	if err != nil {
 		return nil, err
 	}
@@ -402,41 +395,143 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 	// vms.provision_error 而非返回给调用方。使用 context.Background()（而非
 	// 请求的 ctx，后者在处理器返回时被取消），受 vmProvisionTimeout 限制。
 	vm := *created
-	go s.provisionVM(vm, node, image, storageType, pool, req.Password, claimed.IP)
+	go s.provisionVM(vm, node, image, volid, storageType, pool, req.Password, claimed.IP)
 
 	return &repository.VMWithIP{VM: vm, IP: claimed.IP}, nil
 }
 
-// selectPoolAndNode 按 id 顺序遍历区域的 IP 池（D4）。对每个池，将白名单
-// 节点（ip_pool_nodes，按节点 id）与区域启用节点求交集，并挑选第一个可达
-// 节点；没有可达候选的池会被跳过，继续尝试下一个池。当没有池能产出可达节点
-// 时，返回 KindNodeUnavailable 错误（这也涵盖没有池的区域：候选集在构造上
-// 即为空）。
-func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64) (model.IPPool, model.PVENode, error) {
+// selectPoolAndNode 按 id 顺序遍历区域的 IP 池（D4，镜像感知调度 5.6）。
+// 对每个池，将白名单节点（ip_pool_nodes，按节点 id）与区域启用节点求交集，
+// 并先按镜像存在性过滤：仅保留 local 存储 import 目录中存在该镜像（以
+// DownloadURL 的 basename 匹配）的节点及其卷 ID，过滤结果再走 selectNode
+// 可达性探测，第一个可达节点胜出；没有带镜像候选的池会被跳过，继续尝试
+// 下一个池。
+//
+// 返回的 volid 是所选节点上该镜像的卷 ID（如 "local:import/xxx.qcow2"），
+// 由供给链用于 scsi0 的 import-from（任务 5.7），保证非空。
+//
+// 当没有任何池能产出"带镜像且可达"的节点时，区分两种失败：区域内没有任何
+// 启用节点存在该镜像 -> KindImageNotAvailable；有镜像但全部不可达 ->
+// KindNodeUnavailable。
+func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *model.Image) (model.IPPool, model.PVENode, string, error) {
 	enabledNodes, err := s.nodeRepo.ListEnabledNodesByZone(ctx, zoneID)
 	if err != nil {
-		return model.IPPool{}, model.PVENode{}, fmt.Errorf("select node: list enabled nodes: %w", err)
+		return model.IPPool{}, model.PVENode{}, "", fmt.Errorf("select node: list enabled nodes: %w", err)
 	}
 	pools, err := s.ipPoolRepo.ListPoolsByZone(ctx, zoneID)
 	if err != nil {
-		return model.IPPool{}, model.PVENode{}, fmt.Errorf("select node: list pools: %w", err)
+		return model.IPPool{}, model.PVENode{}, "", fmt.Errorf("select node: list pools: %w", err)
 	}
+
+	// 镜像存在性过滤：并行扫描每个启用节点的 local/import 存储，建立
+	// 节点 -> 镜像卷 ID 映射。扫描失败的节点（不可达）视为"未知"，不记录
+	// 存在性，也不参与后续选择——它们只会影响错误区分（见下方）。
+	// 镜像名复用 image_service 的 imageFileName（同包共享 helper，与
+	// image_service 的匹配语义同源）：url.Parse 后取 Path 的 basename，
+	// URL 带查询串时不会把查询串带进文件名，保证与扫描匹配（D2）一致。
+	imageName := imageFileName(image.DownloadURL)
+	volIDs, scanFailures, err := s.scanNodeImageVolIDs(ctx, enabledNodes, imageName)
+	if err != nil {
+		return model.IPPool{}, model.PVENode{}, "", err
+	}
+
 	for _, pool := range pools {
 		poolNodes, err := s.ipPoolRepo.GetPoolNodes(ctx, pool.ID)
 		if err != nil {
-			return model.IPPool{}, model.PVENode{}, fmt.Errorf("select node: pool %d nodes: %w", pool.ID, err)
+			return model.IPPool{}, model.PVENode{}, "", fmt.Errorf("select node: pool %d nodes: %w", pool.ID, err)
 		}
 		candidates := poolCandidates(poolNodes, enabledNodes)
 		if len(candidates) == 0 {
 			continue
 		}
-		node, err := s.selectNode(ctx, candidates)
+		withImage := make([]model.PVENode, 0, len(candidates))
+		for _, n := range candidates {
+			if _, ok := volIDs[n.ID]; ok {
+				withImage = append(withImage, n)
+			}
+		}
+		if len(withImage) == 0 {
+			continue // 池的候选节点均无该镜像：跳过该池，继续下一个
+		}
+		node, err := s.selectNode(ctx, withImage)
 		if err == nil {
-			return pool, node, nil
+			return pool, node, volIDs[node.ID], nil
 		}
 		// KindNodeUnavailable：保留最后的错误并尝试下一个池。
 	}
-	return model.IPPool{}, model.PVENode{}, nodeUnavailablef("no reachable node for zone %d", zoneID)
+	if len(volIDs) == 0 {
+		// 没有任何启用节点确认存在该镜像。若存在扫描失败的节点（不可达，
+		// 无法确认镜像是否存在），优先呈现节点不可达；全部扫描成功却无镜像
+		// 才是镜像不可用。
+		if len(scanFailures) > 0 {
+			return model.IPPool{}, model.PVENode{}, "", nodeUnavailablef("no reachable node with image %q in zone %d", image.Name, zoneID)
+		}
+		return model.IPPool{}, model.PVENode{}, "", imageNotAvailablef("image %q is not available on any enabled node of zone %d", image.Name, zoneID)
+	}
+	return model.IPPool{}, model.PVENode{}, "", nodeUnavailablef("no reachable node with image %q in zone %d", image.Name, zoneID)
+}
+
+// scanNodeImageVolIDs 并行扫描启用节点的 local 存储 import 目录，返回
+// 存在该镜像（以 imageName 的 basename 匹配）的节点到其卷 ID 的映射，以及
+// 扫描失败的节点名（节点不可达，无法确认镜像是否存在）。
+func (s *VMService) scanNodeImageVolIDs(ctx context.Context, nodes []model.PVENode, imageName string) (map[int64]string, []string, error) {
+	type scanResult struct {
+		nodeID int64
+		name   string
+		volID  string
+		found  bool
+		err    error
+	}
+	results := make([]scanResult, len(nodes))
+	var wg sync.WaitGroup
+	for i, n := range nodes {
+		wg.Add(1)
+		go func(i int, n model.PVENode) {
+			defer wg.Done()
+			volID, found, err := s.nodeImageVolID(ctx, n, imageName)
+			results[i] = scanResult{nodeID: n.ID, name: nodeName(n), volID: volID, found: found, err: err}
+		}(i, n)
+	}
+	wg.Wait()
+
+	volIDs := make(map[int64]string, len(nodes))
+	var failures []string
+	for _, r := range results {
+		if r.err != nil {
+			failures = append(failures, r.name)
+			continue
+		}
+		if r.found {
+			volIDs[r.nodeID] = r.volID
+		}
+	}
+	return volIDs, failures, nil
+}
+
+// nodeImageVolID 扫描单个节点 local 存储的 import 目录，返回与镜像文件名
+// （imageFileName 语义，与 image_service 的匹配同源）匹配的卷 ID；节点上
+// 不存在该镜像时返回 found=false。
+func (s *VMService) nodeImageVolID(ctx context.Context, node model.PVENode, imageName string) (string, bool, error) {
+	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
+	contents, err := client.ListStorageContent(ctx, nodeName(node), "local", "import")
+	if err != nil {
+		return "", false, err
+	}
+	for _, c := range contents {
+		if matchesImageName(c.Name, imageName) {
+			return c.VolID, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// matchesImageName 判断存储内容条目是否对应给定镜像：比较文件名 basename
+// 与镜像文件名（已由 imageFileName 按 URL Path 规范化），相等即匹配。
+// 与 image_service 的匹配语义同源（镜像名侧共享 imageFileName helper，
+// 保证创建 VM 的节点选择与扫描/下载匹配同一个文件名），容忍 PVE 返回
+// 完整路径的情形。
+func matchesImageName(contentName, imageName string) bool {
+	return path.Base(contentName) == imageName
 }
 
 // poolCandidates 将池的白名单节点与区域启用节点求交集。结果遵循
@@ -463,7 +558,7 @@ func poolCandidates(poolNodes, enabledNodes []model.PVENode) []model.PVENode {
 // 该 goroutine 绝不能拖垮进程：链中任何位置的 panic 都会在此被恢复并记录
 // 为内部供给错误，使 VM 行保持可检查状态（provision_error 已设置，pve_vmid
 // 仍为零）。
-func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Image,
+func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Image, imageVolID string,
 	storageType *model.StorageType, pool model.IPPool, plainPassword, ipAddr string) {
 	ctx, cancel := context.WithTimeout(context.Background(), vmProvisionTimeout)
 	defer cancel()
@@ -481,7 +576,7 @@ func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Im
 			)
 		}
 	}()
-	if err := s.provision(ctx, vm, node, image, storageType, pool, plainPassword, ipAddr); err != nil {
+	if err := s.provision(ctx, vm, node, image, imageVolID, storageType, pool, plainPassword, ipAddr); err != nil {
 		slog.Error("vm provisioning failed",
 			"vm_id", vm.ID,
 			"node", node.Name,
@@ -492,13 +587,14 @@ func (s *VMService) provisionVM(vm model.VM, node model.PVENode, image *model.Im
 }
 
 // provision 执行单步创建链（设计 D5）：先 NextVMID，然后一次 CreateVM 调用
-// 携带 scsi0 的 import-from 磁盘、cloud-init 数据盘（ide2）、vmbr0 网络以及
-// cloud-init 注入（ciuser/cipassword/ipconfig0/nameserver）；再对 qmcreate
-// 任务执行 WaitTask；当导入镜像小于请求大小时将磁盘扩展到请求大小；最后
-// 更新 pve_vmid/disk_gb 元数据。每次失败都通过 SetProvisionError 以脱敏消息
+// 携带 scsi0 的 import-from 磁盘（源为节点选择阶段返回的镜像卷 ID
+// imageVolID）、cloud-init 数据盘（ide2）、vmbr0 网络以及 cloud-init 注入
+// （ciuser/cipassword/ipconfig0/nameserver）；再对 qmcreate 任务执行
+// WaitTask；当导入镜像小于请求大小时将磁盘扩展到请求大小；最后更新
+// pve_vmid/disk_gb 元数据。每次失败都通过 SetProvisionError 以脱敏消息
 // 持久化（明文 cloud-init 密码绝不会进入数据库或日志）。
 func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENode,
-	image *model.Image, storageType *model.StorageType, pool model.IPPool,
+	image *model.Image, imageVolID string, storageType *model.StorageType, pool model.IPPool,
 	plainPassword, ipAddr string) error {
 	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
 
@@ -507,10 +603,11 @@ func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENo
 		return s.failProvision(ctx, vm.ID, 0, "next vmid", err, plainPassword)
 	}
 
-	imagePath := image.NodeImages[nodeName(node)]
-	if imagePath == "" {
-		return s.failProvision(ctx, vm.ID, 0, "image path",
-			fmt.Errorf("image %q has no storage path for node %q", image.Name, nodeName(node)), plainPassword)
+	// 镜像卷 ID 由节点选择阶段（selectPoolAndNode）保证非空；这里保留防御性
+	// 检查，防止绕过选择阶段的调用路径在空卷 ID 下产出损坏的磁盘串。
+	if imageVolID == "" {
+		return s.failProvision(ctx, vm.ID, 0, "image volid",
+			fmt.Errorf("image %q has no volume id for node %q", image.Name, nodeName(node)), plainPassword)
 	}
 
 	prefix, err := netip.ParsePrefix(pool.NetworkCIDR)
@@ -524,7 +621,7 @@ func (s *VMService) provision(ctx context.Context, vm model.VM, node model.PVENo
 		Name:       vm.Name,
 		Memory:     vm.MemMB,
 		Cores:      vm.CPU,
-		Scsi0:      pve.DiskImportString(storageType.PVEStorage, imagePath),
+		Scsi0:      pve.DiskImportString(storageType.PVEStorage, imageVolID),
 		IDE2:       storageType.PVEStorage + ":cloudinit",
 		Net0:       "virtio,bridge=vmbr0",
 		BootDisk:   "scsi0",

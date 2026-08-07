@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -19,6 +21,7 @@ type Config struct {
 	Database DatabaseConfig `yaml:"database"`
 	Crypto   CryptoConfig   `yaml:"crypto"`
 	Log      LogConfig      `yaml:"log"`
+	Images   ImagesConfig   `yaml:"images"`
 }
 
 // ServerConfig 保存 HTTP 服务器设置。
@@ -42,6 +45,15 @@ type LogConfig struct {
 	Level string `yaml:"level"`
 }
 
+// ImagesConfig 保存镜像功能（镜像登记与下载）设置。
+type ImagesConfig struct {
+	// DownloadHostAllowlist 是镜像下载源域名白名单：镜像 download_url 的
+	// host（忽略端口，精确匹配）必须命中该列表才受理镜像创建与下载。
+	// 空列表语义为拒绝所有下载（SSRF 面最小化）；常见云镜像源已内置在
+	// Default 中，生产部署可通过 config.yaml 或环境变量覆盖。
+	DownloadHostAllowlist []string `yaml:"download_host_allowlist"`
+}
+
 const (
 	defaultConfigPath = "config/config.yaml"
 	defaultPort       = 8080
@@ -52,6 +64,17 @@ const (
 	exampleEncryptionKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 )
 
+// defaultImageDownloadHosts 是镜像下载源的默认域名白名单（常见云镜像源）。
+// 下载请求最终由 PVE 节点代发（SSRF 的受害方），仅允许向这些受信源下载
+// 镜像文件；空列表语义为拒绝所有下载。
+var defaultImageDownloadHosts = []string{
+	"cloud.debian.org",
+	"cloud-images.ubuntu.com",
+	"cloud.centos.org",
+	"download.cirros-cloud.net",
+	"cloud-images.rockylinux.org",
+}
+
 // Default 返回一个填充了内置默认值的 Config。
 func Default() *Config {
 	return &Config{
@@ -59,6 +82,8 @@ func Default() *Config {
 		Database: DatabaseConfig{},
 		Crypto:   CryptoConfig{},
 		Log:      LogConfig{Level: defaultLogLevel},
+		// 内置常见云镜像源；生产通过 config.yaml / 环境变量覆盖。
+		Images: ImagesConfig{DownloadHostAllowlist: append([]string(nil), defaultImageDownloadHosts...)},
 	}
 }
 
@@ -107,6 +132,15 @@ func applyEnv(cfg *Config) error {
 	if v, ok := os.LookupEnv("SPARK_LOG_LEVEL"); ok {
 		cfg.Log.Level = v
 	}
+	// 逗号分隔覆盖镜像下载源白名单；空值/空列表语义为拒绝所有下载。
+	if v, ok := os.LookupEnv("SPARK_IMAGES_DOWNLOAD_HOST_ALLOWLIST"); ok {
+		cfg.Images.DownloadHostAllowlist = nil
+		for _, h := range strings.Split(v, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				cfg.Images.DownloadHostAllowlist = append(cfg.Images.DownloadHostAllowlist, h)
+			}
+		}
+	}
 	return nil
 }
 
@@ -126,5 +160,22 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("config: crypto.encryption_key must decode to 32 bytes, got %d", len(key))
 		}
 	}
+	// 白名单项归一：trim + 小写（域名大小写不敏感），拒绝空项、含 "/" 或
+	// ":"（防误填 URL/路径/端口）及含空白（防误填多余空格）的条目；归一
+	// 后的值写回 cfg。空列表本身合法，语义为拒绝所有下载（service 层体现）。
+	clean := make([]string, 0, len(cfg.Images.DownloadHostAllowlist))
+	for _, h := range cfg.Images.DownloadHostAllowlist {
+		if h = strings.ToLower(strings.TrimSpace(h)); h == "" {
+			return fmt.Errorf("config: images.download_host_allowlist must not contain empty entries")
+		}
+		if strings.ContainsAny(h, "/:") {
+			return fmt.Errorf("config: images.download_host_allowlist entry %q must be a bare host name (no scheme, path or port)", h)
+		}
+		if strings.IndexFunc(h, unicode.IsSpace) >= 0 {
+			return fmt.Errorf("config: images.download_host_allowlist entry %q must not contain whitespace", h)
+		}
+		clean = append(clean, h)
+	}
+	cfg.Images.DownloadHostAllowlist = clean
 	return nil
 }

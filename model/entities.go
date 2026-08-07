@@ -70,14 +70,14 @@ type StorageType struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// Image 是已注册的云镜像。NodeImages 将节点名称映射为该节点上镜像的
-// 存储路径（或存在标记）。
+// Image 是已注册的云镜像条目，包含名称、默认登录用户与下载地址
+// （download_url）；镜像在各节点上的存在状态以 PVE 实时扫描为准，不落库。
 type Image struct {
-	ID          int64             `json:"id"`
-	Name        string            `json:"name"`
-	DefaultUser string            `json:"default_user"`
-	NodeImages  map[string]string `json:"node_images"`
-	CreatedAt   time.Time         `json:"created_at"`
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	DefaultUser string    `json:"default_user"`
+	DownloadURL string    `json:"download_url"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // VM 状态常量，用于虚拟机尚未（或暂时未）存在于 PVE 侧时。
@@ -160,4 +160,29 @@ type VMOperation struct {
 	// UserID 预留：用户体系（单独提案）启用前恒为 NULL。
 	UserID    *int64    `json:"user_id,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// 镜像下载操作的动作与结果常量（image_operations 列取值）。
+const (
+	ImageOpActionDownload = "download"
+	ImageOpResultRunning  = "running"
+	ImageOpResultSuccess  = "success"
+	ImageOpResultFailed   = "failed"
+)
+
+// ImageOperation 是一次已受理的镜像下载操作（下载到某节点）的持久化记录。
+type ImageOperation struct {
+	ID      int64  `json:"id"`
+	ImageID int64  `json:"image_id"`
+	NodeID  int64  `json:"node_id"`
+	Action  string `json:"action"`
+	Result  string `json:"result"`
+	// ErrorMessage 记录失败原因；失败时非空。
+	ErrorMessage string `json:"error_message,omitempty"`
+	// UPID 是 PVE 受理后返回的任务 ID；尚未受理时为空。
+	UPID string `json:"upid,omitempty"`
+	// UserID 预留：用户体系（单独提案）启用前恒为 NULL。
+	UserID    *int64    `json:"user_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }

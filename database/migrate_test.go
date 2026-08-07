@@ -65,7 +65,7 @@ func TestEmbeddedMigrationsDiscovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrationFiles(MigrationFS): %v", err)
 	}
-	want := []string{"0001_init.sql", "0002_create_tables.sql", "0003_indexes_and_unique.sql", "0004_add_provision_error.sql", "0005_add_node_port.sql", "0006_add_pve_name.sql", "0007_import_vm.sql", "0008_vm_source_and_operations.sql"}
+	want := []string{"0001_init.sql", "0002_create_tables.sql", "0003_indexes_and_unique.sql", "0004_add_provision_error.sql", "0005_add_node_port.sql", "0006_add_pve_name.sql", "0007_import_vm.sql", "0008_vm_source_and_operations.sql", "0009_image_download.sql"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("embedded migrations = %v, want %v", names, want)
 	}
@@ -113,5 +113,31 @@ func TestPendingMigrationsIdempotent(t *testing.T) {
 	}
 	if len(third) != 0 {
 		t.Fatalf("repeated runs should stay empty, got %v", third)
+	}
+}
+
+// TestImageDownloadMigrationContent 对 0009_image_download.sql 的内容做回归
+// 校验：迁移按文件名发现、以 schema_migrations 记账，错误的内容不会被
+// 发现机制捕获，因此这里断言破坏性变更（DROP node_images）与新增对象
+// （download_url 列、image_operations 表及其索引）的关键语句确实存在。
+// 注意：迁移只在未被应用时执行一次，下述语句必须在测试环境之外的数据库
+// 上验证实际可执行性，本测试仅保证文件内容不被误删改。
+func TestImageDownloadMigrationContent(t *testing.T) {
+	raw, err := fs.ReadFile(MigrationFS, "migration/0009_image_download.sql")
+	if err != nil {
+		t.Fatalf("read migration/0009_image_download.sql: %v", err)
+	}
+	content := string(raw)
+	for _, want := range []string{
+		"ALTER TABLE images DROP COLUMN node_images;",
+		"ALTER TABLE images ADD COLUMN download_url TEXT NOT NULL DEFAULT '';",
+		"CREATE TABLE image_operations (",
+		"BIGINT NOT NULL REFERENCES images(id),",
+		"BIGINT NOT NULL REFERENCES pve_nodes(id),",
+		"CREATE INDEX image_operations_image_id_created_idx",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("migration 0009 缺少语句: %q", want)
+		}
 	}
 }

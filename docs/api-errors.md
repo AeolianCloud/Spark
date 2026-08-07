@@ -39,10 +39,10 @@ x-ms-error-code: not_found
 
 | 错误码 | HTTP 状态 | 含义 | 触发场景 |
 | --- | --- | --- | --- |
-| `bad_request` | 400 | 请求参数非法 | 请求体无法解析、必填参数缺失、路径/查询参数格式错误 |
+| `bad_request` | 400 | 请求参数非法 | 请求体无法解析、必填参数缺失、路径/查询参数格式错误；镜像下载请求 `node_ids` 与 `zone_id` 同时提供或都不提供、`node_ids` 超过 64 个、`download_url` 非 http(s) 或 host 不在下载源白名单（`images.download_host_allowlist`，空列表拒绝一切下载）、`download_url` 文件名非法（非空、非 `.`/`..`、不含路径分隔符） |
 | `not_found` | 404 | 资源不存在 | 引用不存在的 zone / node / ip-pool / storage-type / image / VM，或路径未匹配任何路由 |
 | `method_not_allowed` | 405 | 请求方法不允许 | 路径存在但请求方法未注册（响应携带 Allow 头列出允许的方法） |
-| `conflict` | 409 | 与现有状态冲突 | 重名（zone / storage-type / image 等唯一约束）、IP 池网段重叠、删除仍被引用的资源 |
+| `conflict` | 409 | 与现有状态冲突 | 重名（zone / storage-type / image 等唯一约束）、IP 池网段重叠、删除仍被引用的资源、镜像下载幂等拒绝（目标节点已有该镜像 running 下载） |
 | `unprocessable_entity` | 422 | 语义正确但被业务规则拒绝 | 未使用（预留）；磁盘缩小走专门的 `disk_shrink_not_allowed` |
 | `internal_error` | 500 | 服务器内部错误 | 未归类异常的统一兜底，不暴露内部细节 |
 | `service_unavailable` | 503 | 服务不可用 | `/healthz` 数据库探活失败时的 degraded 状态（业务 API 暂无触发） |
@@ -51,7 +51,7 @@ x-ms-error-code: not_found
 | `ip_exhausted` | 409 | IP 池无空闲地址 | 所有候选 IP 池的地址均已分配完毕 |
 | `vm_not_ready` | 409 | VM 尚不可操作 | 供给未完成或 PVE 侧 VM 已不存在时执行生命周期操作 |
 | `disk_shrink_not_allowed` | 422 | 磁盘不支持缩小 | resize 请求中 `disk_gb` 小于当前磁盘大小 |
-| `image_not_available_in_zone` | 400 | 镜像在该区域不可用 | 请求的镜像未同时存在于该区域全部启用节点 |
+| `image_not_available_in_zone` | 400 | 镜像在该区域不可用 | 区域内没有任何启用节点存在该镜像（可用性语义：至少一个启用节点存在即可用，已由"全部节点交集"放宽为"至少一个节点存在"） |
 | `vm_not_found_on_node` | 404 | 节点 PVE 可达但 VM 不在该节点上 | 认领（import）不存在的 pve_vmid，或对 ext- 标识指向的已移除/不存在的 VM 执行生命周期操作（区别于 zone/node 自身不存在的 `not_found`） |
 | `vm_already_managed` | 409 | 该节点上的 pve_vmid 已被托管 | 重复认领同一 PVE VMID（区别于一般资源冲突的 `conflict`） |
 | `invalid_vm_id` | 400 | VM id 无法解析 | 生命周期操作/操作记录查询的 `:id` 既非正整数也非 `ext-{nodeID}-{vmid}` 合成标识 |

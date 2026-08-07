@@ -57,7 +57,10 @@ func run() error {
 		return err
 	}
 
-	router := api.NewRouter(pool, cipher)
+	router := api.NewRouter(pool, cipher,
+		// 镜像下载源域名白名单来自配置（Default 内置常见云镜像源，
+		// 生产通过 config.yaml / 环境变量覆盖）。
+		api.WithImageDownloadHostAllowlist(cfg.Images.DownloadHostAllowlist))
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Server.Port),

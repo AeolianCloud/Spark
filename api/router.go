@@ -25,6 +25,15 @@ type routerOptions struct {
 	// 为 nil 时保持默认值（https://{host}:{port}/api2/json，port 取
 	// 节点持久化的端口）。
 	vmClientFactory func(host string, port int, apiUser, apiTokenSecret string) *pve.Client
+	// imageClientFactory 在设置时替换镜像服务的 PVE 客户端工厂；
+	// 为 nil 时保持默认值（https://{host}:{port}/api2/json，port 取
+	// 节点持久化的端口）。
+	imageClientFactory func(host string, port int, apiUser, apiTokenSecret string) *pve.Client
+	// imageDownloadHostAllowlist 是镜像下载源域名白名单（SSRF 面控制）：
+	// download_url 的 host 必须精确命中才受理镜像创建与下载；空列表语义
+	// 为拒绝所有下载。为 nil 时镜像服务保持其内置默认白名单（与
+	// config.Default 一致）。
+	imageDownloadHostAllowlist []string
 }
 
 // RouterOption 定制路由的构造过程。它主要是一个测试接缝：
@@ -36,6 +45,19 @@ type RouterOption func(o *routerOptions)
 // 途径得知非默认的 base URL）。
 func WithVMClientFactory(fn func(host string, port int, apiUser, apiTokenSecret string) *pve.Client) RouterOption {
 	return func(o *routerOptions) { o.vmClientFactory = fn }
+}
+
+// WithImageClientFactory 覆盖镜像服务使用的 PVE 客户端工厂，使测试可以将
+// 镜像存在性扫描与下载编排指向模拟 PVE 服务器。
+func WithImageClientFactory(fn func(host string, port int, apiUser, apiTokenSecret string) *pve.Client) RouterOption {
+	return func(o *routerOptions) { o.imageClientFactory = fn }
+}
+
+// WithImageDownloadHostAllowlist 覆盖镜像服务用于下载受理校验的域名白名单
+// （镜像 download_url 的 host 必须精确命中，忽略端口；空列表拒绝所有下载）。
+// 生产部署由 cmd/server 传入 config.Images.DownloadHostAllowlist。
+func WithImageDownloadHostAllowlist(hosts []string) RouterOption {
+	return func(o *routerOptions) { o.imageDownloadHostAllowlist = hosts }
 }
 
 // NewRouter 构建带中间件和全部路由的 gin 引擎。
@@ -158,7 +180,14 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	zoneSvc := service.NewZoneService(zoneRepo, nodeRepo)
 	ipPoolSvc := service.NewIPPoolService(ipPoolRepo, zoneRepo, nodeRepo)
 	storageTypeSvc := service.NewStorageTypeService(storageTypeRepo)
-	imageSvc := service.NewImageService(imageRepo)
+	imageOpRepo := repository.NewImageOperationRepository(pool)
+	imageSvc := service.NewImageService(imageRepo, nodeRepo, imageOpRepo)
+	if options.imageClientFactory != nil {
+		imageSvc.SetClientFactory(options.imageClientFactory)
+	}
+	if options.imageDownloadHostAllowlist != nil {
+		imageSvc.SetDownloadHostAllowlist(options.imageDownloadHostAllowlist)
+	}
 
 	// ===== zones 处理器（task 4.1）+ pve nodes 处理器（task 4.2） =====
 	// RegisterZonesRoutes 接收 /zones 和 /nodes 两个分组：node 路由大多

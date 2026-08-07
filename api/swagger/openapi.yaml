@@ -15,6 +15,8 @@
 # - 生命周期操作（start/stop/restart）202 响应携带 Location 指向状态终结点
 #   GET /vms/{id}（external 合成标识 ext-{nodeID}-{vmid} 省略 Location 头，
 #   详情端点仅支持数字本地行 id）。
+# - 镜像下载（POST /images/{id}/download）202 响应携带 Location 指向操作
+#   历史 GET /images/{id}/operations，供前端轮询下载进度。
 openapi: 3.0.3
 # 许可证说明：内部项目尚未确定 LICENSE 声明，暂不声明 license 字段
 #（info-license 豁免记录于 .redocly.lint-ignore.yaml）。
@@ -443,11 +445,14 @@ paths:
           $ref: "#/components/responses/Conflict"
     get:
       tags: [images]
-      summary: 镜像列表
+      summary: 镜像列表（可选区域过滤）
       description: |
-        带 ?zone_id= 时返回该区域各启用节点镜像的交集（不含完整 node_images）；
-        不带时返回全部镜像（含完整 node_images）。两种分支都分页并设置
-        X-Total-Count。
+        不带 ?zone_id= 时返回全部已注册镜像（[]Image）；带 ?zone_id= 时
+        返回该区域内至少一个启用节点存在该镜像的条目（[]ImageZoneItem：
+        镜像元数据 + 各启用节点存在状态；单节点扫描失败降级为"未下载"）。
+        两种分支的响应结构不同（见 200 响应 oneOf），均分页并设置
+        X-Total-Count（各分支结果集的总数）。zone_id 非法返回 400
+        bad_request；区域不存在返回 404 not_found。
       operationId: listImages
       parameters:
         - $ref: "#/components/parameters/QueryZoneID"
@@ -455,7 +460,140 @@ paths:
         - $ref: "#/components/parameters/QueryOffset"
       responses:
         "200":
-          description: 分页后的镜像列表
+          description: 分页后的镜像列表（响应结构随 zone_id 是否提供而不同）
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/XTotalCount"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    description: 不带 zone_id 时的全部镜像
+                    items:
+                      $ref: "#/components/schemas/Image"
+                  - type: array
+                    description: 带 zone_id 时的区域可用镜像（镜像 + 各节点存在状态）
+                    items:
+                      $ref: "#/components/schemas/ImageZoneItem"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /images/{id}:
+    get:
+      tags: [images]
+      summary: 镜像详情
+      description: |
+        返回指定 id 的镜像元数据（id、name、default_user、download_url、
+        created_at）。POST /images 的 201 Location 头即指向本端点。镜像
+        不存在返回 404 not_found；id 非法返回 400 bad_request。
+      operationId: getImage
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: 镜像详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Image"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /images/{id}/nodes-status:
+    get:
+      tags: [images]
+      summary: 查询镜像在各启用节点上的存在状态
+      description: |
+        返回该镜像在各启用节点上的存在状态数组（[]NodeImageStatus）：不带
+        ?zone_id= 时扫描全部启用节点；带时限定为该区域的启用节点（区域
+        不存在返回 404 not_found）。镜像不存在返回 404 not_found。单节点
+        扫描失败降级为"未下载"（downloaded=false），不会令整个请求失败。
+      operationId: listImageNodeStatus
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+        - $ref: "#/components/parameters/QueryZoneID"
+      responses:
+        "200":
+          description: 各启用节点上的镜像存在状态
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NodeImageStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /images/{id}/download:
+    post:
+      tags: [images]
+      summary: 受理镜像下载（异步执行）
+      description: |
+        将镜像下载到目标节点（node_ids 显式列表或 zone_id 区域全部启用
+        节点，二选一）：返回 202 Accepted 与本次创建的每节点一条 running
+        操作记录（[]ImageOperation），下载在后台按节点独立执行，终态
+        （success/failed）写回操作记录。Location 头指向
+        GET /images/{id}/operations，供前端轮询下载进度。
+
+        同一镜像同一节点存在未终态（running）下载时，重复受理返回 409
+        conflict；并发提交存在竞态窗口，可能产生重复记录（调用方自行去重）。
+
+        错误场景：400 node_ids 与 zone_id 同时提供或都不提供、download_url
+        非 http(s)（均 bad_request）；409 目标节点已有该镜像 running 下载
+        （conflict，幂等拒绝）；404 镜像/节点/区域不存在（not_found）。
+      operationId: downloadImage
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageDownloadRequest"
+      responses:
+        "202":
+          description: 已受理；Location 指向下载操作历史 GET /images/{id}/operations
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ImageOperation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /images/{id}/operations:
+    get:
+      tags: [images]
+      summary: 查询镜像下载操作历史（按时间倒序分页）
+      description: |
+        返回该镜像的下载操作记录（每次 POST /images/{id}/download 每节点
+        各一条），按时间倒序分页；镜像不存在返回 404 not_found。分页语义
+        与列表一致：limit 默认 25 上限 100，X-Total-Count 报告匹配总数
+        （分页前）。前端可用它轮询 Download 202 响应中 Location 头指向
+        的进度。
+      operationId: listImageOperations
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+        - $ref: "#/components/parameters/QueryLimit"
+        - $ref: "#/components/parameters/QueryOffset"
+      responses:
+        "200":
+          description: 分页后的下载操作记录（按时间倒序）
           headers:
             X-Total-Count:
               $ref: "#/components/headers/XTotalCount"
@@ -464,7 +602,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/Image"
+                  $ref: "#/components/schemas/ImageOperation"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -1196,7 +1334,7 @@ components:
 
     ImageRequest:
       type: object
-      required: [name, default_user, node_images]
+      required: [name, default_user, download_url]
       properties:
         name:
           type: string
@@ -1204,15 +1342,17 @@ components:
         default_user:
           type: string
           description: 默认登录用户，如 debian
-        node_images:
-          type: object
-          description: 节点名 → 节点上镜像路径
-          additionalProperties:
-            type: string
+        download_url:
+          type: string
+          format: uri
+          description: |
+            镜像下载地址（http/https URL，必填）：镜像文件由目标 PVE 节点
+            代发下载，服务端统一校验协议与 host（非 http(s) 拒绝）；下载
+            文件名取自 URL 路径尾段，用于节点存储内容扫描匹配。
 
     Image:
       type: object
-      required: [id, name, default_user, node_images, created_at]
+      required: [id, name, default_user, download_url, created_at]
       properties:
         id:
           type: integer
@@ -1221,11 +1361,96 @@ components:
           type: string
         default_user:
           type: string
-        node_images:
-          type: object
-          additionalProperties:
-            type: string
+        download_url:
+          type: string
+          format: uri
+          description: 镜像下载地址（http/https URL）
         created_at:
+          type: string
+          format: date-time
+
+    NodeImageStatus:
+      type: object
+      required: [node_id, node_name, pve_name, downloaded]
+      properties:
+        node_id:
+          type: integer
+          format: int64
+          description: 本地 pve_nodes.id
+        node_name:
+          type: string
+          description: 节点业务名（pve_nodes.name）
+        pve_name:
+          type: string
+          description: 节点在 PVE 集群中的节点名；为空表示与 node_name 相同（存量数据）
+        downloaded:
+          type: boolean
+          description: 该节点上是否已存在该镜像文件（扫描失败降级为 false，不拖垮整个请求）
+        volid:
+          type: string
+          description: 匹配到的卷 ID（如 local:import/debian.qcow2）；未匹配或节点扫描失败时省略
+
+    ImageZoneItem:
+      type: object
+      required: [image, nodes]
+      properties:
+        image:
+          $ref: "#/components/schemas/Image"
+        nodes:
+          type: array
+          description: 该区域各启用节点上的镜像存在状态（与节点 id 升序对齐）
+          items:
+            $ref: "#/components/schemas/NodeImageStatus"
+
+    ImageDownloadRequest:
+      type: object
+      description: |
+        node_ids 与 zone_id 二选一指定下载目标：node_ids 为显式节点列表
+        （重复 id 去重），zone_id 为区域全部启用节点。两者同时提供或都
+        不提供返回 400 bad_request。
+      properties:
+        node_ids:
+          type: array
+          description: 目标节点 ID 列表（与 zone_id 互斥）
+          items:
+            type: integer
+            format: int64
+        zone_id:
+          type: integer
+          format: int64
+          description: 目标区域 ID（与 node_ids 互斥）
+
+    ImageOperation:
+      type: object
+      required: [id, image_id, node_id, action, result, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        image_id:
+          type: integer
+          format: int64
+        node_id:
+          type: integer
+          format: int64
+        action:
+          type: string
+          description: 操作动作
+          enum: [download]
+        result:
+          type: string
+          description: 操作结果：running 已受理执行中；success/failed 为终态
+          enum: [running, success, failed]
+        error_message:
+          type: string
+          description: 失败原因（脱敏）；仅失败时出现
+        upid:
+          type: string
+          description: PVE 受理后返回的任务 ID；尚未受理时省略
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
           type: string
           format: date-time
 
