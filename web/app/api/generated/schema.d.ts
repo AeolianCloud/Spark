@@ -162,15 +162,118 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * 镜像列表
-         * @description 带 ?zone_id= 时返回该区域各启用节点镜像的交集（不含完整 node_images）；
-         *     不带时返回全部镜像（含完整 node_images）。两种分支都分页并设置
-         *     X-Total-Count。
+         * 镜像列表（可选区域过滤）
+         * @description 不带 ?zone_id= 时返回全部已注册镜像（[]Image）；带 ?zone_id= 时
+         *     返回该区域内至少一个启用节点存在该镜像的条目（[]ImageZoneItem：
+         *     镜像元数据 + 各启用节点存在状态；单节点扫描失败降级为"未下载"）。
+         *     两种分支的响应结构不同（见 200 响应 oneOf），均分页并设置
+         *     X-Total-Count（各分支结果集的总数）。zone_id 非法返回 400
+         *     bad_request；区域不存在返回 404 not_found。
          */
         get: operations["listImages"];
         put?: never;
         /** 登记 cloud 镜像 */
         post: operations["createImage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/images/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 镜像详情
+         * @description 返回指定 id 的镜像元数据（id、name、default_user、download_url、
+         *     created_at）。POST /images 的 201 Location 头即指向本端点。镜像
+         *     不存在返回 404 not_found；id 非法返回 400 bad_request。
+         */
+        get: operations["getImage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/images/{id}/nodes-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 查询镜像在各启用节点上的存在状态
+         * @description 返回该镜像在各启用节点上的存在状态数组（[]NodeImageStatus）：不带
+         *     ?zone_id= 时扫描全部启用节点；带时限定为该区域的启用节点（区域
+         *     不存在返回 404 not_found）。镜像不存在返回 404 not_found。单节点
+         *     扫描失败降级为"未下载"（downloaded=false），不会令整个请求失败。
+         */
+        get: operations["listImageNodeStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/images/{id}/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 受理镜像下载（异步执行）
+         * @description 将镜像下载到目标节点（node_ids 显式列表或 zone_id 区域全部启用
+         *     节点，二选一）：返回 202 Accepted 与本次创建的每节点一条 running
+         *     操作记录（[]ImageOperation），下载在后台按节点独立执行，终态
+         *     （success/failed）写回操作记录。Location 头指向
+         *     GET /images/{id}/operations，供前端轮询下载进度。
+         *
+         *     同一镜像同一节点存在未终态（running）下载时，重复受理返回 409
+         *     conflict；并发提交存在竞态窗口，可能产生重复记录（调用方自行去重）。
+         *
+         *     错误场景：400 node_ids 与 zone_id 同时提供或都不提供、download_url
+         *     非 http(s)（均 bad_request）；409 目标节点已有该镜像 running 下载
+         *     （conflict，幂等拒绝）；404 镜像/节点/区域不存在（not_found）。
+         */
+        post: operations["downloadImage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/images/{id}/operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 查询镜像下载操作历史（按时间倒序分页）
+         * @description 返回该镜像的下载操作记录（每次 POST /images/{id}/download 每节点
+         *     各一条），按时间倒序分页；镜像不存在返回 404 not_found。分页语义
+         *     与列表一致：limit 默认 25 上限 100，X-Total-Count 报告匹配总数
+         *     （分页前）。前端可用它轮询 Download 202 响应中 Location 头指向
+         *     的进度。
+         */
+        get: operations["listImageOperations"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -521,21 +624,86 @@ export interface components {
             name: string;
             /** @description 默认登录用户，如 debian */
             default_user: string;
-            /** @description 节点名 → 节点上镜像路径 */
-            node_images: {
-                [key: string]: string;
-            };
+            /**
+             * Format: uri
+             * @description 镜像下载地址（http/https URL，必填）：镜像文件由目标 PVE 节点
+             *     代发下载，服务端统一校验协议与 host（非 http(s) 拒绝）；下载
+             *     文件名取自 URL 路径尾段，用于节点存储内容扫描匹配。
+             */
+            download_url: string;
         };
         Image: {
             /** Format: int64 */
             id: number;
             name: string;
             default_user: string;
-            node_images: {
-                [key: string]: string;
-            };
+            /**
+             * Format: uri
+             * @description 镜像下载地址（http/https URL）
+             */
+            download_url: string;
             /** Format: date-time */
             created_at: string;
+        };
+        NodeImageStatus: {
+            /**
+             * Format: int64
+             * @description 本地 pve_nodes.id
+             */
+            node_id: number;
+            /** @description 节点业务名（pve_nodes.name） */
+            node_name: string;
+            /** @description 节点在 PVE 集群中的节点名；为空表示与 node_name 相同（存量数据） */
+            pve_name: string;
+            /** @description 该节点上是否已存在该镜像文件（扫描失败降级为 false，不拖垮整个请求） */
+            downloaded: boolean;
+            /** @description 匹配到的卷 ID（如 local:import/debian.qcow2）；未匹配或节点扫描失败时省略 */
+            volid?: string;
+        };
+        ImageZoneItem: {
+            image: components["schemas"]["Image"];
+            /** @description 该区域各启用节点上的镜像存在状态（与节点 id 升序对齐） */
+            nodes: components["schemas"]["NodeImageStatus"][];
+        };
+        /**
+         * @description node_ids 与 zone_id 二选一指定下载目标：node_ids 为显式节点列表
+         *     （重复 id 去重），zone_id 为区域全部启用节点。两者同时提供或都
+         *     不提供返回 400 bad_request。
+         */
+        ImageDownloadRequest: {
+            /** @description 目标节点 ID 列表（与 zone_id 互斥） */
+            node_ids?: number[];
+            /**
+             * Format: int64
+             * @description 目标区域 ID（与 node_ids 互斥）
+             */
+            zone_id?: number;
+        };
+        ImageOperation: {
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            image_id: number;
+            /** Format: int64 */
+            node_id: number;
+            /**
+             * @description 操作动作
+             * @enum {string}
+             */
+            action: "download";
+            /**
+             * @description 操作结果：running 已受理执行中；success/failed 为终态
+             * @enum {string}
+             */
+            result: "running" | "success" | "failed";
+            /** @description 失败原因（脱敏）；仅失败时出现 */
+            error_message?: string;
+            /** @description PVE 受理后返回的任务 ID；尚未受理时省略 */
+            upid?: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
         };
         CreateVMRequest: {
             /** @description VM 名称 */
@@ -1367,14 +1535,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 分页后的镜像列表 */
+            /** @description 分页后的镜像列表（响应结构随 zone_id 是否提供而不同） */
             200: {
                 headers: {
                     "X-Total-Count": components["headers"]["XTotalCount"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Image"][];
+                    "application/json": components["schemas"]["Image"][] | components["schemas"]["ImageZoneItem"][];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1406,6 +1574,121 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
+        };
+    };
+    getImage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 镜像详情 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Image"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listImageNodeStatus: {
+        parameters: {
+            query?: {
+                /** @description 按区域过滤（正整数；格式非法返回 400） */
+                zone_id?: components["parameters"]["QueryZoneID"];
+            };
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 各启用节点上的镜像存在状态 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeImageStatus"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    downloadImage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImageDownloadRequest"];
+            };
+        };
+        responses: {
+            /** @description 已受理；Location 指向下载操作历史 GET /images/{id}/operations */
+            202: {
+                headers: {
+                    Location: components["headers"]["Location"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageOperation"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    listImageOperations: {
+        parameters: {
+            query?: {
+                /** @description 每页条数；默认 25，上限 100，超出会被服务端截断，负数/非数字返回 400 */
+                limit?: components["parameters"]["QueryLimit"];
+                /** @description 跳过条数；默认 0，负数/非数字返回 400 */
+                offset?: components["parameters"]["QueryOffset"];
+            };
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 分页后的下载操作记录（按时间倒序） */
+            200: {
+                headers: {
+                    "X-Total-Count": components["headers"]["XTotalCount"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageOperation"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
         };
     };
     listVMs: {

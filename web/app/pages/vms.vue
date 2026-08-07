@@ -15,7 +15,7 @@ import {
   createVM,
   destroyVM,
   importVM,
-  listImages,
+  listImagesByZone,
   listStorageTypes,
   listVMOperations,
   listVMs,
@@ -292,7 +292,7 @@ const imageOptions = computed(() => images.value.map(i => ({ label: `${i.name}�
 // 镜像列表请求序号守卫：Zone 快速切换时丢弃过期响应，防止旧 Zone 的镜像覆盖新 Zone
 let imagesSeq = 0
 
-// 可用区切换 → 镜像按该 Zone 过滤（契约 listImages 支持 zone_id；镜像可用性依赖 Zone）
+// 可用区切换 → 镜像按该 Zone 过滤（契约 listImagesByZone 支持 zone_id；镜像可用性依赖 Zone）
 watch(() => createForm.zone_id, async (zoneId) => {
   createForm.image_id = undefined // 切换 Zone 后原镜像可能不可用，强制重新选择
   images.value = []
@@ -301,10 +301,11 @@ watch(() => createForm.zone_id, async (zoneId) => {
   const seq = ++imagesSeq
   imagesLoading.value = true
   try {
-    const res = await listImages({ zone_id: zoneId, limit: 100 })
+    // 区域过滤分支响应为 ImageZoneItem[]（image + 各启用节点存在状态），仅需 image 元数据
+    const res = await listImagesByZone(zoneId, { limit: 100 })
     // 过期响应丢弃：期间 Zone 已再次切换
     if (seq !== imagesSeq || zoneId !== createForm.zone_id) return
-    images.value = res.data
+    images.value = res.data.map(item => item.image)
   } catch (err) {
     if (seq !== imagesSeq || zoneId !== createForm.zone_id) return
     imagesLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
