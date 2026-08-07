@@ -12,3 +12,15 @@ crypto:
 
 log:
   level: "info"
+
+images:
+  # 镜像下载源域名白名单：镜像 download_url 的 host（忽略端口，精确匹配）
+  # 必须命中该列表才受理镜像创建与下载；空列表拒绝所有镜像下载。
+  # 常见云镜像源已内置默认值，生产可按需增删；也可用环境变量
+  # SPARK_IMAGES_DOWNLOAD_HOST_ALLOWLIST（逗号分隔）整体覆盖。
+  download_host_allowlist:
+    - cloud.debian.org
+    - cloud-images.ubuntu.com
+    - cloud.centos.org
+    - download.cirros-cloud.net
+    - cloud-images.rockylinux.org

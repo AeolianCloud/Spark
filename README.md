@@ -29,6 +29,7 @@
 | `database.dsn` | `SPARK_DATABASE_DSN` | PostgreSQL 连接串，如 `postgres://spark:xxx@localhost:5432/spark?sslmode=disable` |
 | `crypto.encryption_key` | `SPARK_CRYPTO_ENCRYPTION_KEY` | base64 编码的 32 字节 AES 密钥，用于加密 VM 的 cloud-init 密码 |
 | `log.level` | `SPARK_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
+| `images.download_host_allowlist` | `SPARK_IMAGES_DOWNLOAD_HOST_ALLOWLIST` | 镜像下载源域名白名单（逗号分隔），默认内置 5 个云镜像源；空列表拒绝所有下载 |
 
 生成加密密钥：
 
@@ -58,20 +59,14 @@ Web 管理界面（`web/`）的生产部署（nginx 静态托管 + `/api` 反代
 
 1. **确认网桥**：`vmbr0` 存在且可路由（创建 VM 时网络固定挂 `bridge=vmbr0`）。
 
-2. **放置 cloud 镜像**（qcow2 格式），例如：
-
-   ```bash
-   scp debian-12-genericcloud-amd64.qcow2 root@pve:/var/lib/vz/template/iso/
-   ```
-
-   随后通过 API 登记到镜像目录（`POST /images`），`node_images` 以**节点名**为 key、值为节点上的镜像路径：
+2. **登记 cloud 镜像**（qcow2 格式）：通过 API 登记镜像下载地址（`POST /images`），镜像由目标 PVE 节点代发下载到 local 存储的 import 目录（`/var/lib/vz/import/`）：
 
    ```json
    {"name": "debian-12-cloud", "default_user": "debian",
-    "node_images": {"pve1": "/var/lib/vz/template/iso/debian-12-genericcloud-amd64.qcow2"}}
+    "download_url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"}
    ```
 
-   创建 VM 时该路径会以 `scsi0="<storage>:0,import-from=<path>"` 的形式交给 PVE 在 `qmcreate` 任务中一步完成导入。
+   随后用 `POST /images/:id/download` 把镜像下载到目标节点（`node_ids` 或 `zone_id` 指定）；也可以手工 `scp` 同名文件到节点的 `/var/lib/vz/import/`，两种方式都会被 PVE 扫描识别。创建 VM 时该镜像会以 `import-from` 的形式交给 PVE 在 `qmcreate` 任务中一步完成导入。
 
 3. **创建 API token**（在 PVE 节点 shell 执行，或 Web 界面 DataCenter → Permissions）：
 
@@ -109,8 +104,12 @@ Web 管理界面（`web/`）的生产部署（nginx 静态托管 + `/api` 反代
 | POST | `/storage-types` | 登记存储类型 | `name`、`display_name`、`pve_storage` |
 | GET | `/storage-types` | 存储类型列表（分页） | `limit?`、`offset?` |
 | GET/PUT/DELETE | `/storage-types/:id` | 存储类型查/改/删（DELETE → 204） | — |
-| POST | `/images` | 登记 cloud 镜像 | `name`、`default_user`、`node_images{节点名→路径}` |
-| GET | `/images` | 镜像列表；`?zone_id=` 返回该区域各节点镜像交集（分页） | `zone_id?`、`limit?`、`offset?` |
+| POST | `/images` | 登记 cloud 镜像 | `name`、`default_user`、`download_url`（http(s)，必填） |
+| GET | `/images` | 镜像列表；`?zone_id=` 返回区域内至少一个启用节点存在该镜像的条目（含各节点存在状态；分页） | `zone_id?`、`limit?`、`offset?` |
+| GET | `/images/:id` | 镜像详情 | — |
+| GET | `/images/:id/nodes-status` | 镜像在各启用节点上的存在状态（`?zone_id=` 限定区域） | `zone_id?` |
+| POST | `/images/:id/download` | 受理镜像下载到目标节点/区域（202 异步，`Location` 指向 `GET /images/:id/operations`） | `node_ids` 或 `zone_id` |
+| GET | `/images/:id/operations` | 镜像下载操作历史（分页） | `limit?`、`offset?` |
 | POST | `/vms` | 创建 VM：分配 IP → 落库 → 异步 PVE 创建链，立即返回 201 | `name`、`cpu`、`mem_mb`、`disk_gb`、`image_id`、`storage_type_id`、`zone_id`、`password` |
 | GET | `/vms` | 列表（穿透式合并各节点实时状态，节点故障出现在 `warnings`；分页） | `limit?`、`offset?` |
 | GET | `/vms/:id` | 详情（穿透实时状态） | — |
@@ -124,7 +123,7 @@ Web 管理界面（`web/`）的生产部署（nginx 静态托管 + `/api` 反代
 - **节点（pve_nodes）**：PVE 节点登记（host + API token），可启停（`enabled`）。
 - **IP 池（ip_pools / ips）**：池登记网段/网关/DNS，展开为逐地址记录；节点白名单（`ip_pool_nodes`）限定哪些节点可用该池。分配采用「随机选 + 条件 UPDATE 原子占位」，并发安全。
 - **存储抽象（storage_types）**：`name/display_name` 对外，`pve_storage` 映射真实 PVE 存储。
-- **镜像目录（images）**：`node_images` 记录镜像在各节点的路径；区域可用镜像 = 各节点交集。
+- **镜像目录（images）**：登记镜像元数据（`name`/`default_user`/`download_url`）；镜像在各节点的存在状态由 PVE 实时扫描（local 存储 import content，即 `/var/lib/vz/import/`）；区域可用镜像 = 区域内至少一个启用节点存在该镜像。
 - **VM 状态语义**：DB 不存状态镜像（穿透式）。创建返回 `creating`；异步供给链失败后详情/列表返回 `failed`（`provision_error` 携带原因）；供给成功后的状态实时读取自 PVE（`running`/`stopped` 等）。
 
 ## 契约与工具链

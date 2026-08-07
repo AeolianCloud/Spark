@@ -104,6 +104,51 @@ func TestListNodesByIDs(t *testing.T) {
 	}
 }
 
+// TestListEnabledNodesByZone 验证区域内启用节点的过滤条件（zone_id + enabled）
+// 与列读取。
+func TestListEnabledNodesByZone(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectQuery("SELECT id, zone_id, name, pve_name, host, port, api_user, api_token_secret, enabled, created_at FROM pve_nodes WHERE zone_id=$1 AND enabled ORDER BY id").
+		WithArgs(int64(1)).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "zone_id", "name", "pve_name", "host", "port", "api_user", "api_token_secret", "enabled", "created_at"}).
+			AddRow(int64(1), int64(1), "pve1", "aeoliancloud", "10.0.0.1", int32(8006), "root@pam!spark", "s1", true, testTime))
+
+	repo := NewNodeRepository(mock)
+	nodes, err := repo.ListEnabledNodesByZone(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("ListEnabledNodesByZone: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].ID != 1 || nodes[0].PveName != "aeoliancloud" {
+		t.Fatalf("nodes = %+v, want only enabled node pve1", nodes)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestListAllEnabledNodes 验证跨区域全量启用节点查询（不带 zone 过滤，
+// 支撑镜像服务不带区域的节点状态扫描），结果按 id 排序。
+func TestListAllEnabledNodes(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectQuery("SELECT id, zone_id, name, pve_name, host, port, api_user, api_token_secret, enabled, created_at FROM pve_nodes WHERE enabled ORDER BY id").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "zone_id", "name", "pve_name", "host", "port", "api_user", "api_token_secret", "enabled", "created_at"}).
+			AddRow(int64(1), int64(1), "pve1", "aeoliancloud", "10.0.0.1", int32(8006), "root@pam!spark", "s1", true, testTime).
+			AddRow(int64(3), int64(2), "pve3", "", "10.0.0.3", int32(8006), "root@pam!spark", "s3", true, testTime))
+
+	repo := NewNodeRepository(mock)
+	nodes, err := repo.ListAllEnabledNodes(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllEnabledNodes: %v", err)
+	}
+	if len(nodes) != 2 || nodes[0].ID != 1 || nodes[1].ID != 3 ||
+		nodes[0].ZoneID != 1 || nodes[1].ZoneID != 2 {
+		t.Fatalf("nodes = %+v, want enabled nodes id 1 (zone 1) and 3 (zone 2), disabled node 2 excluded", nodes)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 // TestUpdateNodeWritesAndReadsPort 验证 UPDATE 写入 port 与 pve_name 列，
 // 且 RETURNING nodeCols 扫描同样读取它们。
 func TestUpdateNodeWritesAndReadsPort(t *testing.T) {

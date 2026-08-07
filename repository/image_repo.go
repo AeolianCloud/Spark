@@ -4,35 +4,33 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"spark/model"
 )
 
-// ImageRepository 负责持久化 model.Image 行，包括 node_images JSONB
-// 映射（节点名 -> 存储路径或存在性标记）。
+// ImageRepository 负责持久化 model.Image 行。镜像在各节点上的存在状态
+// 以 PVE 实时扫描为准，不落库；本仓库仅管理名称、默认登录用户与下载
+// 地址（download_url）等元数据。
 type ImageRepository struct {
-	pool *pgxpool.Pool
+	pool pgxQuerier
 }
 
 // NewImageRepository 创建由 pool 支撑的 ImageRepository。
-func NewImageRepository(pool *pgxpool.Pool) *ImageRepository {
+func NewImageRepository(pool pgxQuerier) *ImageRepository {
 	return &ImageRepository{pool: pool}
 }
 
-const imageCols = "id, name, default_user, node_images, created_at"
+// imageCols 是 images 的读取列清单。
+const imageCols = "id, name, default_user, download_url, created_at"
 
-// Create 插入一个镜像并返回它，且已填充 id 与 created_at。nil 的
-// nodeImages 会被规范化为空 map，使 JSONB 列写为 '{}'（migration 约定），
-// 绝不为 SQL NULL。名称重复时产生 ErrConflict。
-func (r *ImageRepository) Create(ctx context.Context, name, defaultUser string, nodeImages map[string]string) (*model.Image, error) {
-	if nodeImages == nil {
-		nodeImages = map[string]string{}
-	}
-	img := &model.Image{Name: name, DefaultUser: defaultUser, NodeImages: nodeImages}
+// Create 插入一个镜像并返回它，且已填充 id 与 created_at。调用方
+// （service 层）保证 name/default_user/download_url 均非空——repository
+// 不做业务校验（download_url 非空校验在 service 层，与 name 一致）。
+// 名称重复时产生 ErrConflict。
+func (r *ImageRepository) Create(ctx context.Context, name, defaultUser, downloadURL string) (*model.Image, error) {
+	img := &model.Image{Name: name, DefaultUser: defaultUser, DownloadURL: downloadURL}
 	err := r.pool.QueryRow(ctx,
-		"INSERT INTO images (name, default_user, node_images) VALUES ($1, $2, $3) RETURNING id, created_at",
-		name, defaultUser, nodeImages,
+		"INSERT INTO images (name, default_user, download_url) VALUES ($1, $2, $3) RETURNING id, created_at",
+		name, defaultUser, downloadURL,
 	).Scan(&img.ID, &img.CreatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
@@ -44,7 +42,7 @@ func (r *ImageRepository) Create(ctx context.Context, name, defaultUser string, 
 func (r *ImageRepository) Get(ctx context.Context, id int64) (*model.Image, error) {
 	var img model.Image
 	err := r.pool.QueryRow(ctx, "SELECT "+imageCols+" FROM images WHERE id=$1", id).
-		Scan(&img.ID, &img.Name, &img.DefaultUser, &img.NodeImages, &img.CreatedAt)
+		Scan(&img.ID, &img.Name, &img.DefaultUser, &img.DownloadURL, &img.CreatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
 	}
@@ -55,7 +53,7 @@ func (r *ImageRepository) Get(ctx context.Context, id int64) (*model.Image, erro
 func (r *ImageRepository) GetByName(ctx context.Context, name string) (*model.Image, error) {
 	var img model.Image
 	err := r.pool.QueryRow(ctx, "SELECT "+imageCols+" FROM images WHERE name=$1", name).
-		Scan(&img.ID, &img.Name, &img.DefaultUser, &img.NodeImages, &img.CreatedAt)
+		Scan(&img.ID, &img.Name, &img.DefaultUser, &img.DownloadURL, &img.CreatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
 	}
@@ -73,7 +71,7 @@ func (r *ImageRepository) List(ctx context.Context) ([]model.Image, error) {
 	images := make([]model.Image, 0)
 	for rows.Next() {
 		var img model.Image
-		if err := rows.Scan(&img.ID, &img.Name, &img.DefaultUser, &img.NodeImages, &img.CreatedAt); err != nil {
+		if err := rows.Scan(&img.ID, &img.Name, &img.DefaultUser, &img.DownloadURL, &img.CreatedAt); err != nil {
 			return nil, fmt.Errorf("images: scan: %w", err)
 		}
 		images = append(images, img)
@@ -97,7 +95,7 @@ func (r *ImageRepository) ListPage(ctx context.Context, limit, offset int) ([]mo
 	images := make([]model.Image, 0)
 	for rows.Next() {
 		var img model.Image
-		if err := rows.Scan(&img.ID, &img.Name, &img.DefaultUser, &img.NodeImages, &img.CreatedAt); err != nil {
+		if err := rows.Scan(&img.ID, &img.Name, &img.DefaultUser, &img.DownloadURL, &img.CreatedAt); err != nil {
 			return nil, fmt.Errorf("images: scan: %w", err)
 		}
 		images = append(images, img)
@@ -125,29 +123,4 @@ func (r *ImageRepository) ZoneExists(ctx context.Context, id int64) (bool, error
 		return false, fmt.Errorf("images: zone exists: %w", err)
 	}
 	return exists, nil
-}
-
-// EnabledNodeNamesByZone 返回区域内已启用节点的 PVE 集群节点名（pve_name，
-// 空值回退业务名 name），按 id 排序。它支撑 ImageService.ListImagesByZone：
-// 镜像的 node_images 映射按集群节点名登记，交集校验因此必须使用
-// pve_name 而非业务名（任务 4.3）。
-func (r *ImageRepository) EnabledNodeNamesByZone(ctx context.Context, zoneID int64) ([]string, error) {
-	rows, err := r.pool.Query(ctx, "SELECT COALESCE(NULLIF(pve_name, ''), name) AS name FROM pve_nodes WHERE zone_id=$1 AND enabled=TRUE ORDER BY id", zoneID)
-	if err != nil {
-		return nil, fmt.Errorf("images: enabled nodes by zone: %w", err)
-	}
-	defer rows.Close()
-
-	names := make([]string, 0)
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("images: scan node name: %w", err)
-		}
-		names = append(names, name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("images: iterate node names: %w", err)
-	}
-	return names, nil
 }

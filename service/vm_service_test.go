@@ -410,9 +410,8 @@ func (f *fakeVMNodeRepository) ListNodesByIDs(ctx context.Context, ids []int64) 
 
 // fakeVMImageRepository 是供服务测试使用的可脚本化 VMImageRepository。
 type fakeVMImageRepository struct {
-	images    []model.Image
-	nodeNames []string
-	err       error
+	images []model.Image
+	err    error
 }
 
 func (f *fakeVMImageRepository) Get(ctx context.Context, id int64) (*model.Image, error) {
@@ -426,13 +425,6 @@ func (f *fakeVMImageRepository) Get(ctx context.Context, id int64) (*model.Image
 		}
 	}
 	return nil, pgx.ErrNoRows
-}
-
-func (f *fakeVMImageRepository) EnabledNodeNamesByZone(ctx context.Context, zoneID int64) ([]string, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.nodeNames, nil
 }
 
 // fakeVMStorageTypeRepository 是供服务测试使用的可脚本化
@@ -553,14 +545,15 @@ func testPVENode(id int64) model.PVENode {
 }
 
 // createEnv 为快乐路径创建测试构建完全有效的假环境：区域 1 带一个启用节点、
-// 一个将该节点加入白名单的池、一个存在于该节点上的镜像以及一个存储类型。
+// 一个将该节点加入白名单的池、一个存在于该节点上的镜像（DownloadURL 的
+// basename 与 scriptedProvisionServer 预置的 local/import 清单匹配）以及
+// 一个存储类型。
 func createEnv() (*fakeVMZoneRepository, *fakeVMImageRepository, *fakeVMStorageTypeRepository, *fakeVMNodeRepository, *fakeVMIPPoolRepository) {
 	node := testPVENode(1)
 	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
 	imageRepo := &fakeVMImageRepository{
 		images: []model.Image{{ID: 1, Name: "debian-12-cloud", DefaultUser: "debian",
-			NodeImages: map[string]string{"pve1": "/templates/debian-12-cloud.qcow2"}}},
-		nodeNames: []string{"pve1"},
+			DownloadURL: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"}},
 	}
 	stRepo := &fakeVMStorageTypeRepository{types: []model.StorageType{{ID: 1, Name: "ssd", PVEStorage: "local-ssd"}}}
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{node}}
@@ -751,11 +744,10 @@ func TestCreateVMValidationOrder(t *testing.T) {
 	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindNotFound) {
 		t.Fatalf("unknown storage err = %v, want KindNotFound", err)
 	}
-	// 镜像未出现在所有启用节点上 -> KindImageNotAvailable。
+	// 镜像在任何启用节点上都不存在（content 扫描无匹配）-> KindImageNotAvailable。
 	imgRepo := &fakeVMImageRepository{
 		images: []model.Image{{ID: 1, Name: "debian-12-cloud", DefaultUser: "debian",
-			NodeImages: map[string]string{"pve1": "/t.img"}}},
-		nodeNames: []string{"pve1", "pve2"},
+			DownloadURL: "https://example.com/not-present.qcow2"}},
 	}
 	svc2 := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imgRepo, stRepo)
 	if _, err := svc2.CreateVM(context.Background(), req); !isKind(err, KindImageNotAvailable) {
@@ -823,11 +815,110 @@ func TestCreateVMClaimNoFreeAddress(t *testing.T) {
 	}
 }
 
-// TestSelectPoolAndNodeSkipsUnreachablePools 验证 D4：不可达的池会被跳过
-// 转而使用下一个，没有可达池的区域会产生 node_unavailable。
+// TestCreateVMSchedulesToNodeWithImage 验证镜像感知调度（任务 5.6）：区域内
+// 一个节点有镜像、另一个没有时，VM 被调度到有镜像的节点（镜像过滤先于可达
+// 性选择执行）。
+func TestCreateVMSchedulesToNodeWithImage(t *testing.T) {
+	nodeA := testPVENode(1) // pve1：有镜像
+	nodeB := model.PVENode{ID: 2, ZoneID: 1, Name: "pve2", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	imageRepo := &fakeVMImageRepository{images: []model.Image{*testDebianImage()}}
+	stRepo := &fakeVMStorageTypeRepository{types: []model.StorageType{{ID: 1, Name: "ssd", PVEStorage: "local-ssd"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{nodeA, nodeB}}
+	ipRepo := &fakeVMIPPoolRepository{
+		pools:     []model.IPPool{{ID: 1, ZoneID: 1, Name: "p1", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1", DNS: "1.1.1.1"}},
+		poolNodes: map[int64][]model.PVENode{1: {nodeA, nodeB}},
+	}
+	ipRepo.claimResults = []claimResult{{ip: model.IP{ID: 7, PoolID: 1, IP: "10.0.0.5", Status: model.IPStatusUsed}}}
+	vmRepo := &fakeVMRepository{}
+	svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	vm, err := svc.CreateVM(context.Background(), validCreateRequest())
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	// selectNode = firstReachableCandidate：镜像过滤后只剩 pve1（pve2 的
+	// local/import 清单为空），因此 VM 必须落在 pve1。
+	if vm.VM.NodeID != 1 {
+		t.Fatalf("vm node = %d, want 1 (pve1, the only node with the image)", vm.VM.NodeID)
+	}
+	waitForProvision(t, vmRepo)
+}
+
+// TestCreateVMImageNotAvailableOnAnyNode 验证镜像在任何启用节点上都不存在
+// 时返回 KindImageNotAvailable（任务 5.6 的失败区分：先于 node_unavailable
+// 判定）。
+func TestCreateVMImageNotAvailableOnAnyNode(t *testing.T) {
+	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+	// 镜像 DownloadURL 与 scriptedProvisionServer 预置的 local/import 清单
+	// 不匹配：节点上不存在该镜像。
+	imageRepo.images[0].DownloadURL = "https://example.com/not-present.qcow2"
+	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	_, err := svc.CreateVM(context.Background(), validCreateRequest())
+	if !isKind(err, KindImageNotAvailable) {
+		t.Fatalf("err = %v, want KindImageNotAvailable", err)
+	}
+}
+
+// TestCreateVMNodeUnavailableWhenImageNodesUnreachable 验证镜像存在于启用
+// 节点上但全部不可达时返回 KindNodeUnavailable（任务 5.6 的失败区分：区别于
+// 镜像不存在）。
+func TestCreateVMNodeUnavailableWhenImageNodesUnreachable(t *testing.T) {
+	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+	// 镜像过滤后 pve1 仍在候选，但可达性探测全部失败。
+	svc.selectNode = scriptedSelectNode(map[string]bool{"pve1": true})
+
+	_, err := svc.CreateVM(context.Background(), validCreateRequest())
+	if !isKind(err, KindNodeUnavailable) {
+		t.Fatalf("err = %v, want KindNodeUnavailable", err)
+	}
+}
+
+// newStorageContentServer 应答镜像存在性扫描（ListStorageContent）：按节点
+// 名返回预置的 local/import 存储清单；未配置的节点返回空清单。供镜像感知
+// 调度测试（任务 5.6）注入 newClient 使用。
+func newStorageContentServer(contents map[string][]pve.StorageContent) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/storage/local/content") {
+			http.NotFound(w, r)
+			return
+		}
+		node := strings.TrimPrefix(r.URL.Path, "/nodes/")
+		node = node[:strings.Index(node, "/")]
+		items := contents[node]
+		if items == nil {
+			items = []pve.StorageContent{}
+		}
+		data, err := json.Marshal(items)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, `{"data": %s}`, data)
+	}))
+}
+
+// testDebianImage 是供节点选择测试使用的镜像：DownloadURL 的 basename 与
+// 常见测试环境预置的 local/import 清单匹配。
+func testDebianImage() *model.Image {
+	return &model.Image{ID: 1, Name: "debian-12-cloud", DefaultUser: "debian",
+		DownloadURL: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"}
+}
+
+// TestSelectPoolAndNodeSkipsUnreachablePools 验证 D4 + 镜像感知调度（5.6）：
+// 没有带镜像候选的池会被跳过转而使用下一个，没有"带镜像且可达"池的区域
+// 会产生 node_unavailable；区域内任何启用节点都没有镜像时产生
+// image_not_available。
 func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
-	deadNode := model.PVENode{ID: 1, ZoneID: 1, Name: "pve-dead", Host: "h1", Enabled: true}
-	aliveNode := model.PVENode{ID: 2, ZoneID: 1, Name: "pve-alive", Host: "h2", Enabled: true}
+	image := testDebianImage()
+	// download_url 带查询串：镜像名匹配必须与 image_service 同源（url.Parse
+	// 后取 Path 的 basename），查询串绝不能带进文件名，否则与 PVE 扫描到的
+	// 文件名永不匹配（B-1 回归保护）。
+	image.DownloadURL += "?version=1"
+	deadNode := model.PVENode{ID: 1, ZoneID: 1, Name: "pve-dead", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
+	aliveNode := model.PVENode{ID: 2, ZoneID: 1, Name: "pve-alive", Host: "h2", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
 	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{deadNode, aliveNode}}
 	ipRepo := &fakeVMIPPoolRepository{
@@ -837,31 +928,60 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 		},
 		poolNodes: map[int64][]model.PVENode{1: {deadNode}, 2: {aliveNode}},
 	}
+	// alive 节点上有镜像，dead 节点上没有：content 扫描按节点名区分。
+	contentSrv := newStorageContentServer(map[string][]pve.StorageContent{
+		"pve-alive": {{VolID: "local:import/debian-12-genericcloud-amd64.qcow2", Name: "debian-12-genericcloud-amd64.qcow2"}},
+	})
+	defer contentSrv.Close()
 	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
 		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, testCipher(t))
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
+	}
 
-	// 池 1 的唯一节点是死的，池 2 的可达 -> 池 2 胜出。
+	// 池 1 的唯一节点没有镜像（且不可达），池 2 的节点有镜像且可达 -> 池 2
+	// 胜出，返回该节点上的镜像卷 ID。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve-dead": true})
-	pool, node, err := svc.selectPoolAndNode(context.Background(), 1)
+	pool, node, volid, err := svc.selectPoolAndNode(context.Background(), 1, image)
 	if err != nil {
 		t.Fatalf("selectPoolAndNode: %v", err)
 	}
 	if pool.ID != 2 || node.Name != "pve-alive" {
 		t.Fatalf("pool = %+v node = %+v, want pool 2 / pve-alive", pool, node)
 	}
+	if volid != "local:import/debian-12-genericcloud-amd64.qcow2" {
+		t.Fatalf("volid = %q, want the image volume id on pve-alive", volid)
+	}
 
-	// 两个池的节点都是死的 -> node_unavailable。
+	// 两个池的节点都有镜像但都不可达 -> node_unavailable。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve-dead": true, "pve-alive": true})
-	_, _, err = svc.selectPoolAndNode(context.Background(), 1)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image)
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
 
-	// 完全没有池 -> node_unavailable（候选集为空）。
+	// 完全没有池 -> node_unavailable（候选集为空；区域仍有节点带镜像）。
 	ipRepo.pools = nil
-	_, _, err = svc.selectPoolAndNode(context.Background(), 1)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image)
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("no pools err = %v, want KindNodeUnavailable", err)
+	}
+
+	// 区域内所有启用节点都没有该镜像 -> image_not_available（与不可达区分）。
+	emptySrv := newStorageContentServer(nil)
+	defer emptySrv.Close()
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(emptySrv.URL), pve.WithHTTPClient(emptySrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+	ipRepo.pools = []model.IPPool{
+		{ID: 1, ZoneID: 1, Name: "dead-pool", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
+		{ID: 2, ZoneID: 1, Name: "alive-pool", NetworkCIDR: "10.0.1.0/24", Gateway: "10.0.1.1"},
+	}
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image)
+	if !isKind(err, KindImageNotAvailable) {
+		t.Fatalf("no image err = %v, want KindImageNotAvailable", err)
 	}
 }
 
@@ -907,6 +1027,14 @@ func (s *scriptedProvisionServer) handler() http.HandlerFunc {
 		case r.URL.Path == "/nodes/pve1/qemu/100" && r.Method == http.MethodDelete:
 			s.destroyed = true
 			fmt.Fprint(w, `{"data": "UPID:pve1:00000E5B:01C9EC9E:5FAB1EC4:qmdestroy:100:root@pam:"}`)
+		case strings.HasSuffix(r.URL.Path, "/storage/local/content"):
+			// 镜像存在性扫描（任务 5.6）：pve1 上预置与 createEnv 镜像
+			// DownloadURL basename 匹配的 import 条目，其余节点为空清单。
+			if strings.HasPrefix(r.URL.Path, "/nodes/pve1/") {
+				fmt.Fprint(w, `{"data": [{"volid": "local:import/debian-12-genericcloud-amd64.qcow2", "name": "debian-12-genericcloud-amd64.qcow2"}]}`)
+			} else {
+				fmt.Fprint(w, `{"data": []}`)
+			}
 		default:
 			s.t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
@@ -934,7 +1062,8 @@ func TestProvisionSuccessChain(t *testing.T) {
 	err := svc.provision(context.Background(),
 		model.VM{ID: 1, Name: "vm1", MemMB: 2048, CPU: 2, DiskGB: 10},
 		model.PVENode{Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"},
-		&model.Image{Name: "debian-12-cloud", DefaultUser: "debian", NodeImages: map[string]string{"pve1": "/templates/d.qcow2"}},
+		&model.Image{Name: "debian-12-cloud", DefaultUser: "debian"},
+		"local:import/debian-12-genericcloud-amd64.qcow2",
 		&model.StorageType{PVEStorage: "local-ssd"},
 		model.IPPool{NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1", DNS: "1.1.1.1"},
 		pw, "10.0.0.5")
@@ -946,7 +1075,7 @@ func TestProvisionSuccessChain(t *testing.T) {
 	body := srv.createBody
 	if body["vmid"] != float64(100) || body["name"] != "vm1" ||
 		body["memory"] != float64(2048) || body["cores"] != float64(2) ||
-		body["scsi0"] != "local-ssd:0,import-from=/templates/d.qcow2" ||
+		body["scsi0"] != "local-ssd:0,import-from=local:import/debian-12-genericcloud-amd64.qcow2" ||
 		body["ide2"] != "local-ssd:cloudinit" ||
 		body["net0"] != "virtio,bridge=vmbr0" ||
 		body["bootdisk"] != "scsi0" || body["scsihw"] != "virtio-scsi-pci" ||
@@ -968,9 +1097,9 @@ func TestProvisionSuccessChain(t *testing.T) {
 }
 
 // TestProvisionSuccessChainUsesPveName 验证节点 PveName 非空时供给链使用
-// PveName 作为 PVE API 路径与镜像键（任务 4.3）：业务名 pve1、集群名
-// aeoliancloud 的节点把全部请求打到 /nodes/aeoliancloud/qemu，镜像路径取自
-// NodeImages["aeoliancloud"]，业务名 pve1 绝不出现于请求路径。
+// PveName 作为 PVE API 路径（任务 4.3）：业务名 pve1、集群名 aeoliancloud 的
+// 节点把全部请求打到 /nodes/aeoliancloud/qemu，业务名 pve1 绝不出现于请求
+// 路径。镜像卷 ID 由节点选择阶段传入，与节点名无关。
 func TestProvisionSuccessChainUsesPveName(t *testing.T) {
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1002,7 +1131,8 @@ func TestProvisionSuccessChainUsesPveName(t *testing.T) {
 	err := svc.provision(context.Background(),
 		model.VM{ID: 1, Name: "vm1", MemMB: 2048, CPU: 2, DiskGB: 10},
 		model.PVENode{Name: "pve1", PveName: "aeoliancloud", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"},
-		&model.Image{Name: "debian-12-cloud", DefaultUser: "debian", NodeImages: map[string]string{"aeoliancloud": "/templates/d.qcow2"}},
+		&model.Image{Name: "debian-12-cloud", DefaultUser: "debian"},
+		"local:import/debian-12-genericcloud-amd64.qcow2",
 		&model.StorageType{PVEStorage: "local-ssd"},
 		model.IPPool{NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
 		"pw", "10.0.0.5")
@@ -1041,7 +1171,8 @@ func TestProvisionSuccessChainWithResize(t *testing.T) {
 	err := svc.provision(context.Background(),
 		model.VM{ID: 1, Name: "vm1", MemMB: 2048, CPU: 2, DiskGB: 20},
 		model.PVENode{Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"},
-		&model.Image{Name: "img", DefaultUser: "debian", NodeImages: map[string]string{"pve1": "/t.img"}},
+		&model.Image{Name: "img", DefaultUser: "debian"},
+		"local:import/debian-12-genericcloud-amd64.qcow2",
 		&model.StorageType{PVEStorage: "local-ssd"},
 		model.IPPool{NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
 		"pw", "10.0.0.5")
@@ -1077,7 +1208,8 @@ func TestProvisionFailureSetsSanitizedError(t *testing.T) {
 	err := svc.provision(context.Background(),
 		model.VM{ID: 1, Name: "vm1", MemMB: 2048, CPU: 2, DiskGB: 10},
 		model.PVENode{Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"},
-		&model.Image{Name: "img", DefaultUser: "debian", NodeImages: map[string]string{"pve1": "/t.img"}},
+		&model.Image{Name: "img", DefaultUser: "debian"},
+		"local:import/debian-12-genericcloud-amd64.qcow2",
 		&model.StorageType{PVEStorage: "local-ssd"},
 		model.IPPool{NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
 		pw, "10.0.0.5")
@@ -1096,8 +1228,9 @@ func TestProvisionFailureSetsSanitizedError(t *testing.T) {
 	}
 }
 
-// TestProvisionMissingImagePath 记录镜像在所选中节点上没有路径时的供给失败。
-func TestProvisionMissingImagePath(t *testing.T) {
+// TestProvisionMissingImageVolID 记录空镜像卷 ID 时的供给失败（防御性检查：
+// volid 由节点选择阶段保证非空，绕过选择阶段的调用路径在此被拦截）。
+func TestProvisionMissingImageVolID(t *testing.T) {
 	vmRepo := &fakeVMRepository{}
 	svc := newVMService(t, vmRepo, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
@@ -1105,7 +1238,8 @@ func TestProvisionMissingImagePath(t *testing.T) {
 	err := svc.provision(context.Background(),
 		model.VM{ID: 1, Name: "vm1", MemMB: 2048, CPU: 2, DiskGB: 10},
 		model.PVENode{Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"},
-		&model.Image{Name: "img", DefaultUser: "debian", NodeImages: map[string]string{"other": "/t.img"}},
+		&model.Image{Name: "img", DefaultUser: "debian"},
+		"",
 		&model.StorageType{PVEStorage: "local-ssd"},
 		model.IPPool{NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
 		"pw", "10.0.0.5")
@@ -1114,6 +1248,9 @@ func TestProvisionMissingImagePath(t *testing.T) {
 	}
 	if len(vmRepo.provisionErrors) != 1 {
 		t.Fatalf("provision errors = %d, want 1", len(vmRepo.provisionErrors))
+	}
+	if !strings.Contains(vmRepo.provisionErrors[0], "image") {
+		t.Fatalf("provision_error = %q, want it to mention the missing image volid", vmRepo.provisionErrors[0])
 	}
 }
 
@@ -1147,7 +1284,8 @@ func TestProvisionFailureAfterCreateIncludesVMID(t *testing.T) {
 	err := svc.provision(context.Background(),
 		model.VM{ID: 1, Name: "vm1", MemMB: 2048, CPU: 2, DiskGB: 10},
 		model.PVENode{Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid"},
-		&model.Image{Name: "img", DefaultUser: "debian", NodeImages: map[string]string{"pve1": "/t.img"}},
+		&model.Image{Name: "img", DefaultUser: "debian"},
+		"local:import/debian-12-genericcloud-amd64.qcow2",
 		&model.StorageType{PVEStorage: "local-ssd"},
 		model.IPPool{NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
 		"pw", "10.0.0.5")
