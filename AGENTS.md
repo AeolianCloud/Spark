@@ -12,3 +12,30 @@
 - 接口契约红线：任何接口的增、删、改（尤其写操作）后，必须同步更新 `docs/openapi.yaml`（权威源）与 `api/swagger/openapi.yaml`（Swagger UI 挂载副本），并保证 operationId 完整；契约是前端唯一的事实来源，未同步契约的接口变更不允许合并
 - 敏感字段加密：VM 密码已经 crypto 包（AES-256-GCM）加密后落库；节点 API 令牌加密待实现（见 ADR 0004），错误消息对外脱敏
 - 端到端测试位于 `e2e/`（`go test -tags=e2e ./e2e/ -count=1 -v`），依赖 fake PVE 服务器注入，改动涉及 PVE 客户端时须保持其可用
+
+## 开发流程
+
+### Review 分级
+
+按变更路径分级，核心路径从严、文档路径从宽：
+
+| 级别 | 覆盖路径 | 审查要求 |
+| --- | --- | --- |
+| 核心 | `api/` `service/` `repository/` `database/` `crypto/` `pve/` `model/` `e2e/` `web/` | 必须 `reviewer` 审查；涉及敏感数据、认证鉴权、加密、输入校验时额外使用 `security-reviewer` |
+| 普通 | `config/` `cmd/` `.github/` `openspec/` | `reviewer` 审查 |
+| 文档 | `docs/` `*.md` `CONTEXT.md` `AGENTS.md` | `reviewer` 快速审查即可，可放宽 |
+
+### 提交规范
+
+- 提交消息遵循 Conventional Commits：`feat:` / `fix:` / `docs:` / `style:` / `refactor:` / `perf:` / `test:` / `chore:` / `ci:`，如 `feat: 导入 PVE 已有 VM（纳管）`
+- 每次代码完成（一批并行任务结束后）必须先经 `reviewer` 审查，通过后再继续下一步
+- 前端与后端子 agent 互相隔离，发现问题报告主会话统一指派
+
+### PR 契约 checklist
+
+提交 PR 前核对 `.github/pull_request_template.md`，必查项：
+
+1. `docs/openapi.yaml` 与 `api/swagger/openapi.yaml` 双副本字节一致
+2. `npx --yes @redocly/cli lint docs/openapi.yaml` 通过（豁免规则见 `.redocly.lint-ignore.yaml`）
+3. 涉及前端时 `npm run api:check` 通过（生成的 client 与提交版本 git diff 为空）
+4. 新增/修改错误码必须同步 `docs/api-errors.md`（新增错误码属破坏性变更）
