@@ -251,8 +251,11 @@ func TestNodeStatusPVEUnavailable(t *testing.T) {
 		assertServiceErrorKind(t, err, KindNodeUnavailable)
 		var se *Error
 		errors.As(err, &se)
-		if got := len([]rune(se.Message)); got > maxNodeStatusErrorLen+50 {
-			t.Fatalf("err message length = %d runes, want <= %d (truncated)", got, maxNodeStatusErrorLen)
+		// 精确断言：消息 = 固定前缀（node "aeolian1" unavailable: ，29
+		// rune）+ 截断后的 maxPVEErrorLen（500）rune 摘要——截断由
+		// sanitizePVEError 内部单出口统一完成。
+		if got, want := len([]rune(se.Message)), 29+maxPVEErrorLen; got != want {
+			t.Fatalf("err message length = %d runes, want %d (truncated)", got, want)
 		}
 	})
 }

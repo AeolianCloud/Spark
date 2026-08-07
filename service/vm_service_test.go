@@ -1344,6 +1344,17 @@ func TestSanitizePVEError(t *testing.T) {
 	if got != "boom" {
 		t.Fatalf("plain err = %q, want \"boom\"", got)
 	}
+
+	// 超长消息：PVE 错误体最大可达 1MiB，脱敏后必须按 rune 截断到
+	// maxPVEErrorLen，且多字节 UTF-8 字符不能被切成非法序列。
+	upErr.Errors = map[string]string{"_": strings.Repeat("界", 501)}
+	got = sanitizePVEError(upErr)
+	if n := utf8.RuneCountInString(got); n != maxPVEErrorLen {
+		t.Fatalf("long err rune count = %d, want %d", n, maxPVEErrorLen)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("long err %q is not valid UTF-8", got)
+	}
 }
 
 // TestSanitizeOperationError 固定 G2 的落库契约：error_message 保留服务层

@@ -4,7 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -243,14 +244,31 @@ func (h *VMHandler) List(c *gin.Context) error {
 	return nil
 }
 
-// Get 处理 GET /vms/:id：本地元数据加实时状态透传（8.2）。
-// 节点故障时返回 503 node_unavailable，而不是伪造 creating 状态（8.3）。
+// extVMRefPattern 校验 external 合成标识 ext-{nodeID}-{vmid} 的规范形态：
+// 两段均为无前导零的正整数（与 service 层 parseVMRef 的语义一致，此处提前
+// 在 handler 层拒绝，返回 bad_request 而非 invalid_vm_id——保持
+// GET /vms/unmanaged 等旧形态请求的 400 bad_request 契约不变）。
+var extVMRefPattern = regexp.MustCompile(`^ext-[1-9][0-9]*-[1-9][0-9]*$`)
+
+// Get 处理 GET /vms/:id（8.2 + 设计 D6）：:id 为数字本地行 id 或 external
+// 合成标识 ext-{nodeID}-{vmid}。数字 id 走 parseIDParam 原路径（非法 400
+// bad_request）；非数字须匹配 ext- 正则，非法格式 400 bad_request。服务层
+// 对两种形态统一经 parseVMRef 校验（数字 id 规范化后传入）。节点故障时
+// 返回 503 node_unavailable，而不是伪造 creating 状态（8.3）。
 func (h *VMHandler) Get(c *gin.Context) error {
-	id, err := parseIDParam(c, "id")
-	if err != nil {
-		return err
+	raw := c.Param("id")
+	if _, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		// 数字 id：与 parseIDParam 原语义一致（正整数；兼容前导零等可解析
+		// 形态，解析后规范化再传入服务层）。
+		id, err := parseIDParam(c, "id")
+		if err != nil {
+			return err
+		}
+		raw = strconv.FormatInt(id, 10)
+	} else if !extVMRefPattern.MatchString(raw) {
+		return ErrBadRequest("invalid id path parameter")
 	}
-	item, err := h.svc.GetVM(c.Request.Context(), id)
+	item, err := h.svc.GetVM(c.Request.Context(), raw)
 	if err != nil {
 		return mapVMServiceError(err)
 	}
@@ -296,7 +314,7 @@ func (h *VMHandler) Import(c *gin.Context) error {
 		return mapVMServiceError(err)
 	}
 	c.Header("Location", fmt.Sprintf("/vms/%d", vm.VM.ID))
-	item, err := h.svc.GetVM(c.Request.Context(), vm.VM.ID)
+	item, err := h.svc.GetVM(c.Request.Context(), strconv.FormatInt(vm.VM.ID, 10))
 	if err != nil {
 		// 降级：导入已落库，返回 201 + 无实时字段的本地形态（与 Create
 		// 的降级思路一致，客户端仍能拿到 VM 元数据与 Location）。
@@ -310,9 +328,8 @@ func (h *VMHandler) Import(c *gin.Context) error {
 // Start 处理 POST /vms/:id/start（:id 为数字本地行 id 或 external 合成
 // 标识，设计 D2）。选择 202 + {accepted: true} 而非返回 PVE 任务 ID：该
 // 操作是异步分发的，客户端没有任务轮询端点 —— VM 的真实状态通过透传读取
-// （batch 8）。Location 头指向透传状态端点 GET /vms/:id，客户端可在那里
-// 观察结果；external（ext- 标识）没有可用的 GET 端点（详情仅支持数字
-// 本地行 id），因此省略 Location 头（reviewer-3）。
+// （batch 8）。Location 头指向透传状态端点 GET /vms/:id（数字与 external
+// 标识均可，设计 D6），客户端可在那里的详情页观察结果。
 func (h *VMHandler) Start(c *gin.Context) error {
 	id := c.Param("id")
 	if err := h.svc.Start(c.Request.Context(), id); err != nil {
@@ -324,8 +341,8 @@ func (h *VMHandler) Start(c *gin.Context) error {
 }
 
 // Stop 处理 POST /vms/:id/stop（干净的 ACPI 关机；见
-// VMService.Stop）。Location 头指向透传状态端点 GET /vms/:id（external
-// 标识省略，同 Start）。
+// VMService.Stop）。Location 头指向透传状态端点 GET /vms/:id（数字与
+// external 标识均可，设计 D6）。
 func (h *VMHandler) Stop(c *gin.Context) error {
 	id := c.Param("id")
 	if err := h.svc.Stop(c.Request.Context(), id); err != nil {
@@ -337,7 +354,7 @@ func (h *VMHandler) Stop(c *gin.Context) error {
 }
 
 // Restart 处理 POST /vms/:id/restart。Location 头指向透传状态
-// 端点 GET /vms/:id（external 标识省略，同 Start）。
+// 端点 GET /vms/:id（数字与 external 标识均可，设计 D6）。
 func (h *VMHandler) Restart(c *gin.Context) error {
 	id := c.Param("id")
 	if err := h.svc.Restart(c.Request.Context(), id); err != nil {
@@ -348,13 +365,11 @@ func (h *VMHandler) Restart(c *gin.Context) error {
 	return nil
 }
 
-// setLifecycleLocation 仅对数字本地行 id 设置 Location 头：GET /vms/:id
-// 详情端点只接受数字 id，external（ext- 标识）没有可用的状态端点，设置
-// Location 会指向不可用 URL（reviewer-3）。
+// setLifecycleLocation 设置 Location 头指向透传状态端点 GET /vms/:id：
+// 数字本地行 id 与 external 合成标识均可（详情端点已支持 ext-，设计 D6，
+// 不再省略）。
 func (h *VMHandler) setLifecycleLocation(c *gin.Context, id string) {
-	if !strings.HasPrefix(id, "ext-") {
-		c.Header("Location", fmt.Sprintf("/vms/%s", id))
-	}
+	c.Header("Location", fmt.Sprintf("/vms/%s", id))
 }
 
 // Destroy 处理 DELETE /vms/:id（:id 为数字本地行 id 或 external 合成
@@ -443,7 +458,7 @@ func (h *VMHandler) Resize(c *gin.Context) error {
 	if _, err := h.svc.Resize(c.Request.Context(), id, req.CPU, req.MemMB, req.DiskGB); err != nil {
 		return mapVMServiceError(err)
 	}
-	item, err := h.svc.GetVM(c.Request.Context(), id)
+	item, err := h.svc.GetVM(c.Request.Context(), strconv.FormatInt(id, 10))
 	if err != nil {
 		return mapVMServiceError(err)
 	}

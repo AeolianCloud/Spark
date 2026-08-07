@@ -1041,6 +1041,41 @@ provisioned:
 		t.Fatalf("fake pve status of external vm after restart = %+v, want running", s)
 	}
 
+	// 9d2. external 详情：GET /vms/ext-{nodeID}-202 -> 200，external 形态
+	//（合成 id、uuid/created_at/updated_at 为空、source=external、规格取
+	// PVE 摘要、实时指标透传）。fake 摘要只带 cpus/maxmem/maxdisk 且磁盘
+	// 大小解析仅支持 size= 前缀形态（registerVM 的 scsi0 为
+	// "local-lvm:vm-202-disk-0,size=30G"），因此 disk_gb=0 且
+	// mem/maxdisk/cpu_usage/uptime 以零值省略——断言按 fake 实际输出。
+	extDetail := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/vms/%s", extID(202)), nil, http.StatusOK))
+	if extDetail["id"] != extID(202) || extDetail["source"] != "external" {
+		t.Fatalf("external detail id/source = %v / %v, want %s / external", extDetail["id"], extDetail["source"], extID(202))
+	}
+	if extDetail["uuid"] != "" || extDetail["created_at"] != "" || extDetail["updated_at"] != "" {
+		t.Fatalf("external detail uuid/created_at/updated_at = %v/%v/%v, want all empty",
+			extDetail["uuid"], extDetail["created_at"], extDetail["updated_at"])
+	}
+	if extDetail["pve_vmid"] != float64(202) || extDetail["node_id"] != float64(nodeID) {
+		t.Fatalf("external detail = pve_vmid=%v node_id=%v, want vmid 202 on node %d",
+			extDetail["pve_vmid"], extDetail["node_id"], nodeID)
+	}
+	// 规格取 PVE 摘要：2 核 / 2048 MiB（磁盘大小 fake 不解析，为 0）。
+	if extDetail["cpu"] != float64(2) || extDetail["mem_mb"] != float64(2048) || extDetail["disk_gb"] != float64(0) {
+		t.Fatalf("external detail spec = %+v, want cpu=2 mem=2048 disk=0 from the PVE summary", extDetail)
+	}
+	if extDetail["status"] != "running" {
+		t.Fatalf("external detail status = %v, want running (pass-through)", extDetail["status"])
+	}
+	if extDetail["maxmem"] != float64(2048<<20) {
+		t.Fatalf("external detail maxmem = %v, want the byte value from the PVE summary", extDetail["maxmem"])
+	}
+	for _, key := range []string{"maxdisk", "mem", "cpu_usage", "uptime"} {
+		if _, ok := extDetail[key]; ok {
+			t.Fatalf("external detail %s = %v, want omitted (fake summary lacks it)", key, extDetail[key])
+		}
+	}
+
 	// 9e. 失败操作：fake 注入 PVE 拒绝（HTTP 500）后对 external VM 发起
 	// stop -> 500；随后清除注入，成功路径恢复。失败操作的审计记录断言
 	// 在 9f 中进行。
@@ -1075,6 +1110,14 @@ provisioned:
 	goneErr := e2eObj(t, gone["error"])
 	if code, _ := goneErr["code"].(string); code != "vm_not_found_on_node" {
 		t.Fatalf("operate destroyed external vm: error code = %q, want vm_not_found_on_node", code)
+	}
+	// 9g2. external 详情对已销毁 VM：GET /vms/ext-{nodeID}-202 -> 404
+	// vm_not_found_on_node（节点可达但 VM 已从 PVE 移除）。
+	goneDetail := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/vms/%s", extID(202)), nil, http.StatusNotFound))
+	goneDetailErr := e2eObj(t, goneDetail["error"])
+	if code, _ := goneDetailErr["code"].(string); code != "vm_not_found_on_node" {
+		t.Fatalf("detail of destroyed external vm: error code = %q, want vm_not_found_on_node", code)
 	}
 	// 操作记录是审计历史，不随 VM 销毁而删除：destroy 受理后共 5 条，
 	// 最新一条为 destroy/accepted（ext- 查询不校验 VM 当前是否存在）。
@@ -1206,6 +1249,24 @@ provisioned:
 		}
 	}
 
+	// 11b. ext- 标识指向已托管 VM 时按本地形态返回（G1）：认领后的
+	// vmid 200 经 GET /vms/ext-{nodeID}-200 得到数字行 id（含 uuid、
+	// source=claimed），而非 external 形态（合成 id、空 uuid）——与列表
+	// 差集、生命周期 resolveVMTarget 的路由语义一致。
+	claimedViaExt := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/vms/%s", extID(200)), nil, http.StatusOK))
+	if claimedViaExt["id"] != float64(importedID) {
+		t.Fatalf("claimed vm via ext- id = %v, want local numeric id %d", claimedViaExt["id"], importedID)
+	}
+	uuid, _ := claimedViaExt["uuid"].(string)
+	if uuid == "" {
+		t.Fatalf("claimed vm via ext- uuid = %q, want the local row uuid", uuid)
+	}
+	if claimedViaExt["source"] != "claimed" || claimedViaExt["status"] != "stopped" {
+		t.Fatalf("claimed vm via ext- source/status = %v / %v, want claimed / stopped",
+			claimedViaExt["source"], claimedViaExt["status"])
+	}
+
 	// 12. 认领即托管：start/resize 直接生效——start -> PVE running；
 	// PATCH cpu=2 -> PVE config cores=2。start 受理后经数字 id 查询到
 	// 1 条 accepted 记录。
@@ -1266,6 +1327,29 @@ provisioned:
 	noOpsErr := e2eObj(t, noOpsVM["error"])
 	if code, _ := noOpsErr["code"].(string); code != "not_found" {
 		t.Fatalf("operations of missing vm: error code = %q, want not_found", code)
+	}
+
+	// 16. external 详情 503：第二个 fake PVE 服务器（复用主 fake 的 TLS
+	// 证书，探测与调用使用同一客户端工厂均能信任）注册节点后关闭其
+	// 监听——节点行仍在但 PVE 不可达，GET /vms/ext-{nodeID}-100 ->
+	// 503 node_unavailable，绝不伪造状态。
+	zone2 := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/zones",
+		map[string]any{"name": "e2e-zone2"}, http.StatusCreated))
+	zone2ID := int64(zone2["id"].(float64))
+	pve2Srv := httptest.NewUnstartedServer(newFakePVE(t))
+	pve2Srv.TLS = pveServer.TLS // 共享同一证书：探测与后续调用都走 pveServer.Client()
+	pve2Srv.StartTLS()
+	node2 := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
+		fmt.Sprintf("/zones/%d/nodes", zone2ID),
+		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pve2Srv.Listener.Addr().(*net.TCPAddr).Port), "api_user": "root@pam", "api_token": "spark=uuid"},
+		http.StatusCreated))
+	node2ID := int64(node2["id"].(float64))
+	pve2Srv.Close()
+	unavail := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/vms/ext-%d-100", node2ID), nil, http.StatusServiceUnavailable))
+	unavailErr := e2eObj(t, unavail["error"])
+	if code, _ := unavailErr["code"].(string); code != "node_unavailable" {
+		t.Fatalf("detail of external vm on unreachable node: error code = %q, want node_unavailable", code)
 	}
 }
 

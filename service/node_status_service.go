@@ -19,7 +19,7 @@ type NodeStatusRepository interface {
 
 // NodeStatusService 实现节点实时状态聚合（openspec node-monitor 设计 D3）：
 // 先以本地 pve_nodes 记录解析节点凭据，再并发拉取 PVE 的 status/network
-//（核心组）并串行拉取 rrddata（增强字段）聚合成 NodeStatusResult。状态为
+// （核心组）并串行拉取 rrddata（增强字段）聚合成 NodeStatusResult。状态为
 // PVE 实时透传，不落库。
 type NodeStatusService struct {
 	nodeRepo NodeStatusRepository
@@ -67,7 +67,8 @@ type NodeStatusResult struct {
 // KindNodeUnavailable，增强字段 rrddata（NetIO）失败仅降级为零值、不
 // 整体降级（设计决策，见 openspec node-monitor 设计 D3：rrddata 需要
 // Sys.Audit 权限，权限不足或临时失败不应拖垮整个状态查询）。错误消息经
-// sanitizePVEError 脱敏并按 maxNodeStatusErrorLen 截断，不泄露 PVE
+// KindNodeUnavailable 的降级错误消息经
+// sanitizePVEError 脱敏并按 truncatePVEErrorMsg 截断，不泄露 PVE
 // 内部细节（设计 D1/D3）。
 //
 // 并发结构：核心组（status+network）并发执行，任一失败即通过
@@ -114,11 +115,12 @@ func (s *NodeStatusService) GetStatus(ctx context.Context, nodeID int64) (*NodeS
 		if r.err != nil {
 			// 核心组任一失败整体降级：defer cancel 立即中止另一
 			// in-flight 请求，503 无需等待其完成或超时。
-			// 消息先脱敏（sanitizePVEError）再按 rune 截断：PVE 错误体
-			// 最大可达 1MiB（pve 包 maxResponseSize），不截断会原样进入
-			// 503 响应体（安全红线：对外错误消息不得携带内部细节）。
+			// 消息经 sanitizePVEError 脱敏，并在其内部单出口统一按 rune
+			// 截断（maxPVEErrorLen，见 errors.go）：PVE 错误体最大可达
+			// 1MiB（pve 包 maxResponseSize），不截断会原样进入 503
+			// 响应体（安全红线：对外错误消息不得携带内部细节）。
 			return nil, nodeUnavailablef("node %q unavailable: %s", pveNode,
-				truncateNodeStatusError(sanitizePVEError(r.err)))
+				sanitizePVEError(r.err))
 		}
 		if r.status != nil {
 			// PVE 9 的 status 端点不再返回 status 字段（请求成功即在线），
@@ -144,22 +146,4 @@ func (s *NodeStatusService) GetStatus(ctx context.Context, nodeID int64) (*NodeS
 		res.NetIO = io
 	}
 	return res, nil
-}
-
-// maxNodeStatusErrorLen 限制节点状态降级错误消息的最大字符数（rune）。
-// PVE 错误体最大可达 1MiB（pve 包 maxResponseSize），脱敏后若不截断，
-// 超长错误体可能原样进入 503 响应体（违反"对外错误消息不得暴露内部
-// 细节"红线，且放大响应体）；500 字符足以承载脱敏摘要与节点名。
-const maxNodeStatusErrorLen = 500
-
-// truncateNodeStatusError 按 maxNodeStatusErrorLen 以 rune 边界截断错误
-// 消息（先截断后构造 nodeUnavailablef，与 vm_service.sanitizeOperationError
-// 的"先脱敏后截断、按 rune 切割"风格一致）：多字节 UTF-8 字符绝不会被切
-// 成非法序列。消息短于上限时原样返回。
-func truncateNodeStatusError(msg string) string {
-	r := []rune(msg)
-	if len(r) > maxNodeStatusErrorLen {
-		return string(r[:maxNodeStatusErrorLen])
-	}
-	return msg
 }
