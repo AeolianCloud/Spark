@@ -1,0 +1,35 @@
+# 依赖自动更新配置（dependabot）
+# 作用：定期检查 Go 与前端依赖的可用升级，自动提交 PR（commit 前缀统一 chore(scope)）
+version: 2
+updates:
+  # Go 模块（仓库根目录 go.mod）
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # 前端依赖（web/package.json，含 Nuxt UI 等）
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # GitHub Actions（.github/workflows/*.yml）
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
