@@ -16,9 +16,10 @@ import (
 const updateSpecSQL = "UPDATE vms SET cpu=$1, mem_mb=$2, disk_gb=$3, updated_at=now() WHERE id=$4 AND cpu=$5 AND mem_mb=$6 AND disk_gb=$7"
 
 // importVMSQL 是 ImportVMTx 运行的确切的 INSERT ... RETURNING 语句；
-// 可空列（ip_id 与 password_encrypted）显式写入 NULL。
-const importVMSQL = "INSERT INTO vms (uuid, name, zone_id, node_id, pve_vmid, image_id, storage_type_id, cpu, mem_mb, disk_gb, ip_id, password_encrypted) " +
-	"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL) RETURNING " + vmCols
+// 可空列（ip_id 与 password_encrypted）显式写入 NULL，source 显式写入
+// 调用方传入的值（认领语义下为 'claimed'）。
+const importVMSQL = "INSERT INTO vms (uuid, name, zone_id, node_id, pve_vmid, image_id, storage_type_id, cpu, mem_mb, disk_gb, ip_id, password_encrypted, source) " +
+	"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, $11) RETURNING " + vmCols
 
 func TestUpdateSpecOptimisticLockSuccess(t *testing.T) {
 	mock := newMockPool(t)
@@ -55,8 +56,9 @@ func TestUpdateSpecConcurrentModificationConflict(t *testing.T) {
 	}
 }
 
-// vmRowColumns 是 vmCols 扫描顺序对应的列名（16 列），供 mock 行构造使用。
-var vmRowColumns = []string{"id", "uuid", "name", "zone_id", "node_id", "pve_vmid", "image_id", "storage_type_id", "cpu", "mem_mb", "disk_gb", "ip_id", "password_encrypted", "provision_error", "created_at", "updated_at"}
+// vmRowColumns 是 vmCols 扫描顺序对应的列名（17 列，含 source），供 mock
+// 行构造使用。
+var vmRowColumns = []string{"id", "uuid", "name", "zone_id", "node_id", "pve_vmid", "image_id", "storage_type_id", "cpu", "mem_mb", "disk_gb", "ip_id", "password_encrypted", "provision_error", "source", "created_at", "updated_at"}
 
 // TestGetVMByNodeVMID 验证导入幂等检查查询：按 (node_id, pve_vmid) 精确
 // 匹配；导入的 VM 行 image_id/storage_type_id/ip_id 为 NULL，密码与
@@ -66,7 +68,7 @@ func TestGetVMByNodeVMID(t *testing.T) {
 	mock.ExpectQuery("SELECT "+vmCols+" FROM vms WHERE node_id=$1 AND pve_vmid=$2").
 		WithArgs(int64(3), int64(101)).
 		WillReturnRows(pgxmock.NewRows(vmRowColumns).
-			AddRow(int64(9), "uuid-imp", "imported", int64(1), int64(3), int64(101), nil, nil, 2, int64(4096), int64(20), nil, "", "", testTime, testTime))
+			AddRow(int64(9), "uuid-imp", "imported", int64(1), int64(3), int64(101), nil, nil, 2, int64(4096), int64(20), nil, "", "", "claimed", testTime, testTime))
 
 	repo := NewVMRepository(mock)
 	vm, err := repo.GetVMByNodeVMID(context.Background(), 3, 101)
@@ -110,9 +112,9 @@ func TestImportVMTx(t *testing.T) {
 	// 否则与实际的类型化 nil 指针不相等。
 	var nilImageID *int64
 	mock.ExpectQuery(importVMSQL).
-		WithArgs("uuid-imp", "imported", int64(1), int64(3), int64(101), nilImageID, nilImageID, 2, int64(4096), int64(20)).
+		WithArgs("uuid-imp", "imported", int64(1), int64(3), int64(101), nilImageID, nilImageID, 2, int64(4096), int64(20), "claimed").
 		WillReturnRows(pgxmock.NewRows(vmRowColumns).
-			AddRow(int64(9), "uuid-imp", "imported", int64(1), int64(3), int64(101), nil, nil, 2, int64(4096), int64(20), nil, "", "", testTime, testTime))
+			AddRow(int64(9), "uuid-imp", "imported", int64(1), int64(3), int64(101), nil, nil, 2, int64(4096), int64(20), nil, "", "", "claimed", testTime, testTime))
 	mock.ExpectCommit()
 
 	repo := NewVMRepository(mock)
@@ -122,7 +124,7 @@ func TestImportVMTx(t *testing.T) {
 	}
 	vm, err := repo.ImportVMTx(context.Background(), tx, model.VM{
 		UUID: "uuid-imp", Name: "imported", ZoneID: 1, NodeID: 3, PVEVmid: 101,
-		CPU: 2, MemMB: 4096, DiskGB: 20,
+		CPU: 2, MemMB: 4096, DiskGB: 20, Source: model.VMSourceClaimed,
 	})
 	if err != nil {
 		t.Fatalf("ImportVMTx: %v", err)
@@ -146,7 +148,7 @@ func TestImportVMTxDuplicateConflict(t *testing.T) {
 	mock.ExpectBegin()
 	var nilImageID *int64
 	mock.ExpectQuery(importVMSQL).
-		WithArgs("uuid-imp", "imported", int64(1), int64(3), int64(101), nilImageID, nilImageID, 2, int64(4096), int64(20)).
+		WithArgs("uuid-imp", "imported", int64(1), int64(3), int64(101), nilImageID, nilImageID, 2, int64(4096), int64(20), "claimed").
 		WillReturnError(&pgconn.PgError{Code: "23505", Message: "duplicate key value violates unique constraint \"vms_node_vmid_key\""})
 
 	repo := NewVMRepository(mock)
@@ -156,7 +158,7 @@ func TestImportVMTxDuplicateConflict(t *testing.T) {
 	}
 	_, err = repo.ImportVMTx(context.Background(), tx, model.VM{
 		UUID: "uuid-imp", Name: "imported", ZoneID: 1, NodeID: 3, PVEVmid: 101,
-		CPU: 2, MemMB: 4096, DiskGB: 20,
+		CPU: 2, MemMB: 4096, DiskGB: 20, Source: model.VMSourceClaimed,
 	})
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("err = %v, want ErrConflict", err)

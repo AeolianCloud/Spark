@@ -52,3 +52,7 @@ x-ms-error-code: not_found
 | `vm_not_ready` | 409 | VM 尚不可操作 | 供给未完成或 PVE 侧 VM 已不存在时执行生命周期操作 |
 | `disk_shrink_not_allowed` | 422 | 磁盘不支持缩小 | resize 请求中 `disk_gb` 小于当前磁盘大小 |
 | `image_not_available_in_zone` | 400 | 镜像在该区域不可用 | 请求的镜像未同时存在于该区域全部启用节点 |
+| `vm_not_found_on_node` | 404 | 节点 PVE 可达但 VM 不在该节点上 | 认领（import）不存在的 pve_vmid，或对 ext- 标识指向的已移除/不存在的 VM 执行生命周期操作（区别于 zone/node 自身不存在的 `not_found`） |
+| `vm_already_managed` | 409 | 该节点上的 pve_vmid 已被托管 | 重复认领同一 PVE VMID（区别于一般资源冲突的 `conflict`） |
+| `invalid_vm_id` | 400 | VM id 无法解析 | 生命周期操作/操作记录查询的 `:id` 既非正整数也非 `ext-{nodeID}-{vmid}` 合成标识 |
+| `operation_log_failed` | 500 | 操作记录写入失败 | PVE 已受理生命周期操作但审计记录落库失败（前端可刷新确认） |

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"spark/model"
 	"spark/repository"
@@ -38,6 +39,18 @@ func TestMapVMServiceErrorImportKinds(t *testing.T) {
 			serr:       &service.Error{Kind: service.KindNotFound, Message: "zone 9 not found"},
 			wantStatus: http.StatusNotFound,
 			wantCode:   CodeNotFound,
+		},
+		{
+			name:       "malformed vm id maps to 400 invalid_vm_id",
+			serr:       &service.Error{Kind: service.KindInvalidVMRef, Message: "invalid external vm id \"ext-1\""},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeInvalidVMID,
+		},
+		{
+			name:       "operation record write failure maps to 500 operation_log_failed",
+			serr:       &service.Error{Kind: service.KindOperationLogFailed, Message: "start accepted but record failed"},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   CodeOperationLogFailed,
 		},
 	}
 
@@ -91,5 +104,57 @@ func TestVMResponseOmitsNilAssociations(t *testing.T) {
 	}
 	if m["storage_type_id"] != float64(5) {
 		t.Errorf("storage_type_id = %v, want 5", m["storage_type_id"])
+	}
+}
+
+// TestVMListItemExternalSerialization 固定 external 条目的公开形态（设计
+// D2）：id 为合成标识 ext-{nodeID}-{vmid}（字符串）、uuid/created_at 为
+// 空字符串、source=external、规格来自 PVE 摘要；本地条目的 id 保持数字。
+func TestVMListItemExternalSerialization(t *testing.T) {
+	// 本地条目：id 保持数字。
+	local := toVMListItem(&service.VMListItem{
+		VM: repository.VMWithIP{VM: model.VM{ID: 7, UUID: "u-1", Name: "vm1", CPU: 2, MemMB: 2048, DiskGB: 10,
+			Source: model.VMSourceSparkCreated, CreatedAt: time.Unix(100, 0)}},
+		Status: "running",
+	})
+	raw, err := json.Marshal(local)
+	if err != nil {
+		t.Fatalf("marshal local item: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal local item: %v", err)
+	}
+	if m["id"] != float64(7) {
+		t.Errorf("local id = %v, want numeric 7", m["id"])
+	}
+	if m["source"] != model.VMSourceSparkCreated || m["uuid"] != "u-1" {
+		t.Errorf("local source/uuid = %v / %v", m["source"], m["uuid"])
+	}
+
+	// external 条目：合成 id、uuid/created_at 空、source=external。
+	ext := toVMListItem(&service.VMListItem{
+		VM: repository.VMWithIP{VM: model.VM{Name: "ext-vm", ZoneID: 1, NodeID: 3, PVEVmid: 200,
+			CPU: 4, MemMB: 8192, DiskGB: 100, Source: model.VMSourceExternal}},
+		Status:     "running",
+		ExternalID: "ext-3-200",
+	})
+	raw, err = json.Marshal(ext)
+	if err != nil {
+		t.Fatalf("marshal external item: %v", err)
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal external item: %v", err)
+	}
+	if m["id"] != "ext-3-200" {
+		t.Errorf("external id = %v, want ext-3-200", m["id"])
+	}
+	if m["uuid"] != "" || m["created_at"] != "" {
+		t.Errorf("external uuid/created_at = %v / %v, want empty strings", m["uuid"], m["created_at"])
+	}
+	if m["source"] != model.VMSourceExternal || m["name"] != "ext-vm" ||
+		m["cpu"] != float64(4) || m["mem_mb"] != float64(8192) || m["disk_gb"] != float64(100) ||
+		m["node_id"] != float64(3) || m["pve_vmid"] != float64(200) {
+		t.Errorf("external fields = %v, want the PVE summary values", m)
 	}
 }

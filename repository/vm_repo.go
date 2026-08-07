@@ -38,11 +38,12 @@ func NewVMRepository(pool pgxQuerier) *VMRepository {
 // migration 0007 之后也可为 NULL（导入的 VM 无密码）。这两列都使用
 // COALESCE 扫描：NULL 行必须读作 "" 而不能让扫描到普通 string 失败。
 // 带表限定名的列在 INSERT ... RETURNING 中合法。
-const vmCols = "vms.id, vms.uuid, vms.name, vms.zone_id, vms.node_id, vms.pve_vmid, vms.image_id, vms.storage_type_id, vms.cpu, vms.mem_mb, vms.disk_gb, vms.ip_id, COALESCE(vms.password_encrypted, '') AS password_encrypted, COALESCE(vms.provision_error, '') AS provision_error, vms.created_at, vms.updated_at"
+const vmCols = "vms.id, vms.uuid, vms.name, vms.zone_id, vms.node_id, vms.pve_vmid, vms.image_id, vms.storage_type_id, vms.cpu, vms.mem_mb, vms.disk_gb, vms.ip_id, COALESCE(vms.password_encrypted, '') AS password_encrypted, COALESCE(vms.provision_error, '') AS provision_error, vms.source, vms.created_at, vms.updated_at"
 
 // CreateVMTx 在调用方的事务内以 ip_id 为 NULL、pve_vmid 为零插入 VM 行
 // （migration 0002 分配流程的第 1 步：FK 环要求 ip_id 在 ips 领取之后
-// 写入）。返回创建的行，已填充 id 与时间戳。
+// 写入）。source 不显式写入：由列默认值 'spark_created' 兜底（设计 D3）。
+// 返回创建的行，已填充 id 与时间戳。
 func (r *VMRepository) CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error) {
 	var created model.VM
 	err := tx.QueryRow(ctx,
@@ -53,7 +54,7 @@ func (r *VMRepository) CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (
 	).Scan(&created.ID, &created.UUID, &created.Name, &created.ZoneID, &created.NodeID,
 		&created.PVEVmid, &created.ImageID, &created.StorageTypeID, &created.CPU, &created.MemMB,
 		&created.DiskGB, &created.IPID, &created.PasswordEncrypted, &created.ProvisionError,
-		&created.CreatedAt, &created.UpdatedAt)
+		&created.Source, &created.CreatedAt, &created.UpdatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
 	}
@@ -70,7 +71,7 @@ func (r *VMRepository) GetVMByNodeVMID(ctx context.Context, nodeID, vmid int64) 
 		"SELECT "+vmCols+" FROM vms WHERE node_id=$1 AND pve_vmid=$2", nodeID, vmid,
 	).Scan(&v.ID, &v.UUID, &v.Name, &v.ZoneID, &v.NodeID, &v.PVEVmid, &v.ImageID, &v.StorageTypeID,
 		&v.CPU, &v.MemMB, &v.DiskGB, &v.IPID, &v.PasswordEncrypted, &v.ProvisionError,
-		&v.CreatedAt, &v.UpdatedAt)
+		&v.Source, &v.CreatedAt, &v.UpdatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
 	}
@@ -80,21 +81,22 @@ func (r *VMRepository) GetVMByNodeVMID(ctx context.Context, nodeID, vmid int64) 
 // ImportVMTx 在调用方的事务内插入"导入的已有 VM"行（migration 0007）。
 // 与 CreateVMTx 的差异：pve_vmid 写入调用方从 PVE 读到的非零 VMID；
 // image_id、storage_type_id、password_encrypted 与 ip_id 全部写入 NULL
-// （导入的 VM 无镜像/存储类型/密码，地址稍后按需领取，见
-// IPPoolRepository.ClaimIPByAddressTx）。同一 (node_id, pve_vmid) 的
+// （导入的 VM 无镜像/存储类型/密码，地址按认领请求可选领取，见
+// IPPoolRepository.ClaimIPByAddressTx）；source 显式写入调用方传入的值
+// （认领语义下为 'claimed'，设计 D3）。同一 (node_id, pve_vmid) 的
 // 重复导入由 vms_node_vmid_key 部分唯一索引拒绝，23505 经
 // classifyDBError 映射为 ErrConflict。
 func (r *VMRepository) ImportVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error) {
 	var created model.VM
 	err := tx.QueryRow(ctx,
-		"INSERT INTO vms (uuid, name, zone_id, node_id, pve_vmid, image_id, storage_type_id, cpu, mem_mb, disk_gb, ip_id, password_encrypted) "+
-			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL) RETURNING "+vmCols,
+		"INSERT INTO vms (uuid, name, zone_id, node_id, pve_vmid, image_id, storage_type_id, cpu, mem_mb, disk_gb, ip_id, password_encrypted, source) "+
+			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, $11) RETURNING "+vmCols,
 		vm.UUID, vm.Name, vm.ZoneID, vm.NodeID, vm.PVEVmid, vm.ImageID, vm.StorageTypeID,
-		vm.CPU, vm.MemMB, vm.DiskGB,
+		vm.CPU, vm.MemMB, vm.DiskGB, vm.Source,
 	).Scan(&created.ID, &created.UUID, &created.Name, &created.ZoneID, &created.NodeID,
 		&created.PVEVmid, &created.ImageID, &created.StorageTypeID, &created.CPU, &created.MemMB,
 		&created.DiskGB, &created.IPID, &created.PasswordEncrypted, &created.ProvisionError,
-		&created.CreatedAt, &created.UpdatedAt)
+		&created.Source, &created.CreatedAt, &created.UpdatedAt)
 	if err != nil {
 		return nil, classifyDBError(err)
 	}
@@ -120,7 +122,7 @@ func (r *VMRepository) GetVM(ctx context.Context, id int64) (*VMWithIP, error) {
 		"SELECT "+vmCols+", COALESCE(ips.ip, '') FROM vms LEFT JOIN ips ON ips.id = vms.ip_id WHERE vms.id=$1", id,
 	).Scan(&v.ID, &v.UUID, &v.Name, &v.ZoneID, &v.NodeID, &v.PVEVmid, &v.ImageID, &v.StorageTypeID,
 		&v.CPU, &v.MemMB, &v.DiskGB, &v.IPID, &v.PasswordEncrypted, &v.ProvisionError,
-		&v.CreatedAt, &v.UpdatedAt, &ip)
+		&v.Source, &v.CreatedAt, &v.UpdatedAt, &ip)
 	if err != nil {
 		return nil, classifyDBError(err)
 	}
@@ -129,7 +131,9 @@ func (r *VMRepository) GetVM(ctx context.Context, id int64) (*VMWithIP, error) {
 
 // ListVMs 返回带明文 IP 的每一行 VM（VM 没有地址时为 ""），按 id
 // 排序。它服务于透传式列表查询（任务 8.1）：与 PVE 实时状态的合并
-// 发生在服务层，永不落库（设计 D1）。
+// 发生在服务层，永不落库（设计 D1）。列表合并需要本地全量行（与每
+// 节点 PVE 全量摘要做差集，设计 D1/D3），因此这里不再分页——分页由
+// 服务层对合并后的条目统一执行。
 func (r *VMRepository) ListVMs(ctx context.Context) ([]VMWithIP, error) {
 	rows, err := r.pool.Query(ctx,
 		"SELECT "+vmCols+", COALESCE(ips.ip, '') FROM vms LEFT JOIN ips ON ips.id = vms.ip_id ORDER BY vms.id")
@@ -144,7 +148,7 @@ func (r *VMRepository) ListVMs(ctx context.Context) ([]VMWithIP, error) {
 		var ip string
 		if err := rows.Scan(&v.ID, &v.UUID, &v.Name, &v.ZoneID, &v.NodeID, &v.PVEVmid, &v.ImageID,
 			&v.StorageTypeID, &v.CPU, &v.MemMB, &v.DiskGB, &v.IPID, &v.PasswordEncrypted,
-			&v.ProvisionError, &v.CreatedAt, &v.UpdatedAt, &ip); err != nil {
+			&v.ProvisionError, &v.Source, &v.CreatedAt, &v.UpdatedAt, &ip); err != nil {
 			return nil, classifyDBError(err)
 		}
 		out = append(out, VMWithIP{VM: v, IP: ip})
@@ -153,46 +157,6 @@ func (r *VMRepository) ListVMs(ctx context.Context) ([]VMWithIP, error) {
 		return nil, classifyDBError(err)
 	}
 	return out, nil
-}
-
-// ListVMsPage 返回按 id 排序的一页 VM 行。它服务于分页的透传式
-// 列表：LIMIT/OFFSET 作用于本地元数据，PVE 合并只在该页的行上执行
-// （最坏情况下每次节点调用最多 maxPageLimit 行）。
-func (r *VMRepository) ListVMsPage(ctx context.Context, limit, offset int) ([]VMWithIP, error) {
-	rows, err := r.pool.Query(ctx,
-		"SELECT "+vmCols+", COALESCE(ips.ip, '') FROM vms LEFT JOIN ips ON ips.id = vms.ip_id ORDER BY vms.id LIMIT $1 OFFSET $2",
-		limit, offset)
-	if err != nil {
-		return nil, classifyDBError(err)
-	}
-	defer rows.Close()
-
-	out := make([]VMWithIP, 0)
-	for rows.Next() {
-		var v model.VM
-		var ip string
-		if err := rows.Scan(&v.ID, &v.UUID, &v.Name, &v.ZoneID, &v.NodeID, &v.PVEVmid, &v.ImageID,
-			&v.StorageTypeID, &v.CPU, &v.MemMB, &v.DiskGB, &v.IPID, &v.PasswordEncrypted,
-			&v.ProvisionError, &v.CreatedAt, &v.UpdatedAt, &ip); err != nil {
-			return nil, classifyDBError(err)
-		}
-		out = append(out, VMWithIP{VM: v, IP: ip})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, classifyDBError(err)
-	}
-	return out, nil
-}
-
-// CountVMs 返回 VM 行总数，支撑 GET /vms 的 X-Total-Count 响应头。
-// 只统计本地元数据：透传式合并可能丢弃故障节点的行，因此总数可能
-// 超过该页的条目数（上报的总数刻意采用完整的本地统计）。
-func (r *VMRepository) CountVMs(ctx context.Context) (int, error) {
-	var n int
-	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM vms").Scan(&n); err != nil {
-		return 0, classifyDBError(err)
-	}
-	return n, nil
 }
 
 // UpdateVMPVEVMID 记录供给链路分配的 PVE VMID，并同步实际磁盘大小

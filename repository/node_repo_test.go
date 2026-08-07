@@ -80,6 +80,30 @@ func TestListNodesByZoneReadsPort(t *testing.T) {
 	}
 }
 
+// TestListNodesByIDs 验证按 id 集合查询节点（disabled 警告的节点名翻译）：
+// 不存在的 id 被忽略，结果按 id 排序。
+func TestListNodesByIDs(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectQuery("SELECT id, zone_id, name, pve_name, host, port, api_user, api_token_secret, enabled, created_at FROM pve_nodes WHERE id = ANY($1) ORDER BY id").
+		WithArgs([]int64{1, 3}).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "zone_id", "name", "pve_name", "host", "port", "api_user", "api_token_secret", "enabled", "created_at"}).
+			AddRow(int64(1), int64(1), "pve1", "aeoliancloud", "10.0.0.1", int32(8006), "root@pam!spark", "s1", true, testTime).
+			AddRow(int64(3), int64(1), "pve3", "", "10.0.0.3", int32(8006), "root@pam!spark", "s3", false, testTime))
+
+	repo := NewNodeRepository(mock)
+	nodes, err := repo.ListNodesByIDs(context.Background(), []int64{1, 3})
+	if err != nil {
+		t.Fatalf("ListNodesByIDs: %v", err)
+	}
+	if len(nodes) != 2 || nodes[0].ID != 1 || nodes[1].ID != 3 ||
+		nodes[0].Name != "pve1" || nodes[1].Name != "pve3" {
+		t.Fatalf("nodes = %+v, want pve1 then pve3 (id 99 ignored)", nodes)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 // TestUpdateNodeWritesAndReadsPort 验证 UPDATE 写入 port 与 pve_name 列，
 // 且 RETURNING nodeCols 扫描同样读取它们。
 func TestUpdateNodeWritesAndReadsPort(t *testing.T) {
