@@ -5,6 +5,10 @@
 - 主要功能包括虚拟机的全生命周期管理，对接前端实现公有云
 - 严格按照 PVE 标准 API 实现（https://pve.proxmox.com/pve-docs/api-viewer/index.html）
 - 代码注释一律使用中文（含测试代码），专有名词与技术术语可保留英文原文
+- **PVE 版本为 9（生产环境 9.1.1）**，适配 PVE 客户端时注意以下版本差异：
+  - `/nodes/{node}/status` 在 PVE 9 中无 `mem/maxmem/cpus/maxcpu/version/status` 字段，改用对象结构：`memory{total,used,free,available}`、`cpuinfo{cpus,cores,sockets,model}`、`pveversion`（替代 `version`）；`rootfs` 为对象 `{total,used,free,avail}`（PVE 8.2+ 开始），PVE 7 为裸数字，解析需双格式兼容
+  - `/nodes/{node}/netstat` 在 PVE 9 中只返回 VM 网络设备计数器（`[{dev,vmid,in,out}]`），无物理网卡流量；节点级网络吞吐改用 `/nodes/{node}/rrddata?timeframe=hour` 的 `netin/netout`（bytes/s，取最后一个数据点）
+  - PVE 的布尔字段（如 network 的 `active`）在 JSON 中返回数字 `1/0` 而非 `true/false`，解析需兼容两种形式
 
 ## 项目约束
 

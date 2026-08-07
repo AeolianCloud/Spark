@@ -7,13 +7,13 @@
  */
 import type { components, operations } from './generated/schema'
 import type { createVM, destroyVM, getVM, importVM, listVMOperations, listVMs, resizeVM, restartVM, startVM, stopVM } from './vms'
-import type { createNode, updateNode } from './nodes'
+import type { createNode, getNodeStatus, updateNode } from './nodes'
 import type { createPool, listPools, setPoolNodes } from './pools'
 import type { createImage, downloadImage, getImage, getImageNodeStatus, listImageOperations, listImages, listImagesByZone } from './images'
 import type { createStorageType, listStorageTypes, updateStorageType } from './storage-types'
 import type { createZone, listZones } from './zones'
 import type { ApiResponse, LocatedResponse, ListResponse } from './client'
-import type { AcceptedResponse, Image, ImageDownloadRequest, ImageOperation, ImageZoneItem, NodeImageStatus, NodeResponse, StorageType, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
+import type { AcceptedResponse, Image, ImageDownloadRequest, ImageOperation, ImageZoneItem, NodeImageStatus, NodeResponse, NodeStatusResponse, StorageType, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
 
 /** 恒真断言：约束类型推导结果必须为 true */
 type Assert<T extends true> = T
@@ -24,13 +24,14 @@ type RequiredKeys<T> = { [K in keyof T]-?: undefined extends T[K] ? never : K }[
 /** 取对象可选键 */
 type OptionalKeys<T> = Exclude<keyof T, RequiredKeys<T>>
 
-/* ---------------------------------- 2.2：31 端点全覆盖 ---------------------------------- */
+/* ---------------------------------- 2.2：32 端点全覆盖 ---------------------------------- */
 
 type OpKeys = keyof operations
-type _Assert31Ops = Assert<
+type _Assert32Ops = Assert<
   Equal<
     OpKeys,
     | 'healthz' | 'createZone' | 'listZones' | 'createNode' | 'listNodesByZone' | 'updateNode'
+    | 'getNodeStatus'
     | 'createPool' | 'listPools' | 'setPoolNodes' | 'getPoolNodes'
     | 'createStorageType' | 'listStorageTypes' | 'getStorageType' | 'updateStorageType' | 'deleteStorageType'
     | 'createImage' | 'listImages' | 'getImage' | 'listImageNodeStatus' | 'downloadImage' | 'listImageOperations'
@@ -60,6 +61,35 @@ type _AssertResizeRes = Assert<Equal<ReturnType<typeof resizeVM>, Promise<ApiRes
 // destroyVM：204 无响应体；封装函数返回 void
 type _AssertDestroy204NoBody = Assert<operations['destroyVM']['responses'][204] extends { content?: never } ? true : false>
 type _AssertDestroyFn = Assert<Equal<ReturnType<typeof destroyVM>, Promise<void>>>
+
+// getNodeStatus：200 响应体为 NodeStatusResponse（配置 + 嵌套实时状态），
+// PVE 不可达时 503 返回契约错误体 ErrorBody（node_unavailable）
+type _AssertGetNodeStatusContent = Assert<Equal<
+  operations['getNodeStatus']['responses'][200]['content']['application/json'],
+  components['schemas']['NodeStatusResponse']
+>>
+type _AssertGetNodeStatus503Content = Assert<Equal<
+  operations['getNodeStatus']['responses'][503]['content']['application/json'],
+  components['schemas']['ErrorBody']
+>>
+type _AssertGetNodeStatusFn = Assert<Equal<ReturnType<typeof getNodeStatus>,
+  Promise<ApiResponse<NodeStatusResponse>>>>
+type _AssertNodeStatusAlias = Assert<Equal<NodeStatusResponse, components['schemas']['NodeStatusResponse']>>
+// getNodeStatus 路径参数 :id 与契约 PathID 一致（数字节点 id）
+type _AssertGetNodeStatusPath = Assert<Equal<
+  Parameters<typeof getNodeStatus>[0],
+  components['parameters']['PathID']
+>>
+// NodeStatusField 承载节点级网络吞吐 net_io（NodeNetIO：net_in/net_out，bytes/s）
+type _AssertNodeStatusHasNetIO = Assert<Equal<
+  components['schemas']['NodeStatusField']['net_io'],
+  components['schemas']['NodeNetIO']
+>>
+type _AssertNodeNetIOFields = Assert<Equal<keyof components['schemas']['NodeNetIO'], 'net_in' | 'net_out'>>
+// NodeNetStatus 仅接口信息（iface/type/address/active），不含接口级流量字段 rx_bytes/tx_bytes
+type _AssertNodeNetStatusFields = Assert<Equal<keyof components['schemas']['NodeNetStatus'],
+  'iface' | 'type' | 'address' | 'active'>>
+type _AssertNodeNetStatusActiveNullable = Assert<Equal<components['schemas']['NodeNetStatus']['active'], boolean | null>>
 
 // createNode/updateNode：NodeRequest 请求体（api_token 只写），响应 NodeResponse 无 api_token 字段
 type _AssertNodeReq = Assert<Equal<keyof components['schemas']['NodeRequest'],
@@ -326,7 +356,7 @@ type _AssertImageOperationAlias = Assert<Equal<ImageOperation, components['schem
 
 // 兜底引用：确保以上断言类型被程序包含（import type 已保证在类型图中）
 export type {
-  _Assert31Ops,
+  _Assert32Ops,
   _AssertCreateVMReq,
   _AssertCreateVMReqRequired,
   _AssertCreateVMFn,
@@ -344,6 +374,15 @@ export type {
   _AssertCreateNodeFn,
   _AssertUpdateNodeFn,
   _AssertNodeRes,
+  _AssertGetNodeStatusContent,
+  _AssertGetNodeStatus503Content,
+  _AssertGetNodeStatusFn,
+  _AssertNodeStatusAlias,
+  _AssertGetNodeStatusPath,
+  _AssertNodeStatusHasNetIO,
+  _AssertNodeNetIOFields,
+  _AssertNodeNetStatusFields,
+  _AssertNodeNetStatusActiveNullable,
   _AssertPoolReq,
   _AssertPoolReqRequired,
   _AssertCreatePoolFn,

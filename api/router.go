@@ -194,6 +194,13 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	// 位于 /zones/:zone_id/nodes 之下，但 PUT /nodes/:id 位于 /zones 之外。
 	handlers.RegisterZonesRoutes(r.Group("/zones"), r.Group("/nodes"), zoneSvc)
 
+	// ===== node 实时状态处理器（task 3.x） =====
+	// RegisterNodeStatusRoutes 挂在独立的 /nodes 分组实例上（与
+	// RegisterZonesRoutes 的分组互不干扰，路由可并存）：
+	// GET /nodes/:id/status 实时拉取 PVE 状态并聚合返回。
+	nodeStatusSvc := service.NewNodeStatusService(nodeRepo)
+	handlers.RegisterNodeStatusRoutes(r.Group("/nodes"), nodeStatusSvc)
+
 	// ===== ip pool 处理器（task 5.x） =====
 	handlers.RegisterIPPoolsRoutes(r.Group("/ip-pools"), ipPoolSvc)
 

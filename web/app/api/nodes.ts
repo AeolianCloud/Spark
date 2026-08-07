@@ -1,5 +1,5 @@
 import { request, type ApiResponse, type LocatedResponse } from './client'
-import type { NodeRequest, NodeResponse } from './types'
+import type { NodeRequest, NodeResponse, NodeStatusResponse } from './types'
 
 /** 登记 PVE 节点（api_token 只写：响应不含令牌，仅 api_token_set） */
 export function createNode(zoneId: number, body: NodeRequest): Promise<LocatedResponse<NodeResponse>> {
@@ -14,4 +14,9 @@ export function listNodesByZone(zoneId: number): Promise<ApiResponse<NodeRespons
 /** 更新节点（空 api_token 保留原密钥；enabled 缺省时保留现值） */
 export function updateNode(id: number, body: NodeRequest): Promise<ApiResponse<NodeResponse>> {
   return request<NodeResponse>(`/nodes/${id}`, { method: 'PUT', body })
+}
+
+/** 节点实时状态：配置字段 + 嵌套 status（CPU/内存/磁盘/网络/集群信息）；PVE 不可达返回 503 node_unavailable */
+export function getNodeStatus(id: number): Promise<ApiResponse<NodeStatusResponse>> {
+  return request<NodeStatusResponse>(`/nodes/${id}/status`)
 }

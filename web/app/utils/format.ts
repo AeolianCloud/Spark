@@ -10,6 +10,13 @@ export function formatDateTime(value: string): string {
   return date.toLocaleString('zh-CN', { hour12: false })
 }
 
+/** 0-1 小数使用率 → 百分比字符串（如 0.153 → "15%"）；非法值/缺省显示占位 */
+export function formatPercent(usage?: number | null): string {
+  if (usage === undefined || usage === null || !Number.isFinite(usage)) return '—'
+  const n = Math.round(Math.min(1, Math.max(0, usage)) * 100)
+  return `${n}%`
+}
+
 /**
  * VM 状态中文标签（契约 status 为自由字符串，未知状态统一归入"其他"）。
  * creating/failed 为本地过渡状态；ready 及以后为 PVE 穿透状态（running/stopped 等）。
