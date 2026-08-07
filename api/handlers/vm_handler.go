@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +27,12 @@ const (
 	// 选择 400（而非 422）是因为请求参数明显无法满足：客户端请求的
 	// image/zone 组合无法被提供，即参数集非法。
 	CodeImageNotAvailableInZone = "image_not_available_in_zone"
+	// CodeVMNotFoundOnNode：节点 PVE 可达，但请求的 pve_vmid 不在该
+	// 节点上（404 —— 区别于 zone/node 自身不存在的 not_found）。
+	CodeVMNotFoundOnNode = "vm_not_found_on_node"
+	// CodeVMAlreadyManaged：该节点上的 pve_vmid 已被托管，重复导入
+	// 被拒绝（409 —— 区别于一般资源冲突的 conflict）。
+	CodeVMAlreadyManaged = "vm_already_managed"
 )
 
 // mapVMServiceError 将 service 层错误映射为统一的 API 错误契约。
@@ -43,6 +50,10 @@ func mapVMServiceError(err error) error {
 		return NewError(http.StatusUnprocessableEntity, CodeDiskShrinkNotAllowed, serr.Message)
 	case service.KindImageNotAvailable:
 		return NewError(http.StatusBadRequest, CodeImageNotAvailableInZone, serr.Message)
+	case service.KindVMNotFoundOnNode:
+		return NewError(http.StatusNotFound, CodeVMNotFoundOnNode, serr.Message)
+	case service.KindVMAlreadyManaged:
+		return NewError(http.StatusConflict, CodeVMAlreadyManaged, serr.Message)
 	default:
 		return mapServiceErrorExtended(err)
 	}
@@ -67,6 +78,11 @@ func RegisterVMsRoutes(rg *gin.RouterGroup, svc *service.VMService) {
 	h := NewVMHandler(svc)
 	rg.POST("", Handler(h.Create))
 	rg.GET("", Handler(h.List))
+	// GET /vms/unmanaged 与 POST /vms/import 是静态段，与 /vms/:id
+	// 参数段在不同 HTTP 方法下共存无冲突；gin 同方法下静态段优先于
+	// 参数段，因此 GET /vms/unmanaged 不会被 GET /vms/:id 吞掉。
+	rg.GET("/unmanaged", Handler(h.ListUnmanaged))
+	rg.POST("/import", Handler(h.Import))
 	rg.GET("/:id", Handler(h.Get))
 	rg.POST("/:id/start", Handler(h.Start))
 	rg.POST("/:id/stop", Handler(h.Stop))
@@ -84,8 +100,8 @@ type vmResponse struct {
 	CPU            int       `json:"cpu"`
 	MemMB          int64     `json:"mem_mb"`
 	DiskGB         int64     `json:"disk_gb"`
-	ImageID        int64     `json:"image_id"`
-	StorageTypeID  int64     `json:"storage_type_id"`
+	ImageID        *int64    `json:"image_id,omitempty"`
+	StorageTypeID  *int64    `json:"storage_type_id,omitempty"`
 	ZoneID         int64     `json:"zone_id"`
 	NodeID         int64     `json:"node_id"`
 	PVEVmid        int64     `json:"pve_vmid,omitempty"`
@@ -116,6 +132,18 @@ func toVMResponse(vm *repository.VMWithIP, status string) vmResponse {
 		CreatedAt:      vm.VM.CreatedAt,
 		UpdatedAt:      vm.VM.UpdatedAt,
 	}
+}
+
+// unmanagedVMResponse 是 GET /vms/unmanaged 的候选 VM 负载：节点 PVE
+// 上尚未被托管的 VM（task import-1）。disk_gb 以 GiB 计；已停止的 VM
+// 由 service 层读配置补全规格，失败则跳过该候选。
+type unmanagedVMResponse struct {
+	VMID   int64  `json:"vmid"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	CPU    int    `json:"cpu"`
+	MemMB  int64  `json:"mem_mb"`
+	DiskGB int64  `json:"disk_gb"`
 }
 
 // localVMStatus 推导过渡状态：PVE VM 尚不存在时为 "creating"，
@@ -225,6 +253,65 @@ func (h *VMHandler) Create(c *gin.Context) error {
 	// 供给链路是分离运行的，到这里还未完成，因此状态始终是
 	// "creating" —— PVE 还没有这个 VM。
 	c.JSON(http.StatusCreated, toVMResponse(vm, localVMStatus(vm)))
+	return nil
+}
+
+// ListUnmanaged 处理 GET /vms/unmanaged：列出节点 PVE 上尚未被托管的
+// VM 候选（供前端"导入已有 VM"的选型列表）。node_id 查询参数必填且必须
+// 是正整数；节点不存在 -> 404 not_found，节点 PVE 不可达 -> 503
+// node_unavailable。
+func (h *VMHandler) ListUnmanaged(c *gin.Context) error {
+	raw := c.Query("node_id")
+	nodeID, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || nodeID <= 0 {
+		return ErrBadRequest("invalid node_id query parameter")
+	}
+	items, err := h.svc.ListUnmanagedVMs(c.Request.Context(), nodeID)
+	if err != nil {
+		return mapVMServiceError(err)
+	}
+	vms := make([]unmanagedVMResponse, 0, len(items))
+	for _, it := range items {
+		vms = append(vms, unmanagedVMResponse{
+			VMID:   it.VMID,
+			Name:   it.Name,
+			Status: it.Status,
+			CPU:    it.CPU,
+			MemMB:  it.MemMB,
+			DiskGB: it.DiskGB,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"vms": vms})
+	return nil
+}
+
+// Import 处理 POST /vms/import：把节点 PVE 上已有的 VM 纳管为托管 VM。
+// 请求体 {zone_id, node_id, pve_vmid} 必填，{ip_pool_id, name} 可选
+// （zero 表示缺省：自动选池 / 取 PVE 配置名）。成功返回 201 + Location 头
+// + 完整 VMListItem（透传状态：导入是同步的，PVE 实体已存在，因此像
+// Resize 一样经 GetVM 读取实时状态）；GetVM 读取失败时降级返回无实时字段
+// 的 vmResponse（事务已提交，客户端若收到 5xx 会重试并撞上 409
+// vm_already_managed，所以查询失败不能令请求失败）。
+// 错误区分两种 404：zone/node 不存在 -> not_found；vmid 不在该节点 PVE
+// 上 -> vm_not_found_on_node；重复托管 -> 409 vm_already_managed。
+func (h *VMHandler) Import(c *gin.Context) error {
+	var req service.ImportVMRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		return ErrBadRequest("invalid request body")
+	}
+	vm, err := h.svc.ImportVM(c.Request.Context(), req)
+	if err != nil {
+		return mapVMServiceError(err)
+	}
+	c.Header("Location", fmt.Sprintf("/vms/%d", vm.VM.ID))
+	item, err := h.svc.GetVM(c.Request.Context(), vm.VM.ID)
+	if err != nil {
+		// 降级：导入已落库，返回 201 + 无实时字段的本地形态（与 Create
+		// 的降级思路一致，客户端仍能拿到 VM 元数据与 Location）。
+		c.JSON(http.StatusCreated, toVMResponse(vm, localVMStatus(vm)))
+		return nil
+	}
+	c.JSON(http.StatusCreated, toVMListItem(item))
 	return nil
 }
 

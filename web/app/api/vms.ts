@@ -1,5 +1,5 @@
 import { request, type ApiResponse, type LocatedResponse, type ListResponse } from './client'
-import type { AcceptedResponse, CreateVMRequest, ResizeRequest, VMListItem, VMListResponse, VMResponse } from './types'
+import type { AcceptedResponse, CreateVMRequest, ImportVMRequest, ResizeRequest, UnmanagedVMListResponse, VMListItem, VMListResponse, VMResponse } from './types'
 
 /** 创建 VM：分配 IP → 落库 → 异步 PVE 创建链，201 立即返回（status 为 creating） */
 export function createVM(body: CreateVMRequest): Promise<LocatedResponse<VMResponse>> {
@@ -12,6 +12,16 @@ export function createVM(body: CreateVMRequest): Promise<LocatedResponse<VMRespo
  */
 export function listVMs(params: { limit?: number, offset?: number } = {}): Promise<ListResponse<VMListResponse>> {
   return request<VMListResponse>('/vms', { query: params }) as Promise<ListResponse<VMListResponse>>
+}
+
+/** 未纳管 VM 列表：节点上 PVE 已存在、本平台尚未登记（供导入弹窗选择候选） */
+export function listUnmanagedVMs(params: { node_id: number }): Promise<ApiResponse<UnmanagedVMListResponse>> {
+  return request<UnmanagedVMListResponse>('/vms/unmanaged', { query: params })
+}
+
+/** 导入已有 VM：将 PVE 上已存在的 VM 纳入本平台纳管，201 返回完整 VMListItem + Location */
+export function importVM(body: ImportVMRequest): Promise<LocatedResponse<VMListItem>> {
+  return request<VMListItem>('/vms/import', { method: 'POST', body }) as Promise<LocatedResponse<VMListItem>>
 }
 
 /** VM 详情（PVE 实时穿透状态） */

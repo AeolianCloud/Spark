@@ -94,18 +94,24 @@ const (
 
 // VM 是虚拟机记录；实时状态不存储（对 PVE 的透传查询，见设计 D1）。
 type VM struct {
-	ID                int64  `json:"id"`
-	UUID              string `json:"uuid"`
-	Name              string `json:"name"`
-	ZoneID            int64  `json:"zone_id"`
-	NodeID            int64  `json:"node_id"`
-	PVEVmid           int64  `json:"pve_vmid"`
-	ImageID           int64  `json:"image_id"`
-	StorageTypeID     int64  `json:"storage_type_id"`
-	CPU               int    `json:"cpu"`
-	MemMB             int64  `json:"mem_mb"`
-	DiskGB            int64  `json:"disk_gb"`
-	IPID              *int64 `json:"ip_id,omitempty"`
+	ID      int64  `json:"id"`
+	UUID    string `json:"uuid"`
+	Name    string `json:"name"`
+	ZoneID  int64  `json:"zone_id"`
+	NodeID  int64  `json:"node_id"`
+	PVEVmid int64  `json:"pve_vmid"`
+	// ImageID 指向 vms.image_id；导入的已有 VM 没有关联云镜像，
+	// 此时为 nil（SQL NULL），与 IPID 的可空指针风格一致。
+	ImageID *int64 `json:"image_id"`
+	// StorageTypeID 指向 vms.storage_type_id；导入的已有 VM 没有关联
+	// 存储类型，此时为 nil（SQL NULL）。
+	StorageTypeID *int64 `json:"storage_type_id"`
+	CPU           int    `json:"cpu"`
+	MemMB         int64  `json:"mem_mb"`
+	DiskGB        int64  `json:"disk_gb"`
+	IPID          *int64 `json:"ip_id,omitempty"`
+	// PasswordEncrypted 是加密后的 VM 密码；导入的已有 VM 无密码，
+	// 读取时 NULL 一律经 COALESCE 归一化为空字符串（见 vmCols）。
 	PasswordEncrypted string `json:"password_encrypted,omitempty"`
 	// ProvisionError 携带分离式 PVE 预配置链的脱敏失败消息
 	// （预配置中或成功后为空）。

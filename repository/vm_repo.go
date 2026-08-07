@@ -34,10 +34,11 @@ func NewVMRepository(pool pgxQuerier) *VMRepository {
 // vmCols 是 INSERT RETURNING 与读取查询使用的 vms 列清单。每一列
 // 都带表限定名：GetVM/ListVMs 会将 vms 与 ips 做 JOIN，裸的 "id"
 // 会产生歧义（SQLSTATE 42702）。provision_error 可为 NULL
-// （migration 0004 添加时未带默认值），因此使用 COALESCE 扫描：
-// NULL 行必须读作 "" 而不能让扫描到普通 string 失败。
+// （migration 0004 添加时未带默认值）；password_encrypted 在
+// migration 0007 之后也可为 NULL（导入的 VM 无密码）。这两列都使用
+// COALESCE 扫描：NULL 行必须读作 "" 而不能让扫描到普通 string 失败。
 // 带表限定名的列在 INSERT ... RETURNING 中合法。
-const vmCols = "vms.id, vms.uuid, vms.name, vms.zone_id, vms.node_id, vms.pve_vmid, vms.image_id, vms.storage_type_id, vms.cpu, vms.mem_mb, vms.disk_gb, vms.ip_id, vms.password_encrypted, COALESCE(vms.provision_error, '') AS provision_error, vms.created_at, vms.updated_at"
+const vmCols = "vms.id, vms.uuid, vms.name, vms.zone_id, vms.node_id, vms.pve_vmid, vms.image_id, vms.storage_type_id, vms.cpu, vms.mem_mb, vms.disk_gb, vms.ip_id, COALESCE(vms.password_encrypted, '') AS password_encrypted, COALESCE(vms.provision_error, '') AS provision_error, vms.created_at, vms.updated_at"
 
 // CreateVMTx 在调用方的事务内以 ip_id 为 NULL、pve_vmid 为零插入 VM 行
 // （migration 0002 分配流程的第 1 步：FK 环要求 ip_id 在 ips 领取之后
@@ -49,6 +50,47 @@ func (r *VMRepository) CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (
 			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING "+vmCols,
 		vm.UUID, vm.Name, vm.ZoneID, vm.NodeID, vm.PVEVmid, vm.ImageID, vm.StorageTypeID,
 		vm.CPU, vm.MemMB, vm.DiskGB, vm.IPID, vm.PasswordEncrypted,
+	).Scan(&created.ID, &created.UUID, &created.Name, &created.ZoneID, &created.NodeID,
+		&created.PVEVmid, &created.ImageID, &created.StorageTypeID, &created.CPU, &created.MemMB,
+		&created.DiskGB, &created.IPID, &created.PasswordEncrypted, &created.ProvisionError,
+		&created.CreatedAt, &created.UpdatedAt)
+	if err != nil {
+		return nil, classifyDBError(err)
+	}
+	return &created, nil
+}
+
+// GetVMByNodeVMID 按 (node_id, pve_vmid) 精确查询 VM 行，作为导入
+// （纳管）的幂等检查：重复导入同一 PVE VMID 在服务层先被本方法拒绝，
+// 并发场景由 vms_node_vmid_key 部分唯一索引兜底。不存在时返回
+// pgx.ErrNoRows。
+func (r *VMRepository) GetVMByNodeVMID(ctx context.Context, nodeID, vmid int64) (*model.VM, error) {
+	var v model.VM
+	err := r.pool.QueryRow(ctx,
+		"SELECT "+vmCols+" FROM vms WHERE node_id=$1 AND pve_vmid=$2", nodeID, vmid,
+	).Scan(&v.ID, &v.UUID, &v.Name, &v.ZoneID, &v.NodeID, &v.PVEVmid, &v.ImageID, &v.StorageTypeID,
+		&v.CPU, &v.MemMB, &v.DiskGB, &v.IPID, &v.PasswordEncrypted, &v.ProvisionError,
+		&v.CreatedAt, &v.UpdatedAt)
+	if err != nil {
+		return nil, classifyDBError(err)
+	}
+	return &v, nil
+}
+
+// ImportVMTx 在调用方的事务内插入"导入的已有 VM"行（migration 0007）。
+// 与 CreateVMTx 的差异：pve_vmid 写入调用方从 PVE 读到的非零 VMID；
+// image_id、storage_type_id、password_encrypted 与 ip_id 全部写入 NULL
+// （导入的 VM 无镜像/存储类型/密码，地址稍后按需领取，见
+// IPPoolRepository.ClaimIPByAddressTx）。同一 (node_id, pve_vmid) 的
+// 重复导入由 vms_node_vmid_key 部分唯一索引拒绝，23505 经
+// classifyDBError 映射为 ErrConflict。
+func (r *VMRepository) ImportVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error) {
+	var created model.VM
+	err := tx.QueryRow(ctx,
+		"INSERT INTO vms (uuid, name, zone_id, node_id, pve_vmid, image_id, storage_type_id, cpu, mem_mb, disk_gb, ip_id, password_encrypted) "+
+			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL) RETURNING "+vmCols,
+		vm.UUID, vm.Name, vm.ZoneID, vm.NodeID, vm.PVEVmid, vm.ImageID, vm.StorageTypeID,
+		vm.CPU, vm.MemMB, vm.DiskGB,
 	).Scan(&created.ID, &created.UUID, &created.Name, &created.ZoneID, &created.NodeID,
 		&created.PVEVmid, &created.ImageID, &created.StorageTypeID, &created.CPU, &created.MemMB,
 		&created.DiskGB, &created.IPID, &created.PasswordEncrypted, &created.ProvisionError,

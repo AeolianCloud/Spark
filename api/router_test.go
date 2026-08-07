@@ -77,6 +77,8 @@ func TestRouterRegistersAllRoutes(t *testing.T) {
 		"GET /images",
 		"POST /vms",
 		"GET /vms",
+		"GET /vms/unmanaged",
+		"POST /vms/import",
 		"GET /vms/:id",
 		"POST /vms/:id/start",
 		"POST /vms/:id/stop",

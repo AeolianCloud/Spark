@@ -528,6 +528,69 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
 
+  /vms/unmanaged:
+    get:
+      tags: [vms]
+      summary: 节点未托管 VM 候选列表
+      description: |
+        返回指定节点 PVE 上尚未被托管的虚拟机候选（供导入选择）。
+        节点不存在返回 404 not_found；节点不可达或查询失败返回 503
+        node_unavailable。
+      operationId: listUnmanagedVMs
+      parameters:
+        - $ref: "#/components/parameters/QueryNodeID"
+      responses:
+        "200":
+          description: 该节点未托管的 VM 候选列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnmanagedVMListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /vms/import:
+    post:
+      tags: [vms]
+      summary: 导入已有 VM（纳管）
+      description: |
+        将 PVE 节点上已有的虚拟机导入为托管虚拟机：读取 PVE 配置规格，
+        IP 优先复用 ipconfig0 静态 IP（属于池且空闲时直接占用），否则从
+        池分配。导入不修改 PVE 侧配置。
+
+        错误场景：400 参数非法；404 区域/节点不存在（not_found）或 PVE 上
+        无此 VM（vm_not_found_on_node）；409 已托管（vm_already_managed）
+        或 IP 池耗尽（ip_exhausted）；503 节点不可达/禁用（node_unavailable）。
+      operationId: importVM
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportVMRequest"
+      responses:
+        "201":
+          description: 导入成功
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VMListItem"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /vms/{id}:
     get:
       tags: [vms]
@@ -739,6 +802,15 @@ components:
         type: integer
         format: int64
         minimum: 1
+    QueryNodeID:
+      name: node_id
+      in: query
+      required: true
+      description: 节点 ID（正整数；缺失或格式非法返回 400）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
 
   headers:
     XTotalCount:
@@ -881,6 +953,8 @@ components:
             - vm_not_ready
             - disk_shrink_not_allowed
             - image_not_available_in_zone
+            - vm_already_managed
+            - vm_not_found_on_node
         message:
           type: string
           description: 仅供人阅读，不可被程序解析
@@ -1145,9 +1219,34 @@ components:
           type: string
           description: cloud-init 注入密码（仅创建时使用，不随响应返回）
 
+    ImportVMRequest:
+      type: object
+      required: [zone_id, node_id, pve_vmid]
+      properties:
+        zone_id:
+          type: integer
+          format: int64
+          description: 区域 ID（必填）
+        node_id:
+          type: integer
+          format: int64
+          description: 节点 ID（必填）
+        pve_vmid:
+          type: integer
+          format: int64
+          description: PVE 侧 VMID（必填）
+        ip_pool_id:
+          type: integer
+          format: int64
+          description: IP 池 ID，可选；0 表示自动选池（默认按静态 IP 匹配/回退分配）
+        name:
+          type: string
+          maxLength: 128
+          description: 导入后的 VM 名称，可选；空则取 PVE 配置名。名称须匹配 ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$；PVE 配置名超长时截断到 128 字符而非拒绝
+
     VMResponse:
       type: object
-      required: [id, uuid, name, cpu, mem_mb, disk_gb, image_id, storage_type_id, zone_id, node_id, status, created_at, updated_at]
+      required: [id, uuid, name, cpu, mem_mb, disk_gb, zone_id, node_id, status, created_at, updated_at]
       properties:
         id:
           type: integer
@@ -1169,9 +1268,13 @@ components:
         image_id:
           type: integer
           format: int64
+          # 可空：导入的 VM 无镜像关联时省略
+          description: 可为空（导入的 VM 无镜像关联）
         storage_type_id:
           type: integer
           format: int64
+          # 可空：导入的 VM 无存储类型关联时省略
+          description: 可为空（导入的 VM 无存储类型关联）
         zone_id:
           type: integer
           format: int64
@@ -1254,6 +1357,42 @@ components:
           description: 节点查询失败告警（恒为数组，无失败时为空数组）
           items:
             $ref: "#/components/schemas/NodeWarning"
+
+    UnmanagedVM:
+      type: object
+      required: [vmid, name, status, cpu, mem_mb, disk_gb]
+      properties:
+        vmid:
+          type: integer
+          format: int64
+          description: PVE 侧 VMID
+        name:
+          type: string
+          description: PVE 配置中的 VM 名称
+        status:
+          type: string
+          description: PVE 运行时状态，如 running/stopped
+        cpu:
+          type: integer
+          format: int32
+          description: vCPU 核数
+        mem_mb:
+          type: integer
+          format: int64
+          description: 内存（MB）
+        disk_gb:
+          type: integer
+          format: int64
+          description: 磁盘总量（GiB）
+
+    UnmanagedVMListResponse:
+      type: object
+      required: [vms]
+      properties:
+        vms:
+          type: array
+          items:
+            $ref: "#/components/schemas/UnmanagedVM"
 
     ResizeRequest:
       type: object
