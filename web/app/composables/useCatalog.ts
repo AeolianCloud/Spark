@@ -1,5 +1,5 @@
 /**
- * 目录映射（Zone/节点 id → 名称）：VM 列表页与详情页共用。
+ * 目录映射（Zone/节点 id → 名称，节点 id → 所属 Zone）：VM 列表页与详情页共用。
  * 模块级缓存：SPA 单实例，两页共享同一份数据，避免重复请求。
  * 加载失败静默吞掉（不阻塞 VM 列表），映射缺失时页面回退展示 id。
  * 缓存带失效机制：VM 增删改或 Zone/节点变更后，页面进入时调用 refresh() 重拉，
@@ -10,6 +10,7 @@ import { listZones } from '~/api/zones'
 // 模块级状态：跨页面共享的懒加载缓存
 const zoneNames = ref(new Map<number, string>())
 const nodeNames = ref(new Map<number, string>())
+const nodeZones = ref(new Map<number, number>())
 const loaded = ref(false)
 const loading = ref(false)
 // 失效标记：invalidate() 置位；加载在途时置位则结束后自动补拉一次（补偿刷新）
@@ -30,12 +31,17 @@ export function useCatalog() {
       const res = await listZones({ limit: 100 })
       const nextZones = new Map<number, string>()
       const nextNodes = new Map<number, string>()
+      const nextNodeZones = new Map<number, number>()
       for (const zone of res.data) {
         nextZones.set(zone.id, zone.name)
-        for (const node of zone.nodes) nextNodes.set(node.id, node.name)
+        for (const node of zone.nodes) {
+          nextNodes.set(node.id, node.name)
+          nextNodeZones.set(node.id, zone.id)
+        }
       }
       zoneNames.value = nextZones
       nodeNames.value = nextNodes
+      nodeZones.value = nextNodeZones
       loaded.value = true
     } catch {
       // 目录加载失败不阻塞 VM 列表：保留旧映射，页面回退展示 id（页面兜底）
@@ -74,5 +80,10 @@ export function useCatalog() {
     return nodeNames.value.get(id)
   }
 
-  return { ensureLoaded, refresh, invalidate, zoneName, nodeName }
+  /** 节点 id → 所属可用区 id（映射未就绪返回 undefined；用于认领表单预填） */
+  function zoneIdOfNode(nodeId: number): number | undefined {
+    return nodeZones.value.get(nodeId)
+  }
+
+  return { ensureLoaded, refresh, invalidate, zoneName, nodeName, zoneIdOfNode }
 }

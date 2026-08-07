@@ -3,6 +3,7 @@
  * 列表页与详情页共用，保证两页展示与判定一致。
  */
 import { vmStatusLabel } from './format'
+import type { VMListItem } from '~/api'
 
 /** 徽章展示元数据：文案 + 颜色（未知 PVE 穿透状态给中性样式） */
 export interface VMStatusBadge {
@@ -32,6 +33,28 @@ export function vmStatusBadge(status: string): VMStatusBadge {
 /** 本地过渡状态：供给未完成（creating）或供给失败（failed），PVE 对端尚不可操作 */
 export function isProvisioningStatus(status: string): boolean {
   return status === 'creating' || status === 'failed'
+}
+
+/** 来源徽章展示元数据：文案 + 颜色（列表页 source 列三态） */
+export interface VMSourceBadge {
+  /** 徽章颜色 */
+  color: 'success' | 'warning' | 'info' | 'neutral'
+  /** 来源中文标签 */
+  label: string
+}
+
+/** 来源徽章映射：spark_created=Spark 创建、claimed=已认领、external=外部 VM（未纳管，需认领） */
+export function vmSourceBadge(source: VMListItem['source']): VMSourceBadge {
+  switch (source) {
+    case 'spark_created':
+      return { color: 'info', label: 'Spark 创建' }
+    case 'claimed':
+      return { color: 'success', label: '已认领' }
+    case 'external':
+      return { color: 'warning', label: '外部 VM' }
+    default:
+      return { color: 'neutral', label: '未知来源' }
+  }
 }
 
 // ---- 生命周期操作可用性 ----

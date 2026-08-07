@@ -6,14 +6,14 @@
  * 契约新增/删除/改名端点或字段时，此处断言在 `npm run typecheck` 中失败。
  */
 import type { components, operations } from './generated/schema'
-import type { createVM, destroyVM, getVM, importVM, listUnmanagedVMs, listVMs, resizeVM, restartVM, startVM, stopVM } from './vms'
+import type { createVM, destroyVM, getVM, importVM, listVMOperations, listVMs, resizeVM, restartVM, startVM, stopVM } from './vms'
 import type { createNode, updateNode } from './nodes'
 import type { createPool, listPools, setPoolNodes } from './pools'
 import type { createImage, listImages } from './images'
 import type { createStorageType, listStorageTypes, updateStorageType } from './storage-types'
 import type { createZone, listZones } from './zones'
 import type { ApiResponse, LocatedResponse, ListResponse } from './client'
-import type { AcceptedResponse, Image, NodeResponse, StorageType, UnmanagedVMListResponse, VMListItem, VMListResponse, VMResponse, ZoneResponse } from './types'
+import type { AcceptedResponse, Image, NodeResponse, StorageType, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
 
 /** 恒真断言：约束类型推导结果必须为 true */
 type Assert<T extends true> = T
@@ -35,7 +35,7 @@ type _Assert27Ops = Assert<
     | 'createStorageType' | 'listStorageTypes' | 'getStorageType' | 'updateStorageType' | 'deleteStorageType'
     | 'createImage' | 'listImages'
     | 'createVM' | 'listVMs' | 'getVM' | 'resizeVM' | 'destroyVM' | 'startVM' | 'stopVM' | 'restartVM'
-    | 'listUnmanagedVMs' | 'importVM'
+    | 'listVMOperations' | 'importVM'
   >
 >
 
@@ -191,10 +191,10 @@ type _AssertStopVMFn = Assert<Equal<ReturnType<typeof stopVM>,
 type _AssertRestartVMFn = Assert<Equal<ReturnType<typeof restartVM>,
   Promise<LocatedResponse<AcceptedResponse>>>>
 
-// importVM：ImportVMRequest 仅 zone_id/node_id/pve_vmid 必填（ip_pool_id/name 可选）；
+// importVM：ImportVMRequest 仅 zone_id/node_id/pve_vmid 必填（ip/name 可选）；
 // 响应 201 为 VMListItem（含 PVE 实时透传字段）+ Location
 type _AssertImportVMReq = Assert<Equal<keyof components['schemas']['ImportVMRequest'],
-  'zone_id' | 'node_id' | 'pve_vmid' | 'ip_pool_id' | 'name'>>
+  'zone_id' | 'node_id' | 'pve_vmid' | 'ip' | 'name'>>
 type _AssertImportVMReqRequired = Assert<Equal<RequiredKeys<components['schemas']['ImportVMRequest']>,
   'zone_id' | 'node_id' | 'pve_vmid'>>
 type _AssertImportVMFn = Assert<Equal<Parameters<typeof importVM>[0], components['schemas']['ImportVMRequest']>>
@@ -207,17 +207,29 @@ type _AssertImportVMLocationHeader = Assert<
   'Location' extends keyof operations['importVM']['responses'][201]['headers'] ? true : false
 >
 
-// listUnmanagedVMs：query 仅 node_id 必填；响应体为 UnmanagedVMListResponse 包装（vms），无分页头
-type _AssertListUnmanagedVMsQuery = Assert<Equal<
-  Exclude<operations['listUnmanagedVMs']['parameters']['query'], undefined>,
-  Exclude<Parameters<typeof listUnmanagedVMs>[0], undefined>
+// listVMOperations：id 支持数字本地行 id 与 ext- 合成标识（PathVMRef）；响应体为
+// VMOperationsResponse 包装（operations），带 X-Total-Count 分页头；封装函数返回 ListResponse
+type _AssertListOperationsQuery = Assert<Equal<
+  Exclude<operations['listVMOperations']['parameters']['query'], undefined>,
+  Exclude<Parameters<typeof listVMOperations>[1], undefined>
 >>
-type _AssertUnmanagedVMFields = Assert<Equal<keyof components['schemas']['UnmanagedVM'],
-  'vmid' | 'name' | 'status' | 'cpu' | 'mem_mb' | 'disk_gb'>>
-type _AssertUnmanagedVMListBody = Assert<Equal<components['schemas']['UnmanagedVMListResponse']['vms'],
-  components['schemas']['UnmanagedVM'][]>>
-type _AssertListUnmanagedVMsFn = Assert<Equal<ReturnType<typeof listUnmanagedVMs>,
-  Promise<ApiResponse<UnmanagedVMListResponse>>>>
+type _AssertListOperationsBody = Assert<Equal<components['schemas']['VMOperationsResponse']['operations'],
+  components['schemas']['VMOperation'][]>>
+type _AssertListOperationsFn = Assert<Equal<ReturnType<typeof listVMOperations>,
+  Promise<ListResponse<VMOperationsResponse>>>>
+type _AssertListOperationsTotalHeader = Assert<
+  'X-Total-Count' extends keyof operations['listVMOperations']['responses'][200]['headers'] ? true : false
+>
+// types.ts 别名与契约镜像一致（操作记录相关）
+type _AssertVMOperationAlias = Assert<Equal<VMOperation, components['schemas']['VMOperation']>>
+type _AssertVMOperationsResAlias = Assert<Equal<VMOperationsResponse, components['schemas']['VMOperationsResponse']>>
+type _AssertVMOperationFields = Assert<Equal<keyof components['schemas']['VMOperation'],
+  'id' | 'node_id' | 'pve_vmid' | 'action' | 'result' | 'error_message' | 'created_at'>>
+// 生命周期/操作记录路径参数 PathVMRef 为 ext-{nodeID}-{vmid} 或数字 id 的字符串形态
+type _AssertVMOperationIdRef = Assert<Equal<
+  components['parameters']['PathVMRef'],
+  string
+>>
 
 // 兜底引用：确保以上断言类型被程序包含（import type 已保证在类型图中）
 export type {
@@ -287,8 +299,12 @@ export type {
   _AssertImportVMRes,
   _AssertImportVMContent,
   _AssertImportVMLocationHeader,
-  _AssertListUnmanagedVMsQuery,
-  _AssertUnmanagedVMFields,
-  _AssertUnmanagedVMListBody,
-  _AssertListUnmanagedVMsFn
+  _AssertListOperationsQuery,
+  _AssertListOperationsBody,
+  _AssertListOperationsFn,
+  _AssertListOperationsTotalHeader,
+  _AssertVMOperationAlias,
+  _AssertVMOperationsResAlias,
+  _AssertVMOperationFields,
+  _AssertVMOperationIdRef
 }
