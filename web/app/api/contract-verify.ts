@@ -6,14 +6,14 @@
  * 契约新增/删除/改名端点或字段时，此处断言在 `npm run typecheck` 中失败。
  */
 import type { components, operations } from './generated/schema'
-import type { createVM, destroyVM, getVM, listVMs, resizeVM, restartVM, startVM, stopVM } from './vms'
+import type { createVM, destroyVM, getVM, importVM, listUnmanagedVMs, listVMs, resizeVM, restartVM, startVM, stopVM } from './vms'
 import type { createNode, updateNode } from './nodes'
 import type { createPool, listPools, setPoolNodes } from './pools'
 import type { createImage, listImages } from './images'
 import type { createStorageType, listStorageTypes, updateStorageType } from './storage-types'
 import type { createZone, listZones } from './zones'
 import type { ApiResponse, LocatedResponse, ListResponse } from './client'
-import type { AcceptedResponse, Image, NodeResponse, StorageType, VMListItem, VMListResponse, VMResponse, ZoneResponse } from './types'
+import type { AcceptedResponse, Image, NodeResponse, StorageType, UnmanagedVMListResponse, VMListItem, VMListResponse, VMResponse, ZoneResponse } from './types'
 
 /** 恒真断言：约束类型推导结果必须为 true */
 type Assert<T extends true> = T
@@ -24,10 +24,10 @@ type RequiredKeys<T> = { [K in keyof T]-?: undefined extends T[K] ? never : K }[
 /** 取对象可选键 */
 type OptionalKeys<T> = Exclude<keyof T, RequiredKeys<T>>
 
-/* ---------------------------------- 2.2：25 端点全覆盖 ---------------------------------- */
+/* ---------------------------------- 2.2：27 端点全覆盖 ---------------------------------- */
 
 type OpKeys = keyof operations
-type _Assert25Ops = Assert<
+type _Assert27Ops = Assert<
   Equal<
     OpKeys,
     | 'healthz' | 'createZone' | 'listZones' | 'createNode' | 'listNodesByZone' | 'updateNode'
@@ -35,6 +35,7 @@ type _Assert25Ops = Assert<
     | 'createStorageType' | 'listStorageTypes' | 'getStorageType' | 'updateStorageType' | 'deleteStorageType'
     | 'createImage' | 'listImages'
     | 'createVM' | 'listVMs' | 'getVM' | 'resizeVM' | 'destroyVM' | 'startVM' | 'stopVM' | 'restartVM'
+    | 'listUnmanagedVMs' | 'importVM'
   >
 >
 
@@ -190,9 +191,37 @@ type _AssertStopVMFn = Assert<Equal<ReturnType<typeof stopVM>,
 type _AssertRestartVMFn = Assert<Equal<ReturnType<typeof restartVM>,
   Promise<LocatedResponse<AcceptedResponse>>>>
 
+// importVM：ImportVMRequest 仅 zone_id/node_id/pve_vmid 必填（ip_pool_id/name 可选）；
+// 响应 201 为 VMListItem（含 PVE 实时透传字段）+ Location
+type _AssertImportVMReq = Assert<Equal<keyof components['schemas']['ImportVMRequest'],
+  'zone_id' | 'node_id' | 'pve_vmid' | 'ip_pool_id' | 'name'>>
+type _AssertImportVMReqRequired = Assert<Equal<RequiredKeys<components['schemas']['ImportVMRequest']>,
+  'zone_id' | 'node_id' | 'pve_vmid'>>
+type _AssertImportVMFn = Assert<Equal<Parameters<typeof importVM>[0], components['schemas']['ImportVMRequest']>>
+type _AssertImportVMRes = Assert<Equal<ReturnType<typeof importVM>, Promise<LocatedResponse<VMListItem>>>>
+type _AssertImportVMContent = Assert<Equal<
+  operations['importVM']['responses'][201]['content']['application/json'],
+  components['schemas']['VMListItem']
+>>
+type _AssertImportVMLocationHeader = Assert<
+  'Location' extends keyof operations['importVM']['responses'][201]['headers'] ? true : false
+>
+
+// listUnmanagedVMs：query 仅 node_id 必填；响应体为 UnmanagedVMListResponse 包装（vms），无分页头
+type _AssertListUnmanagedVMsQuery = Assert<Equal<
+  Exclude<operations['listUnmanagedVMs']['parameters']['query'], undefined>,
+  Exclude<Parameters<typeof listUnmanagedVMs>[0], undefined>
+>>
+type _AssertUnmanagedVMFields = Assert<Equal<keyof components['schemas']['UnmanagedVM'],
+  'vmid' | 'name' | 'status' | 'cpu' | 'mem_mb' | 'disk_gb'>>
+type _AssertUnmanagedVMListBody = Assert<Equal<components['schemas']['UnmanagedVMListResponse']['vms'],
+  components['schemas']['UnmanagedVM'][]>>
+type _AssertListUnmanagedVMsFn = Assert<Equal<ReturnType<typeof listUnmanagedVMs>,
+  Promise<ApiResponse<UnmanagedVMListResponse>>>>
+
 // 兜底引用：确保以上断言类型被程序包含（import type 已保证在类型图中）
 export type {
-  _Assert25Ops,
+  _Assert27Ops,
   _AssertCreateVMReq,
   _AssertCreateVMReqRequired,
   _AssertCreateVMFn,
@@ -251,5 +280,15 @@ export type {
   _AssertVM202LocationHeader,
   _AssertStartVMFn,
   _AssertStopVMFn,
-  _AssertRestartVMFn
+  _AssertRestartVMFn,
+  _AssertImportVMReq,
+  _AssertImportVMReqRequired,
+  _AssertImportVMFn,
+  _AssertImportVMRes,
+  _AssertImportVMContent,
+  _AssertImportVMLocationHeader,
+  _AssertListUnmanagedVMsQuery,
+  _AssertUnmanagedVMFields,
+  _AssertUnmanagedVMListBody,
+  _AssertListUnmanagedVMsFn
 }

@@ -207,6 +207,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vms/unmanaged": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 节点未托管 VM 候选列表
+         * @description 返回指定节点 PVE 上尚未被托管的虚拟机候选（供导入选择）。
+         *     节点不存在返回 404 not_found；节点不可达或查询失败返回 503
+         *     node_unavailable。
+         */
+        get: operations["listUnmanagedVMs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 导入已有 VM（纳管）
+         * @description 将 PVE 节点上已有的虚拟机导入为托管虚拟机：读取 PVE 配置规格，
+         *     IP 优先复用 ipconfig0 静态 IP（属于池且空闲时直接占用），否则从
+         *     池分配。导入不修改 PVE 侧配置。
+         *
+         *     错误场景：400 参数非法；404 区域/节点不存在（not_found）或 PVE 上
+         *     无此 VM（vm_not_found_on_node）；409 已托管（vm_already_managed）
+         *     或 IP 池耗尽（ip_exhausted）；503 节点不可达/禁用（node_unavailable）。
+         */
+        post: operations["importVM"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vms/{id}": {
         parameters: {
             query?: never;
@@ -316,7 +364,7 @@ export interface components {
              * @description 稳定的机器可读错误码（客户端只可依赖 code）
              * @enum {string}
              */
-            code: "bad_request" | "not_found" | "method_not_allowed" | "conflict" | "unprocessable_entity" | "internal_error" | "service_unavailable" | "dependency_failed" | "node_unavailable" | "ip_exhausted" | "vm_not_ready" | "disk_shrink_not_allowed" | "image_not_available_in_zone";
+            code: "bad_request" | "not_found" | "method_not_allowed" | "conflict" | "unprocessable_entity" | "internal_error" | "service_unavailable" | "dependency_failed" | "node_unavailable" | "ip_exhausted" | "vm_not_ready" | "disk_shrink_not_allowed" | "image_not_available_in_zone" | "vm_already_managed" | "vm_not_found_on_node";
             /** @description 仅供人阅读，不可被程序解析 */
             message: string;
         };
@@ -484,6 +532,30 @@ export interface components {
             /** @description cloud-init 注入密码（仅创建时使用，不随响应返回） */
             password: string;
         };
+        ImportVMRequest: {
+            /**
+             * Format: int64
+             * @description 区域 ID（必填）
+             */
+            zone_id: number;
+            /**
+             * Format: int64
+             * @description 节点 ID（必填）
+             */
+            node_id: number;
+            /**
+             * Format: int64
+             * @description PVE 侧 VMID（必填）
+             */
+            pve_vmid: number;
+            /**
+             * Format: int64
+             * @description IP 池 ID，可选；0 表示自动选池（默认按静态 IP 匹配/回退分配）
+             */
+            ip_pool_id?: number;
+            /** @description 导入后的 VM 名称，可选；空则取 PVE 配置名。名称须匹配 ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$；PVE 配置名超长时截断到 128 字符而非拒绝 */
+            name?: string;
+        };
         VMResponse: {
             /** Format: int64 */
             id: number;
@@ -496,10 +568,16 @@ export interface components {
             mem_mb: number;
             /** Format: int64 */
             disk_gb: number;
-            /** Format: int64 */
-            image_id: number;
-            /** Format: int64 */
-            storage_type_id: number;
+            /**
+             * Format: int64
+             * @description 可为空（导入的 VM 无镜像关联）
+             */
+            image_id?: number;
+            /**
+             * Format: int64
+             * @description 可为空（导入的 VM 无存储类型关联）
+             */
+            storage_type_id?: number;
             /** Format: int64 */
             zone_id: number;
             /** Format: int64 */
@@ -568,6 +646,35 @@ export interface components {
             vms: components["schemas"]["VMListItem"][];
             /** @description 节点查询失败告警（恒为数组，无失败时为空数组） */
             warnings: components["schemas"]["NodeWarning"][];
+        };
+        UnmanagedVM: {
+            /**
+             * Format: int64
+             * @description PVE 侧 VMID
+             */
+            vmid: number;
+            /** @description PVE 配置中的 VM 名称 */
+            name: string;
+            /** @description PVE 运行时状态，如 running/stopped */
+            status: string;
+            /**
+             * Format: int32
+             * @description vCPU 核数
+             */
+            cpu: number;
+            /**
+             * Format: int64
+             * @description 内存（MB）
+             */
+            mem_mb: number;
+            /**
+             * Format: int64
+             * @description 磁盘总量（GiB）
+             */
+            disk_gb: number;
+        };
+        UnmanagedVMListResponse: {
+            vms: components["schemas"]["UnmanagedVM"][];
         };
         /** @description 至少一个字段必须出现；缺失或 null 的字段保留现值 */
         ResizeRequest: {
@@ -729,6 +836,8 @@ export interface components {
         QueryOffset: number;
         /** @description 按区域过滤（正整数；格式非法返回 400） */
         QueryZoneID: number;
+        /** @description 节点 ID（正整数；缺失或格式非法返回 400） */
+        QueryNodeID: number;
     };
     requestBodies: never;
     headers: {
@@ -1266,6 +1375,61 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["VMResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listUnmanagedVMs: {
+        parameters: {
+            query: {
+                /** @description 节点 ID（正整数；缺失或格式非法返回 400） */
+                node_id: components["parameters"]["QueryNodeID"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 该节点未托管的 VM 候选列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnmanagedVMListResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    importVM: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportVMRequest"];
+            };
+        };
+        responses: {
+            /** @description 导入成功 */
+            201: {
+                headers: {
+                    Location: components["headers"]["Location"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VMListItem"];
                 };
             };
             400: components["responses"]["BadRequest"];

@@ -116,6 +116,113 @@ func TestAllocateFreeIPLostRaceReturnsRetry(t *testing.T) {
 	}
 }
 
+func TestClaimIPByAddressTx(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectBegin()
+	// 按池与地址精确取行，而不是随机挑选候选（与 ClaimFreeIP 的差异点）。
+	mock.ExpectQuery(getIPByAddressSQL).WithArgs(int64(1), "10.0.0.5").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "pool_id", "ip", "status", "vm_id", "updated_at"}).
+			AddRow(int64(10), int64(1), "10.0.0.5", "free", nil, testTime))
+	// 领取必须重新检查 status='free'（由 claimIPByAddressSQL 断言）。
+	mock.ExpectExec(claimIPByAddressSQL).WithArgs(int64(10), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+
+	repo := NewIPPoolRepository(mock)
+	tx, err := mock.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	ip, err := repo.ClaimIPByAddressTx(context.Background(), tx, 1, "10.0.0.5", nil)
+	if err != nil {
+		t.Fatalf("ClaimIPByAddressTx: %v", err)
+	}
+	if ip.ID != 10 || ip.IP != "10.0.0.5" {
+		t.Fatalf("unexpected ip: %+v", ip)
+	}
+	if ip.Status != model.IPStatusUsed {
+		t.Fatalf("status = %q, want %q", ip.Status, model.IPStatusUsed)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestClaimIPByAddressTxLinksVM(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectBegin()
+	vmID := int64(42)
+	mock.ExpectQuery(getIPByAddressSQL).WithArgs(int64(1), "10.0.0.5").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "pool_id", "ip", "status", "vm_id", "updated_at"}).
+			AddRow(int64(10), int64(1), "10.0.0.5", "free", nil, testTime))
+	mock.ExpectExec(claimIPByAddressSQL).WithArgs(int64(10), &vmID).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+	repo := NewIPPoolRepository(mock)
+	tx, err := mock.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	ip, err := repo.ClaimIPByAddressTx(context.Background(), tx, 1, "10.0.0.5", &vmID)
+	if err != nil {
+		t.Fatalf("ClaimIPByAddressTx: %v", err)
+	}
+	if ip.VMID == nil || *ip.VMID != vmID {
+		t.Fatalf("vm_id = %v, want %d", ip.VMID, vmID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestClaimIPByAddressTxNoSuchAddress(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectBegin()
+	// 池中不存在该地址：SELECT 无行 -> pgx.ErrNoRows（不执行领取 UPDATE）。
+	mock.ExpectQuery(getIPByAddressSQL).WithArgs(int64(1), "10.0.0.99").WillReturnError(pgx.ErrNoRows)
+
+	repo := NewIPPoolRepository(mock)
+	tx, err := mock.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	_, err = repo.ClaimIPByAddressTx(context.Background(), tx, 1, "10.0.0.99", nil)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("err = %v, want pgx.ErrNoRows", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestClaimIPByAddressTxAlreadyClaimed(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(getIPByAddressSQL).WithArgs(int64(1), "10.0.0.5").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "pool_id", "ip", "status", "vm_id", "updated_at"}).
+			AddRow(int64(10), int64(1), "10.0.0.5", "free", nil, testTime))
+	// 0 行受影响：条件 UPDATE 的 status='free' 守卫未通过，
+	// 目标地址已被并发事务抢先领取 -> ErrAllocationRetry。
+	mock.ExpectExec(claimIPByAddressSQL).WithArgs(int64(10), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+
+	repo := NewIPPoolRepository(mock)
+	tx, err := mock.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	_, err = repo.ClaimIPByAddressTx(context.Background(), tx, 1, "10.0.0.5", nil)
+	if !errors.Is(err, ErrAllocationRetry) {
+		t.Fatalf("err = %v, want ErrAllocationRetry", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestCreatePoolWithIPs(t *testing.T) {
 	mock := newMockPool(t)
 	mock.ExpectBegin()

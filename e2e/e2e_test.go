@@ -289,6 +289,17 @@ func (f *fakePVE) handleDelete(w http.ResponseWriter, node, vmid string) {
 	f.writeJSON(w, f.upid(node, "qmdestroy", id))
 }
 
+// registerVM 直接向 fake 节点注册一台 stopped 状态的 VM，用于模拟 PVE 上
+// 手工创建的已有虚拟机（"导入已有 VM"场景）。config 至少携带
+// name/cores/memory/scsi0（带 size=..G 字段）与 ipconfig0（静态 IP 声明）；
+// 与 handleCreate 不同，它不经过 POST /qemu 链路，也不推进 nextVMID，
+// 因此注册的 vmid 需要调用方自行避开 100（一步式创建测试已使用）。
+func (f *fakePVE) registerVM(vmid int64, name string, config map[string]string) {
+	f.mu.Lock()
+	f.vms[vmid] = &fakePVEVM{vmid: vmid, name: name, status: "stopped", config: config}
+	f.mu.Unlock()
+}
+
 // ---------- 辅助函数 ----------
 
 func e2eDSN() string {
@@ -692,5 +703,164 @@ provisioned:
 	}
 	if vmCount != 0 {
 		t.Fatalf("vms row count = %d after destroy, want 0", vmCount)
+	}
+
+	// ---------- 导入已有 VM（feat/import-existing-vms） ----------
+
+	// 9. 预置：在 fake PVE 上注册一台手工创建的 VM（vmid=200，避开
+	// 已创建并销毁的 100）。静态 IP 10.9.0.10 落在 e2e-pool 网段内：
+	// 池创建时 expandPoolIPs 会物化 10.9.0.0/24 除网络地址、广播地址
+	// 与网关（10.9.0.1）外的全部地址，因此导入时应精确复用该地址。
+	fakePVE.registerVM(200, "imported-vm", map[string]string{
+		"name":      "imported-vm",
+		"cores":     "1",
+		"memory":    "1024",
+		"scsi0":     "local-lvm:vm-200-disk-0,size=20G",
+		"ipconfig0": "ip=10.9.0.10/24,gw=10.9.0.1",
+	})
+
+	// 10. 候选查询：GET /vms/unmanaged 返回未托管候选，vmid=200
+	// 应出现（此前无托管 VM，故无过滤）。
+	unmanaged := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/vms/unmanaged?node_id=%d", nodeID), nil, http.StatusOK))
+	unmanagedVMs := unmanaged["vms"].([]any)
+	foundImport := false
+	for _, raw := range unmanagedVMs {
+		item := e2eObj(t, raw)
+		if int64(item["vmid"].(float64)) == 200 {
+			foundImport = true
+			if item["name"] != "imported-vm" || item["status"] != "stopped" {
+				t.Fatalf("unmanaged candidate 200 = %+v, want name=imported-vm status=stopped", item)
+			}
+		}
+	}
+	if !foundImport {
+		t.Fatalf("GET /vms/unmanaged candidates = %+v, want vmid 200", unmanagedVMs)
+	}
+
+	// 11. 导入：POST /vms/import -> 201 + Location + 完整 VMListItem。
+	// 需要读取响应头，故不走 e2eDo 而手动构造请求。
+	importReq, err := http.NewRequest(http.MethodPost, base+"/vms/import", strings.NewReader(
+		fmt.Sprintf(`{"zone_id":%d,"node_id":%d,"pve_vmid":200}`, zoneID, nodeID)))
+	if err != nil {
+		t.Fatalf("build import request: %v", err)
+	}
+	importReq.Header.Set("Content-Type", "application/json")
+	importResp, err := client.Do(importReq)
+	if err != nil {
+		t.Fatalf("POST /vms/import: %v", err)
+	}
+	defer importResp.Body.Close()
+	if importResp.StatusCode != http.StatusCreated {
+		raw := make([]byte, 4096)
+		n, _ := importResp.Body.Read(raw)
+		t.Fatalf("POST /vms/import: status %d, want 201 (body: %s)", importResp.StatusCode, strings.TrimSpace(string(raw[:n])))
+	}
+	var importBody any
+	if err := json.NewDecoder(importResp.Body).Decode(&importBody); err != nil {
+		t.Fatalf("POST /vms/import: decode body: %v", err)
+	}
+	imported := e2eObj(t, importBody)
+	importedID := int64(imported["id"].(float64))
+	if loc := importResp.Header.Get("Location"); loc != fmt.Sprintf("/vms/%d", importedID) {
+		t.Fatalf("import Location = %q, want /vms/%d", loc, importedID)
+	}
+	if imported["pve_vmid"] != float64(200) {
+		t.Fatalf("import pve_vmid = %v, want 200", imported["pve_vmid"])
+	}
+	if imported["ip"] != "10.9.0.10" {
+		t.Fatalf("import ip = %v, want 10.9.0.10 (静态 IP 精确复用)", imported["ip"])
+	}
+	// 导入的 VM 没有本地镜像/存储绑定：image_id、storage_type_id
+	// 应为 null（不出现）而非任意数值。
+	for _, key := range []string{"image_id", "storage_type_id"} {
+		if v, ok := imported[key]; ok && v != nil {
+			t.Fatalf("import %s = %v, want null/absent", key, v)
+		}
+	}
+	// 规格来自 PVE config 解析（vmConfigSpec：cores/memory/scsi0 size）。
+	if imported["cpu"] != float64(1) || imported["mem_mb"] != float64(1024) || imported["disk_gb"] != float64(20) {
+		t.Fatalf("import spec = cpu=%v mem_mb=%v disk_gb=%v, want 1/1024/20", imported["cpu"], imported["mem_mb"], imported["disk_gb"])
+	}
+	// 导入是同步的，状态从 PVE 实时透传：已存在的 stopped VM 即 stopped。
+	if imported["status"] != "stopped" {
+		t.Fatalf("import status = %v, want stopped (透传)", imported["status"])
+	}
+
+	// 12. 幂等：同一节点上的同一 pve_vmid 重复导入 -> 409
+	// vm_already_managed。
+	idem := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms/import",
+		map[string]any{"zone_id": zoneID, "node_id": nodeID, "pve_vmid": 200},
+		http.StatusConflict))
+	idemErr := e2eObj(t, idem["error"])
+	if code, _ := idemErr["code"].(string); code != "vm_already_managed" {
+		t.Fatalf("idempotent import code = %q, want vm_already_managed", code)
+	}
+
+	// 13. 候选过滤：导入后 vmid=200 不再出现在未托管列表。
+	unmanaged = e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+		fmt.Sprintf("/vms/unmanaged?node_id=%d", nodeID), nil, http.StatusOK))
+	for _, raw := range unmanaged["vms"].([]any) {
+		item := e2eObj(t, raw)
+		if int64(item["vmid"].(float64)) == 200 {
+			t.Fatalf("unmanaged candidates after import = %+v, want vmid 200 filtered out", unmanaged["vms"])
+		}
+	}
+
+	// 14. 列表与详情：GET /vms 出现新导入的 VM（id 匹配、status
+	// 透传为 stopped）；GET /vms/:id 的 image_id/storage_type_id 可空。
+	list = e2eObj(t, e2eDo(t, client, base, http.MethodGet, "/vms", nil, http.StatusOK))
+	found = false
+	for _, raw := range list["vms"].([]any) {
+		item := raw.(map[string]any)
+		if int64(item["id"].(float64)) == importedID {
+			found = true
+			if item["status"] != "stopped" {
+				t.Fatalf("list status of imported vm = %v, want stopped (透传)", item["status"])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("GET /vms does not contain the imported VM")
+	}
+	importedDetail := e2eObj(t, e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/vms/%d", importedID), nil, http.StatusOK))
+	if importedDetail["status"] != "stopped" {
+		t.Fatalf("detail status of imported vm = %v, want stopped", importedDetail["status"])
+	}
+	for _, key := range []string{"image_id", "storage_type_id"} {
+		if v, ok := importedDetail[key]; ok && v != nil {
+			t.Fatalf("detail %s = %v, want null/absent", key, v)
+		}
+	}
+
+	// 15. 生命周期：导入即托管，start/resize 直接生效——
+	// start -> PVE running；PATCH cpu=2 -> PVE config cores=2。
+	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/start", importedID), nil, http.StatusAccepted)
+	if s := fakePVE.get(200); s == nil || s.status != "running" {
+		t.Fatalf("fake pve status of imported vm after start = %+v, want running", s)
+	}
+	e2eDo(t, client, base, http.MethodPatch, fmt.Sprintf("/vms/%d", importedID),
+		map[string]any{"cpu": 2}, http.StatusOK)
+	if cfg := fakePVE.get(200).config; cfg["cores"] != "2" {
+		t.Fatalf("pve config after import resize = %+v, want cores=2", cfg)
+	}
+
+	// 16. 销毁：DELETE /vms/:id -> 204；PVE 虚拟机被删除，静态复用
+	// 的 IP 10.9.0.10 释放回 free，vms 数据行消失。
+	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%d", importedID), nil, http.StatusNoContent)
+	if got := fakePVE.get(200); got != nil {
+		t.Fatalf("fake pve still has VM 200 after destroy: %+v", got)
+	}
+	if err := pool.QueryRow(ctx, "SELECT status, vm_id FROM ips WHERE ip=$1", "10.9.0.10").Scan(&ipStatus, &ipVMID); err != nil {
+		t.Fatalf("query released ip 10.9.0.10: %v", err)
+	}
+	if ipStatus != "free" || ipVMID != nil {
+		t.Fatalf("released ip 10.9.0.10: status=%q vm_id=%v, want free/nil", ipStatus, ipVMID)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM vms WHERE id=$1", importedID).Scan(&vmCount); err != nil {
+		t.Fatalf("query vms after import destroy: %v", err)
+	}
+	if vmCount != 0 {
+		t.Fatalf("vms row count = %d after import destroy, want 0", vmCount)
 	}
 }

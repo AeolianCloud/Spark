@@ -75,6 +75,10 @@ type fakeVMRepository struct {
 	mu               sync.Mutex
 	created          *model.VM
 	createErr        error
+	imported         *model.VM
+	importErr        error
+	getByNodeVMID    *model.VM
+	getByNodeVMIDErr error
 	get              *repository.VMWithIP
 	getErr           error
 	vms              []repository.VMWithIP
@@ -121,6 +125,31 @@ func (f *fakeVMRepository) CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.V
 	created.UpdatedAt = vmTestTime
 	f.created = &created
 	return &created, nil
+}
+
+func (f *fakeVMRepository) ImportVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error) {
+	if f.importErr != nil {
+		return nil, f.importErr
+	}
+	created := vm
+	created.ID = 1
+	created.CreatedAt = vmTestTime
+	created.UpdatedAt = vmTestTime
+	// 保存调用时参数的值副本：service 会在 INSERT 之后回填 IPID，不能让它
+	// 污染"调用时"的记录（返回指针与 saved 指向同一对象的拷贝）。
+	saved := created
+	f.imported = &saved
+	return &created, nil
+}
+
+func (f *fakeVMRepository) GetVMByNodeVMID(ctx context.Context, nodeID, vmid int64) (*model.VM, error) {
+	if f.getByNodeVMIDErr != nil {
+		return nil, f.getByNodeVMIDErr
+	}
+	if f.getByNodeVMID != nil {
+		return f.getByNodeVMID, nil
+	}
+	return nil, pgx.ErrNoRows
 }
 
 func (f *fakeVMRepository) GetVM(ctx context.Context, id int64) (*repository.VMWithIP, error) {
@@ -209,15 +238,37 @@ func (f *fakeVMRepository) DeleteVMTx(ctx context.Context, tx pgx.Tx, id int64) 
 type fakeVMIPPoolRepository struct {
 	pools        []model.IPPool
 	poolNodes    map[int64][]model.PVENode
-	claimResults []claimResult // 按顺序消费
+	claimResults []claimResult // 按顺序消费（ClaimFreeIP）
 	claimDefault error         // 脚本耗尽时返回
 	claimedVMIDs []int64
-	released     []int64
+	// claimAddressResults 按顺序消费（ClaimIPByAddressTx）；脚本耗尽时
+	// 返回 claimAddressDefault，仍为 nil 则返回 pgx.ErrNoRows。
+	claimAddressResults []claimResult
+	claimAddressDefault error
+	addressClaims       []addressClaim
+	released            []int64
 }
 
 type claimResult struct {
 	ip  model.IP
 	err error
+}
+
+// addressClaim 记录一次 ClaimIPByAddressTx 调用的参数。
+type addressClaim struct {
+	poolID int64
+	ip     string
+	vmID   *int64
+}
+
+func (f *fakeVMIPPoolRepository) GetPool(ctx context.Context, id int64) (*model.IPPool, error) {
+	for i := range f.pools {
+		if f.pools[i].ID == id {
+			p := f.pools[i]
+			return &p, nil
+		}
+	}
+	return nil, pgx.ErrNoRows
 }
 
 func (f *fakeVMIPPoolRepository) ListPoolsByZone(ctx context.Context, zoneID int64) ([]model.IPPool, error) {
@@ -239,6 +290,19 @@ func (f *fakeVMIPPoolRepository) ClaimFreeIP(ctx context.Context, tx pgx.Tx, poo
 	}
 	if f.claimDefault != nil {
 		return model.IP{}, f.claimDefault
+	}
+	return model.IP{}, pgx.ErrNoRows
+}
+
+func (f *fakeVMIPPoolRepository) ClaimIPByAddressTx(ctx context.Context, tx pgx.Tx, poolID int64, ipAddr string, vmID *int64) (model.IP, error) {
+	f.addressClaims = append(f.addressClaims, addressClaim{poolID: poolID, ip: ipAddr, vmID: vmID})
+	if len(f.claimAddressResults) > 0 {
+		r := f.claimAddressResults[0]
+		f.claimAddressResults = f.claimAddressResults[1:]
+		return r.ip, r.err
+	}
+	if f.claimAddressDefault != nil {
+		return model.IP{}, f.claimAddressDefault
 	}
 	return model.IP{}, pgx.ErrNoRows
 }
