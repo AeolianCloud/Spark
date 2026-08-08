@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -169,6 +170,20 @@ func (f *fakeVMRepository) ListVMs(ctx context.Context) ([]repository.VMWithIP, 
 	return f.vms, nil
 }
 
+// ListVMsByUser 按归属用户过滤本地行（设计 D5 分流测试用）。
+func (f *fakeVMRepository) ListVMsByUser(ctx context.Context, userID int64) ([]repository.VMWithIP, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]repository.VMWithIP, 0, len(f.vms))
+	for _, v := range f.vms {
+		if v.VM.UserID != nil && *v.VM.UserID == userID {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeVMRepository) SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error {
 	f.linkedIPID = ipID
 	return nil
@@ -250,6 +265,41 @@ func (f *fakeVMOperationRepository) ListOperations(ctx context.Context, nodeID, 
 		}
 	}
 	return slicePage(all, limit, offset), len(all), nil
+}
+
+// fakeVMUserRepository 是供服务测试使用的可脚本化 UserLookupRepository
+// （创建/认领的可选归属用户校验，设计 D3）。
+type fakeVMUserRepository struct {
+	users []model.User
+	err   error
+}
+
+func (f *fakeVMUserRepository) GetUserByID(ctx context.Context, id int64) (*model.User, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	for i := range f.users {
+		if f.users[i].ID == id {
+			u := f.users[i]
+			return &u, nil
+		}
+	}
+	return nil, pgx.ErrNoRows
+}
+
+// testVMUser 构造一个启用状态的测试用户。
+func testVMUser(id int64) model.User {
+	return model.User{ID: id, Username: "u" + strconv.FormatInt(id, 10), Name: "User", Status: model.UserStatusEnabled}
+}
+
+// userIdentity 返回给定用户 ID 的用户身份（设计 D5 归属校验测试用）。
+func userIdentity(id int64) *Identity {
+	return &Identity{Role: RoleUser, ID: id}
+}
+
+// adminIdentity 返回管理员身份（显式表达"管理员视角"的既有行为）。
+func adminIdentity() *Identity {
+	return &Identity{Role: RoleAdmin, ID: 1}
 }
 
 // fakeVMIPPoolRepository 是供服务测试使用的可脚本化 VMIPPoolRepository：
@@ -469,7 +519,7 @@ func newVMService(t *testing.T, vmRepo VMRepository, ipRepo VMIPPoolRepository,
 	zoneRepo VMZoneRepository, nodeRepo VMNodeRepository, imageRepo VMImageRepository,
 	stRepo VMStorageTypeRepository) *VMService {
 	t.Helper()
-	svc := NewVMService(&fakeBeginner{}, vmRepo, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo, testCipher(t))
+	svc := NewVMService(&fakeBeginner{}, vmRepo, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo, &fakeVMUserRepository{}, testCipher(t))
 	svc.selectNode = firstReachableCandidate
 	srv := newScriptedProvisionServer(t, "15G")
 	ts := httptest.NewServer(srv.handler())
@@ -488,7 +538,7 @@ func newVMServiceWithOps(t *testing.T, opRepo VMOperationRepository, vmRepo VMRe
 	zoneRepo VMZoneRepository, nodeRepo VMNodeRepository, imageRepo VMImageRepository,
 	stRepo VMStorageTypeRepository) *VMService {
 	t.Helper()
-	svc := NewVMService(&fakeBeginner{}, vmRepo, opRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo, testCipher(t))
+	svc := NewVMService(&fakeBeginner{}, vmRepo, opRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo, &fakeVMUserRepository{}, testCipher(t))
 	svc.selectNode = firstReachableCandidate
 	srv := newScriptedProvisionServer(t, "15G")
 	ts := httptest.NewServer(srv.handler())
@@ -670,7 +720,7 @@ func TestCreateVMHappyPath(t *testing.T) {
 	ipRepo.claimResults = []claimResult{{ip: model.IP{ID: 7, PoolID: 1, IP: "10.0.0.5", Status: model.IPStatusUsed}}}
 	svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
 
-	vm, err := svc.CreateVM(context.Background(), validCreateRequest())
+	vm, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
 	if err != nil {
 		t.Fatalf("CreateVM: %v", err)
 	}
@@ -704,7 +754,7 @@ func TestCreateVMEncryptsPassword(t *testing.T) {
 	const pw = "s3cret-pw-123"
 	req := validCreateRequest()
 	req.Password = pw
-	if _, err := svc.CreateVM(context.Background(), req); err != nil {
+	if _, err := svc.CreateVM(context.Background(), adminIdentity(), req); err != nil {
 		t.Fatalf("CreateVM: %v", err)
 	}
 	enc := vmRepo.created.PasswordEncrypted
@@ -729,19 +779,19 @@ func TestCreateVMValidationOrder(t *testing.T) {
 	// 未知区域 -> not_found。
 	r := req
 	r.ZoneID = 99
-	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindNotFound) {
+	if _, err := svc.CreateVM(context.Background(), adminIdentity(), r); !isKind(err, KindNotFound) {
 		t.Fatalf("unknown zone err = %v, want KindNotFound", err)
 	}
 	// 未知镜像 -> not_found。
 	r = req
 	r.ImageID = 99
-	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindNotFound) {
+	if _, err := svc.CreateVM(context.Background(), adminIdentity(), r); !isKind(err, KindNotFound) {
 		t.Fatalf("unknown image err = %v, want KindNotFound", err)
 	}
 	// 未知存储类型 -> not_found。
 	r = req
 	r.StorageTypeID = 99
-	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindNotFound) {
+	if _, err := svc.CreateVM(context.Background(), adminIdentity(), r); !isKind(err, KindNotFound) {
 		t.Fatalf("unknown storage err = %v, want KindNotFound", err)
 	}
 	// 镜像在任何启用节点上都不存在（content 扫描无匹配）-> KindImageNotAvailable。
@@ -750,19 +800,19 @@ func TestCreateVMValidationOrder(t *testing.T) {
 			DownloadURL: "https://example.com/not-present.qcow2"}},
 	}
 	svc2 := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imgRepo, stRepo)
-	if _, err := svc2.CreateVM(context.Background(), req); !isKind(err, KindImageNotAvailable) {
+	if _, err := svc2.CreateVM(context.Background(), adminIdentity(), req); !isKind(err, KindImageNotAvailable) {
 		t.Fatalf("image not available err = %v, want KindImageNotAvailable", err)
 	}
 	// 空密码 -> bad_request。
 	r = req
 	r.Password = ""
-	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindBadRequest) {
+	if _, err := svc.CreateVM(context.Background(), adminIdentity(), r); !isKind(err, KindBadRequest) {
 		t.Fatalf("empty password err = %v, want KindBadRequest", err)
 	}
 	// 零 cpu -> bad_request。
 	r = req
 	r.CPU = 0
-	if _, err := svc.CreateVM(context.Background(), r); !isKind(err, KindBadRequest) {
+	if _, err := svc.CreateVM(context.Background(), adminIdentity(), r); !isKind(err, KindBadRequest) {
 		t.Fatalf("zero cpu err = %v, want KindBadRequest", err)
 	}
 }
@@ -777,7 +827,7 @@ func TestCreateVMClaimRetriesThenSucceeds(t *testing.T) {
 	}
 	svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
 
-	vm, err := svc.CreateVM(context.Background(), validCreateRequest())
+	vm, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
 	if err != nil {
 		t.Fatalf("CreateVM: %v", err)
 	}
@@ -798,7 +848,7 @@ func TestCreateVMClaimExhausted(t *testing.T) {
 	}
 	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
 
-	_, err := svc.CreateVM(context.Background(), validCreateRequest())
+	_, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
 	if !isKind(err, KindIPExhausted) {
 		t.Fatalf("err = %v, want KindIPExhausted", err)
 	}
@@ -809,7 +859,7 @@ func TestCreateVMClaimNoFreeAddress(t *testing.T) {
 	ipRepo.claimDefault = pgx.ErrNoRows
 	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
 
-	_, err := svc.CreateVM(context.Background(), validCreateRequest())
+	_, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
 	if !isKind(err, KindIPExhausted) {
 		t.Fatalf("err = %v, want KindIPExhausted", err)
 	}
@@ -833,7 +883,7 @@ func TestCreateVMSchedulesToNodeWithImage(t *testing.T) {
 	vmRepo := &fakeVMRepository{}
 	svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
 
-	vm, err := svc.CreateVM(context.Background(), validCreateRequest())
+	vm, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
 	if err != nil {
 		t.Fatalf("CreateVM: %v", err)
 	}
@@ -855,7 +905,7 @@ func TestCreateVMImageNotAvailableOnAnyNode(t *testing.T) {
 	imageRepo.images[0].DownloadURL = "https://example.com/not-present.qcow2"
 	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
 
-	_, err := svc.CreateVM(context.Background(), validCreateRequest())
+	_, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
 	if !isKind(err, KindImageNotAvailable) {
 		t.Fatalf("err = %v, want KindImageNotAvailable", err)
 	}
@@ -870,7 +920,7 @@ func TestCreateVMNodeUnavailableWhenImageNodesUnreachable(t *testing.T) {
 	// 镜像过滤后 pve1 仍在候选，但可达性探测全部失败。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve1": true})
 
-	_, err := svc.CreateVM(context.Background(), validCreateRequest())
+	_, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
@@ -934,7 +984,7 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 	})
 	defer contentSrv.Close()
 	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
-		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, testCipher(t))
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, &fakeVMUserRepository{}, testCipher(t))
 	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
@@ -1527,13 +1577,13 @@ func TestStartStopRestart(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := svc.Start(ctx, "1"); err != nil {
+	if err := svc.Start(ctx, "1", adminIdentity()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := svc.Stop(ctx, "1"); err != nil {
+	if err := svc.Stop(ctx, "1", adminIdentity()); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	if err := svc.Restart(ctx, "1"); err != nil {
+	if err := svc.Restart(ctx, "1", adminIdentity()); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
 	// 三个 accepted 记录：start/stop/reboot，节点 1 / VMID 100。
@@ -1553,7 +1603,7 @@ func TestStartStopRestart(t *testing.T) {
 func TestStartVMNotFound(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	if err := svc.Start(context.Background(), "404"); !isKind(err, KindNotFound) {
+	if err := svc.Start(context.Background(), "404", adminIdentity()); !isKind(err, KindNotFound) {
 		t.Fatalf("err = %v, want KindNotFound", err)
 	}
 }
@@ -1568,7 +1618,7 @@ func TestInvalidVMRefs(t *testing.T) {
 		"abc", "ext-", "ext-1", "ext-a-b", "ext-1-2-3", "ext-0-5", "ext-1-0", "-1",
 		"ext-01-005", "ext-+1-+5", "ext-1-+5", "ext-01-5", "01", "0", "+1",
 	} {
-		if err := svc.Start(context.Background(), id); !isKind(err, KindInvalidVMRef) {
+		if err := svc.Start(context.Background(), id, adminIdentity()); !isKind(err, KindInvalidVMRef) {
 			t.Fatalf("id %q err = %v, want KindInvalidVMRef", id, err)
 		}
 	}
@@ -1580,7 +1630,7 @@ func TestStartVMNotProvisioned(t *testing.T) {
 	vm.VM.PVEVmid = 0
 	svc := newVMService(t, &fakeVMRepository{get: vm}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	if err := svc.Start(context.Background(), "1"); !isKind(err, KindVMNotReady) {
+	if err := svc.Start(context.Background(), "1", adminIdentity()); !isKind(err, KindVMNotReady) {
 		t.Fatalf("err = %v, want KindVMNotReady", err)
 	}
 }
@@ -1602,7 +1652,7 @@ func TestStartVMPVENotFound(t *testing.T) {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	if err := svc.Start(context.Background(), "1"); !isKind(err, KindVMNotReady) {
+	if err := svc.Start(context.Background(), "1", adminIdentity()); !isKind(err, KindVMNotReady) {
 		t.Fatalf("err = %v, want KindVMNotReady", err)
 	}
 	if len(opRepo.ops) != 1 {
@@ -1642,13 +1692,13 @@ func TestExternalLifecycleOps(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := svc.Start(ctx, "ext-3-200"); err != nil {
+	if err := svc.Start(ctx, "ext-3-200", adminIdentity()); err != nil {
 		t.Fatalf("Start external: %v", err)
 	}
-	if err := svc.Stop(ctx, "ext-3-200"); err != nil {
+	if err := svc.Stop(ctx, "ext-3-200", adminIdentity()); err != nil {
 		t.Fatalf("Stop external: %v", err)
 	}
-	if err := svc.Restart(ctx, "ext-3-200"); err != nil {
+	if err := svc.Restart(ctx, "ext-3-200", adminIdentity()); err != nil {
 		t.Fatalf("Restart external: %v", err)
 	}
 	if len(opRepo.ops) != 3 {
@@ -1676,7 +1726,7 @@ func TestExternalLifecycleOpMissingNode(t *testing.T) {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	if err := svc.Start(context.Background(), "ext-99-200"); !isKind(err, KindNotFound) {
+	if err := svc.Start(context.Background(), "ext-99-200", adminIdentity()); !isKind(err, KindNotFound) {
 		t.Fatalf("missing node err = %v, want KindNotFound", err)
 	}
 	if len(opRepo.ops) != 0 {
@@ -1703,7 +1753,7 @@ func TestExternalLifecycleOpVMNotFoundOnNode(t *testing.T) {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	if err := svc.Start(context.Background(), "ext-3-999"); !isKind(err, KindVMNotFoundOnNode) {
+	if err := svc.Start(context.Background(), "ext-3-999", adminIdentity()); !isKind(err, KindVMNotFoundOnNode) {
 		t.Fatalf("err = %v, want KindVMNotFoundOnNode", err)
 	}
 }
@@ -1730,7 +1780,7 @@ func TestExternalLifecycleOpPVE404MapsNotFound(t *testing.T) {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	if err := svc.Restart(context.Background(), "ext-3-200"); !isKind(err, KindVMNotFoundOnNode) {
+	if err := svc.Restart(context.Background(), "ext-3-200", adminIdentity()); !isKind(err, KindVMNotFoundOnNode) {
 		t.Fatalf("err = %v, want KindVMNotFoundOnNode", err)
 	}
 	if len(opRepo.ops) != 1 || opRepo.ops[0].Result != model.VMOpResultFailed {
@@ -1752,7 +1802,7 @@ func TestOperationLogWriteFailure(t *testing.T) {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	if err := svc.Start(context.Background(), "1"); !isKind(err, KindOperationLogFailed) {
+	if err := svc.Start(context.Background(), "1", adminIdentity()); !isKind(err, KindOperationLogFailed) {
 		t.Fatalf("err = %v, want KindOperationLogFailed", err)
 	}
 }
@@ -1773,7 +1823,7 @@ func TestDestroyFlow(t *testing.T) {
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Destroy(context.Background(), "1"); err != nil {
+	if err := svc.Destroy(context.Background(), "1", adminIdentity()); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 	if !srv.destroyed {
@@ -1806,7 +1856,7 @@ func TestDestroyUnprovisioned(t *testing.T) {
 	// newVMService 的 newClient 对所有请求都应答 503；PVE 调用绝不能发生，
 	// 因此任何调用都会导致下面的测试失败。
 
-	if err := svc.Destroy(context.Background(), "1"); err != nil {
+	if err := svc.Destroy(context.Background(), "1", adminIdentity()); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 	if len(ipRepo.released) != 1 || len(vmRepo.deleted) != 1 {
@@ -1821,7 +1871,7 @@ func TestDestroyUnprovisioned(t *testing.T) {
 func TestDestroyVMNotFound(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		&fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
-	if err := svc.Destroy(context.Background(), "404"); !isKind(err, KindNotFound) {
+	if err := svc.Destroy(context.Background(), "404", adminIdentity()); !isKind(err, KindNotFound) {
 		t.Fatalf("err = %v, want KindNotFound", err)
 	}
 }
@@ -1856,7 +1906,7 @@ func TestDestroyExternal(t *testing.T) {
 			pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Destroy(context.Background(), "ext-3-200"); err != nil {
+	if err := svc.Destroy(context.Background(), "ext-3-200", adminIdentity()); err != nil {
 		t.Fatalf("Destroy external: %v", err)
 	}
 	// 无本地行/IP 清理；操作记录照写（外部操作同样记录，spec）。
@@ -1901,7 +1951,7 @@ func TestDestroyExternalManagedRoutesLocal(t *testing.T) {
 			pve.WithBaseURL(srv.URL), pve.WithHTTPClient(srv.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Destroy(context.Background(), "ext-3-200"); err != nil {
+	if err := svc.Destroy(context.Background(), "ext-3-200", adminIdentity()); err != nil {
 		t.Fatalf("Destroy external-managed: %v", err)
 	}
 	// 本地清理执行：PVE 销毁 + IP 释放 + 行删除（按本地行 id 5）。
@@ -1940,7 +1990,7 @@ func TestStartExternalManagedRoutesLocal(t *testing.T) {
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Start(context.Background(), "ext-3-200"); !isKind(err, KindVMNotReady) {
+	if err := svc.Start(context.Background(), "ext-3-200", adminIdentity()); !isKind(err, KindVMNotReady) {
 		t.Fatalf("err = %v, want KindVMNotReady (local routing), not vm_not_found_on_node", err)
 	}
 	// failed 记录照写，消息为本地语义。
@@ -1971,11 +2021,11 @@ func TestExternalLifecycleOpTemplateRejected(t *testing.T) {
 		return pve.NewClient("pve1", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	for _, op := range []func(context.Context, string) error{
+	for _, op := range []func(context.Context, string, *Identity) error{
 		svc.Start, svc.Stop, svc.Restart,
-		func(ctx context.Context, id string) error { return svc.Destroy(ctx, id) },
+		func(ctx context.Context, id string, identity *Identity) error { return svc.Destroy(ctx, id, identity) },
 	} {
-		if err := op(context.Background(), "ext-3-200"); !isKind(err, KindBadRequest) {
+		if err := op(context.Background(), "ext-3-200", adminIdentity()); !isKind(err, KindBadRequest) {
 			t.Fatalf("err = %v, want KindBadRequest for a pve template", err)
 		}
 	}
@@ -2001,7 +2051,7 @@ func TestDestroyPVEFailureKeepsRecordAndIP(t *testing.T) {
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Destroy(context.Background(), "1"); err == nil {
+	if err := svc.Destroy(context.Background(), "1", adminIdentity()); err == nil {
 		t.Fatal("Destroy succeeded, want PVE failure")
 	}
 	if len(ipRepo.released) != 0 || len(vmRepo.deleted) != 0 {
@@ -2032,7 +2082,7 @@ func TestDestroyPVE404CleansUpLocal(t *testing.T) {
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if err := svc.Destroy(context.Background(), "1"); err != nil {
+	if err := svc.Destroy(context.Background(), "1", adminIdentity()); err != nil {
 		t.Fatalf("Destroy with PVE 404: %v", err)
 	}
 	if len(ipRepo.released) != 1 || ipRepo.released[0] != 1 {
@@ -2070,7 +2120,7 @@ func TestListOperations(t *testing.T) {
 	}
 
 	// 数字 id：查本地行（节点 1 / vmid 100）的记录，倒序分页。
-	ops, total, err := svc.ListOperations(context.Background(), "1", 25, 0)
+	ops, total, err := svc.ListOperations(context.Background(), "1", adminIdentity(), 25, 0)
 	if err != nil {
 		t.Fatalf("ListOperations (numeric): %v", err)
 	}
@@ -2081,7 +2131,7 @@ func TestListOperations(t *testing.T) {
 		t.Fatalf("ops = %+v, want destroy/stop/start in descending time order", ops)
 	}
 	// 分页：limit 2 offset 1 -> [stop, start]（中间两条），total 不变。
-	ops, total, err = svc.ListOperations(context.Background(), "1", 2, 1)
+	ops, total, err = svc.ListOperations(context.Background(), "1", adminIdentity(), 2, 1)
 	if err != nil {
 		t.Fatalf("ListOperations page: %v", err)
 	}
@@ -2090,7 +2140,7 @@ func TestListOperations(t *testing.T) {
 	}
 
 	// ext- 标识：直接按 node+vmid 查询，不要求本地行。
-	ops, total, err = svc.ListOperations(context.Background(), "ext-3-200", 25, 0)
+	ops, total, err = svc.ListOperations(context.Background(), "ext-3-200", adminIdentity(), 25, 0)
 	if err != nil {
 		t.Fatalf("ListOperations (external): %v", err)
 	}
@@ -2099,7 +2149,7 @@ func TestListOperations(t *testing.T) {
 	}
 
 	// 无记录的 VM：空列表。
-	ops, total, err = svc.ListOperations(context.Background(), "ext-1-999", 25, 0)
+	ops, total, err = svc.ListOperations(context.Background(), "ext-1-999", adminIdentity(), 25, 0)
 	if err != nil {
 		t.Fatalf("ListOperations (empty): %v", err)
 	}
@@ -2109,12 +2159,12 @@ func TestListOperations(t *testing.T) {
 
 	// 本地不存在的 VM id -> not_found（spec：查询本地不存在的 VM -> 资源不存在）。
 	svc.vmRepo = &fakeVMRepository{}
-	if _, _, err := svc.ListOperations(context.Background(), "404", 25, 0); !isKind(err, KindNotFound) {
+	if _, _, err := svc.ListOperations(context.Background(), "404", adminIdentity(), 25, 0); !isKind(err, KindNotFound) {
 		t.Fatalf("missing vm err = %v, want KindNotFound", err)
 	}
 
 	// 非法标识 -> invalid ref。
-	if _, _, err := svc.ListOperations(context.Background(), "ext-bad", 25, 0); !isKind(err, KindInvalidVMRef) {
+	if _, _, err := svc.ListOperations(context.Background(), "ext-bad", adminIdentity(), 25, 0); !isKind(err, KindInvalidVMRef) {
 		t.Fatalf("bad id err = %v, want KindInvalidVMRef", err)
 	}
 }
@@ -2143,7 +2193,7 @@ func TestResizeRejectsShrinkBeforePVE(t *testing.T) {
 	}
 
 	disk := int64(5)
-	if _, err := svc.Resize(context.Background(), 1, nil, nil, &disk); !isKind(err, KindDiskShrinkNotAllowed) {
+	if _, err := svc.Resize(context.Background(), 1, adminIdentity(), nil, nil, &disk); !isKind(err, KindDiskShrinkNotAllowed) {
 		t.Fatalf("err = %v, want KindDiskShrinkNotAllowed", err)
 	}
 }
@@ -2164,7 +2214,7 @@ func TestResizeNoOpEqualDisk(t *testing.T) {
 	}
 
 	disk := int64(10) // 等于当前 10G
-	vm, err := svc.Resize(context.Background(), 1, nil, nil, &disk)
+	vm, err := svc.Resize(context.Background(), 1, adminIdentity(), nil, nil, &disk)
 	if err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
@@ -2212,7 +2262,7 @@ func TestResizeGrowAll(t *testing.T) {
 	cpu := 4
 	mem := int64(4096)
 	disk := int64(20)
-	vm, err := svc.Resize(context.Background(), 1, &cpu, &mem, &disk)
+	vm, err := svc.Resize(context.Background(), 1, adminIdentity(), &cpu, &mem, &disk)
 	if err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
@@ -2247,7 +2297,7 @@ func TestResizeSpecConflict(t *testing.T) {
 	}
 
 	cpu := 4
-	_, err := svc.Resize(context.Background(), 1, &cpu, nil, nil)
+	_, err := svc.Resize(context.Background(), 1, adminIdentity(), &cpu, nil, nil)
 	if !isKind(err, KindConflict) {
 		t.Fatalf("err = %v, want KindConflict", err)
 	}

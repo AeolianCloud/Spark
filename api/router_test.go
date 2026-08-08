@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"gopkg.in/yaml.v3"
 
@@ -16,7 +17,12 @@ import (
 	"spark/api/middleware"
 	"spark/config"
 	"spark/crypto"
+	"spark/service"
 )
+
+// testJWTSecret 是路由测试注入的固定 JWT 密钥（≥32 字符，满足 config
+// 最小长度下限；auth 中间件据此校验测试令牌）。
+const testJWTSecret = "test-jwt-secret-0123456789abcdefghijklmnopqrstuv"
 
 // testRouterPool 构建一个从不打开连接的懒加载 pool，
 // 足以用于不触碰数据库的路由层测试。
@@ -46,19 +52,33 @@ func testRouterCipher(t *testing.T) *crypto.Cipher {
 	return c
 }
 
+// newTestRouter 构建带固定 JWT 密钥的完整路由（auth 服务依赖非空密钥，
+// 路由层测试必须注入）。
+func newTestRouter(t *testing.T) *gin.Engine {
+	t.Helper()
+	return NewRouter(testRouterPool(t), testRouterCipher(t), WithJWTSecret(testJWTSecret))
+}
+
 // TestRouterRegistersAllRoutes 用懒加载 pool（不打开任何连接）构建完整
 // 路由并断言完整路由表。gin 在路由注册冲突时会 panic，因此仅构建路由
-// 本身就是冲突检查；断言则固定了预期路径，包括 batch-7 的 /vms 分组。
+// 本身就是冲突检查；断言则固定了预期路径，包括认证路由（task 3.2/3.3）
+// 与 batch-7 的 /vms 分组。
 func TestRouterRegistersAllRoutes(t *testing.T) {
-	pool := testRouterPool(t)
-
-	r := NewRouter(pool, testRouterCipher(t))
+	r := newTestRouter(t)
 
 	want := []string{
 		"GET /healthz",
 		"GET /docs",
 		"GET /docs/*any",
 		"GET /openapi.yaml",
+		"POST /auth/login",
+		"POST /auth/admin/login",
+		"POST /users",
+		"GET /users",
+		"GET /users/:id",
+		"PUT /users/:id",
+		"DELETE /users/:id",
+		"PUT /users/:id/status",
 		"POST /zones",
 		"GET /zones",
 		"POST /zones/:zone_id/nodes",
@@ -112,7 +132,7 @@ type errorBody struct {
 // TestRouterUnmatchedPathAndMethod 验证统一错误契约覆盖整个 API 表面：
 // 未知路径返回 404 结构，已知路径配未注册方法返回 405 并带 Allow 头。
 func TestRouterUnmatchedPathAndMethod(t *testing.T) {
-	r := NewRouter(testRouterPool(t), testRouterCipher(t))
+	r := newTestRouter(t)
 
 	t.Run("unknown path returns unified 404", func(t *testing.T) {
 		w := httptest.NewRecorder()
@@ -194,7 +214,7 @@ func TestRouterUnmatchedPathAndMethod(t *testing.T) {
 // openapi 3.0.3。这两条路由刻意不写入契约本身（docs/openapi.yaml），
 // 因此断言的是实际挂载行为而非契约内容。
 func TestDocsRoutes(t *testing.T) {
-	r := NewRouter(testRouterPool(t), testRouterCipher(t))
+	r := newTestRouter(t)
 
 	t.Run("GET /docs renders swagger ui page", func(t *testing.T) {
 		w := httptest.NewRecorder()
@@ -245,6 +265,68 @@ func TestErrorCodeConstantsLocked(t *testing.T) {
 	if handlers.CodeNotFound != "not_found" {
 		t.Errorf("handlers.CodeNotFound = %q, want %q", handlers.CodeNotFound, "not_found")
 	}
+	if handlers.CodeUnauthorized != "unauthorized" {
+		t.Errorf("handlers.CodeUnauthorized = %q, want %q", handlers.CodeUnauthorized, "unauthorized")
+	}
+	if handlers.CodeForbidden != "forbidden" {
+		t.Errorf("handlers.CodeForbidden = %q, want %q", handlers.CodeForbidden, "forbidden")
+	}
+}
+
+// TestAuthConstantsLocked 守护 middleware 与 service 跨包重复的身份域常量
+// （JWT role claim 取值，设计 D2）：middleware 不能 import service，
+// 两处取值必须一致，防止身份域漂移导致鉴权漏洞。
+func TestAuthConstantsLocked(t *testing.T) {
+	if middleware.RoleAdmin != "admin" || service.RoleAdmin != "admin" {
+		t.Errorf("RoleAdmin = middleware %q / service %q, want both %q",
+			middleware.RoleAdmin, service.RoleAdmin, "admin")
+	}
+	if middleware.RoleUser != "user" || service.RoleUser != "user" {
+		t.Errorf("RoleUser = middleware %q / service %q, want both %q",
+			middleware.RoleUser, service.RoleUser, "user")
+	}
+	if middleware.IdentityKey != "identity" {
+		t.Errorf("middleware.IdentityKey = %q, want %q", middleware.IdentityKey, "identity")
+	}
+}
+
+// TestRouterAuthProtection 验证路由分层（task 4.3，设计 D4）：公开组
+// （healthz/docs/双登录）不要求令牌；受保护组（全部业务路由）缺失令牌
+// 一律 401，由 requireAuth 在 handler 之前拦截。
+func TestRouterAuthProtection(t *testing.T) {
+	r := newTestRouter(t)
+
+	paths := []string{"/zones", "/zones/1/nodes", "/ip-pools", "/storage-types", "/images", "/vms", "/users"}
+	for _, path := range paths {
+		t.Run("protected "+path, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", w.Code)
+			}
+			if got := w.Header().Get(middleware.XMSErrorCodeHeader); got != handlers.CodeUnauthorized {
+				t.Errorf("x-ms-error-code = %q, want %q", got, handlers.CodeUnauthorized)
+			}
+		})
+	}
+
+	// 公开路由不受鉴权影响：登录接口对坏请求返回 400 而非 401 鉴权拦截。
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Error("POST /auth/login 不应要求令牌（登录接口本身公开）")
+	}
+
+	// docs 公开访问正常渲染。
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/docs", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("GET /docs status = %d, want 200（公开路由不受鉴权影响）", w.Code)
+	}
 }
 
 // TestHealthzServiceDown 验证 degraded 契约：数据库 ping 失败时
@@ -252,7 +334,7 @@ func TestErrorCodeConstantsLocked(t *testing.T) {
 // 视为服务不可用。懒加载 pool 指向无人监听的 127.0.0.1:1，
 // 因此 ping 必然失败。
 func TestHealthzServiceDown(t *testing.T) {
-	r := NewRouter(testRouterPool(t), testRouterCipher(t))
+	r := newTestRouter(t)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)

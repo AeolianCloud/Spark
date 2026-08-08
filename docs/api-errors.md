@@ -1,6 +1,6 @@
 # API 错误码契约
 
-本页是错误响应的唯一权威契约，与 `api/handlers/error.go`、`api/handlers/zone_handler.go`、`api/handlers/vm_handler.go` 中的错误码常量保持一致。修改任何错误码必须同步更新本页。
+本页是错误响应的唯一权威契约，与 `api/handlers/error.go`、`api/handlers/zone_handler.go`、`api/handlers/vm_handler.go`、`api/handlers/user_handler.go` 中的错误码常量保持一致。修改任何错误码必须同步更新本页。
 
 ## 错误响应结构
 
@@ -40,6 +40,8 @@ x-ms-error-code: not_found
 | 错误码 | HTTP 状态 | 含义 | 触发场景 |
 | --- | --- | --- | --- |
 | `bad_request` | 400 | 请求参数非法 | 请求体无法解析、必填参数缺失、路径/查询参数格式错误；镜像下载请求 `node_ids` 与 `zone_id` 同时提供或都不提供、`node_ids` 超过 64 个、`download_url` 非 http(s) 或 host 不在下载源白名单（`images.download_host_allowlist`，空列表拒绝一切下载）、`download_url` 文件名非法（非空、非 `.`/`..`、不含路径分隔符） |
+| `unauthorized` | 401 | 凭证无效或身份不可信 | 登录失败（账号不存在/密码错误/账号被禁用，消息统一不泄露原因）、令牌缺失/非法/过期/篡改（Bearer JWT 解析与声明校验失败，含无 exp、sub 非正整数、签名算法非 HS256）、身份查库失效（账号被删除或用户被禁用） |
+| `forbidden` | 403 | 身份有效但无权访问目标资源 | 用户令牌访问管理员接口（requireAdmin 拒绝）；用户令牌查看/操作他人或无主虚拟机（归属校验、ext- 合成标识一律拒绝） |
 | `not_found` | 404 | 资源不存在 | 引用不存在的 zone / node / ip-pool / storage-type / image / VM，或路径未匹配任何路由 |
 | `method_not_allowed` | 405 | 请求方法不允许 | 路径存在但请求方法未注册（响应携带 Allow 头列出允许的方法） |
 | `conflict` | 409 | 与现有状态冲突 | 重名（zone / storage-type / image 等唯一约束）、IP 池网段重叠、删除仍被引用的资源、镜像下载幂等拒绝（目标节点已有该镜像 running 下载） |
@@ -56,3 +58,4 @@ x-ms-error-code: not_found
 | `vm_already_managed` | 409 | 该节点上的 pve_vmid 已被托管 | 重复认领同一 PVE VMID（区别于一般资源冲突的 `conflict`） |
 | `invalid_vm_id` | 400 | VM id 无法解析 | 生命周期操作/操作记录查询的 `:id` 既非正整数也非 `ext-{nodeID}-{vmid}` 合成标识 |
 | `operation_log_failed` | 500 | 操作记录写入失败 | PVE 已受理生命周期操作但审计记录落库失败（前端可刷新确认） |
+| `user_has_resources` | 409 | 用户名下仍有虚拟机等资源，禁止删除 | 删除用户时 `vms.user_id` 仍引用该用户（区别于一般资源冲突的 `conflict`） |

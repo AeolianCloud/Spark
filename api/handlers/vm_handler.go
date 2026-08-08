@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"spark/api/middleware"
 	"spark/model"
 	"spark/repository"
 	"spark/service"
@@ -78,6 +80,25 @@ type VMHandler struct {
 // NewVMHandler 创建一个由 svc 支撑的 VMHandler。
 func NewVMHandler(svc *service.VMService) *VMHandler {
 	return &VMHandler{svc: svc}
+}
+
+// identityFromContext 从 gin.Context 读取 requireAuth 注入的身份
+// （middleware.IdentityKey，设计 D4）并转换为服务层表示，供分流与归属校验
+// 使用（设计 D5）。身份缺失（中间件未挂载或测试直连）或类型断言失败时打
+// 警告日志（带 request_id，M1）并返回 nil：服务层对 nil 一律按非管理员
+// 处理（fail-closed），绝不静默降级为管理员放行。
+func identityFromContext(c *gin.Context) *service.Identity {
+	raw, ok := c.Get(middleware.IdentityKey)
+	if !ok {
+		slog.Warn("identity missing from request context", "request_id", c.GetString(middleware.RequestIDKey))
+		return nil
+	}
+	ident, ok := raw.(middleware.Identity)
+	if !ok {
+		slog.Warn("identity in request context has unexpected type", "request_id", c.GetString(middleware.RequestIDKey))
+		return nil
+	}
+	return &service.Identity{Role: ident.Role, ID: ident.ID}
 }
 
 // RegisterVMsRoutes 在 rg 上挂载 VM 生命周期路由。由 router 以 /vms
@@ -227,7 +248,7 @@ func (h *VMHandler) List(c *gin.Context) error {
 	if err != nil {
 		return err
 	}
-	items, warnings, total, err := h.svc.ListVMs(c.Request.Context(), limit, offset)
+	items, warnings, total, err := h.svc.ListVMs(c.Request.Context(), identityFromContext(c), limit, offset)
 	if err != nil {
 		return mapVMServiceError(err)
 	}
@@ -268,7 +289,7 @@ func (h *VMHandler) Get(c *gin.Context) error {
 	} else if !extVMRefPattern.MatchString(raw) {
 		return ErrBadRequest("invalid id path parameter")
 	}
-	item, err := h.svc.GetVM(c.Request.Context(), raw)
+	item, err := h.svc.GetVM(c.Request.Context(), raw, identityFromContext(c))
 	if err != nil {
 		return mapVMServiceError(err)
 	}
@@ -278,13 +299,14 @@ func (h *VMHandler) Get(c *gin.Context) error {
 
 // Create 处理 POST /vms：校验请求、分配 IP、持久化记录、
 // 触发分离的供给链路，并以 201 返回 VM —— 包含明文 IP，
-// password 永不回显。
+// password 永不回显。归属约束（H1）：user 令牌只能把 user_id 指定为自身
+// 或留空（留空默认归属自身），指定他人 -> 403 forbidden。
 func (h *VMHandler) Create(c *gin.Context) error {
 	var req service.CreateVMRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		return ErrBadRequest("invalid request body")
 	}
-	vm, err := h.svc.CreateVM(c.Request.Context(), req)
+	vm, err := h.svc.CreateVM(c.Request.Context(), identityFromContext(c), req)
 	if err != nil {
 		return mapVMServiceError(err)
 	}
@@ -303,18 +325,19 @@ func (h *VMHandler) Create(c *gin.Context) error {
 // 的 vmResponse（事务已提交，客户端若收到 5xx 会重试并撞上 409
 // vm_already_managed，所以查询失败不能令请求失败）。
 // 错误区分两种 404：zone/node 不存在 -> not_found；vmid 不在该节点 PVE
-// 上 -> vm_not_found_on_node；重复托管 -> 409 vm_already_managed。
+// 上 -> vm_not_found_on_node；重复托管 -> 409 vm_already_managed。归属
+// 约束与 Create 一致（H1）：user 令牌只能把 user_id 指定为自身或留空。
 func (h *VMHandler) Import(c *gin.Context) error {
 	var req service.ImportVMRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		return ErrBadRequest("invalid request body")
 	}
-	vm, err := h.svc.ImportVM(c.Request.Context(), req)
+	vm, err := h.svc.ImportVM(c.Request.Context(), identityFromContext(c), req)
 	if err != nil {
 		return mapVMServiceError(err)
 	}
 	c.Header("Location", fmt.Sprintf("/vms/%d", vm.VM.ID))
-	item, err := h.svc.GetVM(c.Request.Context(), strconv.FormatInt(vm.VM.ID, 10))
+	item, err := h.svc.GetVM(c.Request.Context(), strconv.FormatInt(vm.VM.ID, 10), identityFromContext(c))
 	if err != nil {
 		// 降级：导入已落库，返回 201 + 无实时字段的本地形态（与 Create
 		// 的降级思路一致，客户端仍能拿到 VM 元数据与 Location）。
@@ -332,7 +355,7 @@ func (h *VMHandler) Import(c *gin.Context) error {
 // 标识均可，设计 D6），客户端可在那里的详情页观察结果。
 func (h *VMHandler) Start(c *gin.Context) error {
 	id := c.Param("id")
-	if err := h.svc.Start(c.Request.Context(), id); err != nil {
+	if err := h.svc.Start(c.Request.Context(), id, identityFromContext(c)); err != nil {
 		return mapVMServiceError(err)
 	}
 	h.setLifecycleLocation(c, id)
@@ -345,7 +368,7 @@ func (h *VMHandler) Start(c *gin.Context) error {
 // external 标识均可，设计 D6）。
 func (h *VMHandler) Stop(c *gin.Context) error {
 	id := c.Param("id")
-	if err := h.svc.Stop(c.Request.Context(), id); err != nil {
+	if err := h.svc.Stop(c.Request.Context(), id, identityFromContext(c)); err != nil {
 		return mapVMServiceError(err)
 	}
 	h.setLifecycleLocation(c, id)
@@ -357,7 +380,7 @@ func (h *VMHandler) Stop(c *gin.Context) error {
 // 端点 GET /vms/:id（数字与 external 标识均可，设计 D6）。
 func (h *VMHandler) Restart(c *gin.Context) error {
 	id := c.Param("id")
-	if err := h.svc.Restart(c.Request.Context(), id); err != nil {
+	if err := h.svc.Restart(c.Request.Context(), id, identityFromContext(c)); err != nil {
 		return mapVMServiceError(err)
 	}
 	h.setLifecycleLocation(c, id)
@@ -382,7 +405,7 @@ func (h *VMHandler) setLifecycleLocation(c *gin.Context, id string) {
 // ——ext- 标识不存在"本地清理"可言（reviewer-6）。
 func (h *VMHandler) Destroy(c *gin.Context) error {
 	id := c.Param("id")
-	if err := h.svc.Destroy(c.Request.Context(), id); err != nil {
+	if err := h.svc.Destroy(c.Request.Context(), id, identityFromContext(c)); err != nil {
 		return mapVMServiceError(err)
 	}
 	c.Status(http.StatusNoContent)
@@ -390,7 +413,8 @@ func (h *VMHandler) Destroy(c *gin.Context) error {
 }
 
 // vmOperationResponse 是 GET /vms/:id/operations 的操作记录负载（设计
-// D5）。user_id 预留（用户体系启用前恒为 NULL），响应中省略。
+// D5/D8）。user_id 是旧 schema 预留列，语义以 operator_type/operator_id
+// 为准；两者均为空表示旧记录（无操作者信息）。
 type vmOperationResponse struct {
 	ID           int64     `json:"id"`
 	NodeID       int64     `json:"node_id"`
@@ -398,34 +422,48 @@ type vmOperationResponse struct {
 	Action       string    `json:"action"`
 	Result       string    `json:"result"`
 	ErrorMessage string    `json:"error_message,omitempty"`
+	OperatorType string    `json:"operator_type,omitempty"`
+	OperatorID   *int64    `json:"operator_id,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
 // Operations 处理 GET /vms/:id/operations：按时间倒序分页返回该 VM 的
 // 生命周期操作记录（设计 D5）。:id 支持数字本地行 id（要求本地行存在，
-// 否则 404 not_found）与 external 合成标识 ext-{nodeID}-{vmid}。分页
-// 语义与列表一致：limit 默认 25 上限 100，X-Total-Count 报告匹配总数。
+// 否则 404 not_found）与 external 合成标识 ext-{nodeID}-{vmid}。身份分流
+// （设计 D5）：用户令牌仅能查看归属自己的 VM 的操作记录；且用户视角的
+// operator_id 脱敏（L2）——置空省略、仅保留 operator_type，admin 可见
+// 完整操作者信息。分页语义与列表一致：limit 默认 25 上限 100，
+// X-Total-Count 报告匹配总数。
 func (h *VMHandler) Operations(c *gin.Context) error {
 	id := c.Param("id")
 	limit, offset, err := parsePagination(c)
 	if err != nil {
 		return err
 	}
-	ops, total, err := h.svc.ListOperations(c.Request.Context(), id, limit, offset)
+	ident := identityFromContext(c)
+	ops, total, err := h.svc.ListOperations(c.Request.Context(), id, ident, limit, offset)
 	if err != nil {
 		return mapVMServiceError(err)
 	}
 	out := make([]vmOperationResponse, 0, len(ops))
 	for _, op := range ops {
-		out = append(out, vmOperationResponse{
+		resp := vmOperationResponse{
 			ID:           op.ID,
 			NodeID:       op.NodeID,
 			PVEVmid:      op.PVEVmid,
 			Action:       op.Action,
 			Result:       op.Result,
 			ErrorMessage: op.ErrorMessage,
+			OperatorType: op.OperatorType,
+			OperatorID:   op.OperatorID,
 			CreatedAt:    op.CreatedAt,
-		})
+		}
+		if !ident.IsAdmin() {
+			// 用户令牌脱敏（L2）：不暴露操作者 ID（operator_id 置空省略），
+			// 仅保留 operator_type；admin 可见完整操作者信息。
+			resp.OperatorID = nil
+		}
+		out = append(out, resp)
 	}
 	setTotalCount(c, total)
 	c.JSON(http.StatusOK, gin.H{"operations": out})
@@ -455,10 +493,10 @@ func (h *VMHandler) Resize(c *gin.Context) error {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		return ErrBadRequest("invalid request body")
 	}
-	if _, err := h.svc.Resize(c.Request.Context(), id, req.CPU, req.MemMB, req.DiskGB); err != nil {
+	if _, err := h.svc.Resize(c.Request.Context(), id, identityFromContext(c), req.CPU, req.MemMB, req.DiskGB); err != nil {
 		return mapVMServiceError(err)
 	}
-	item, err := h.svc.GetVM(c.Request.Context(), strconv.FormatInt(id, 10))
+	item, err := h.svc.GetVM(c.Request.Context(), strconv.FormatInt(id, 10), identityFromContext(c))
 	if err != nil {
 		return mapVMServiceError(err)
 	}

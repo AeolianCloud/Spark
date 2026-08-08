@@ -260,20 +260,25 @@ func findVM(vms []pve.VMStatus, vmid int64) (pve.VMStatus, bool) {
 	return pve.VMStatus{}, false
 }
 
-// ListVMs 实现透传列表（任务 8.1，设计 D1）：查询每个区域的启用节点，每个
-// 节点恰好一次 PVE 列表调用（设计 D1），读取本地全量元数据（含 IP），并将
-// 两者合并为三类条目（本地行+PVE、本地行-only、PVE-only external，设计
+// ListVMs 实现透传列表（任务 8.1，设计 D1/D5）：查询每个区域的启用节点，
+// 每个节点恰好一次 PVE 列表调用（设计 D1），读取本地全量元数据（含 IP），
+// 并将两者合并为三类条目（本地行+PVE、本地行-only、PVE-only external，设计
 // D1/D2/D3）。整个查询运行在请求级预算（listVMsTimeout）之内。节点查询并行
 // 执行，因此总延迟由最慢的节点决定，而非所有节点延迟之和；列表调用失败的
 // 节点——包括共享截止时间触发——贡献一条警告而非其 VM（任务 8.3），绝不会
 // 让整个请求失败。
+//
+// 身份分流（设计 D5）：管理员返回合并后的全量条目（含 external）；用户仅
+// 返回归属自己的本地 VM 行——本地行按 user_id 过滤，合并后的 external 条目
+// 对用户剔除（external 无本地行即无归属，天然不可见）。nil 身份（M1
+// fail-closed）按用户语义处理（ID 为 0，列表为空）。
 //
 // 分页（limit/offset）作用于合并后的完整条目列表：先按 (node_id, pve_vmid)
 // 升序稳定排序，再在内存中切片分页（设计 D1）——external 条目因此与本地
 // 条目同页混排且翻页稳定。total 是合并后条目总数（含 external、剔除失败/
 // 禁用节点的 VM），即 X-Total-Count 的口径；它与本地 vms 行数（CountVMs
 // 的旧口径）不再相等，本地行数没有独立的对外语义。
-func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListItem, []NodeWarning, int, error) {
+func (s *VMService) ListVMs(ctx context.Context, identity *Identity, limit, offset int) ([]VMListItem, []NodeWarning, int, error) {
 	// 请求级总超时：一起限制数据库读取与所有并行节点调用，因此慢或挂起的节点
 	// 无法拉长请求。下方每个节点 goroutine 共享同一个截止时间；当它触发时，
 	// 挂起的调用会以 context 错误失败，并像其他任何节点失败一样呈现为警告。
@@ -322,9 +327,20 @@ func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListIte
 		perNode[nodes[i].ID] = results[i]
 	}
 
-	// 本地全量行：合并需要与每节点 PVE 全量摘要做差集（设计 D1/D3），
-	// SQL 分页在此不再适用，分页在合并排序后统一执行。
-	local, err := s.vmRepo.ListVMs(ctx)
+	// 本地行（设计 D5 分流）：管理员取全量（合并需要与每节点 PVE 全量摘要
+	// 做差集，设计 D1/D3），用户仅取归属自己的行；SQL 分页在此不再适用，
+	// 分页在合并排序后统一执行。nil 身份（M1 fail-closed）按用户语义处理：
+	// ID 视为 0（ListVMsByUser(0) 返回空，绝不放行为管理员的全量视图）。
+	var local []repository.VMWithIP
+	if identity != nil && identity.IsAdmin() {
+		local, err = s.vmRepo.ListVMs(ctx)
+	} else {
+		var uid int64
+		if identity != nil {
+			uid = identity.ID
+		}
+		local, err = s.vmRepo.ListVMsByUser(ctx, uid)
+	}
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("list vms: local metadata: %w", err)
 	}
@@ -353,25 +369,62 @@ func (s *VMService) ListVMs(ctx context.Context, limit, offset int) ([]VMListIte
 	}
 
 	items, warnings := mergeVMListItems(local, perNode, nodeNames)
+	if !identity.IsAdmin() {
+		// 用户视角：剔除 external 条目（外部 VM 无归属，不可见，设计 D5）；
+		// warnings 仅保留自己 VM 所在节点的警告（M2）——其余节点的失败/禁用
+		// 是基础设施可用性细节，绝不向用户泄露。
+		filtered := items[:0]
+		for _, it := range items {
+			if it.ExternalID == "" {
+				filtered = append(filtered, it)
+			}
+		}
+		items = filtered
+		warnings = filterWarningsForUser(warnings, local, nodeNames)
+	}
 	total := len(items)
 	page := slicePage(items, limit, offset)
 	return page, warnings, total, nil
 }
 
+// filterWarningsForUser 把用户视角的列表警告收窄到其自己 VM 所在节点（M2）：
+// 只保留 Node 名与用户本地行节点名（nodeNames 映射，缺失时兜底为 id 字符串，
+// 与 mergeVMListItems 的 disabled 警告同源）匹配的警告。用户自己 VM 所在
+// 节点的失败/禁用仍可见（其 VM 会从列表消失），其余节点的可用性绝不泄露。
+func filterWarningsForUser(warnings []NodeWarning, local []repository.VMWithIP, nodeNames map[int64]string) []NodeWarning {
+	relevant := make(map[string]struct{}, len(local))
+	for i := range local {
+		name := nodeNames[local[i].VM.NodeID]
+		if name == "" {
+			name = strconv.FormatInt(local[i].VM.NodeID, 10)
+		}
+		relevant[name] = struct{}{}
+	}
+	filtered := warnings[:0]
+	for _, w := range warnings {
+		if _, ok := relevant[w.Node]; ok {
+			filtered = append(filtered, w)
+		}
+	}
+	return filtered
+}
+
 // GetVM 实现透传详情（任务 8.2 + 设计 D5/D6）：id 为数字本地行 id 或 external
 // 合成标识 ext-{nodeID}-{vmid}（parseVMRef 校验，非法标识 -> KindInvalidVMRef
-// -> 400）。数字 id 走本地路径（getLocalVM）；external 分支实时读取该节点
-// PVE 状态并复用 externalVMListItem 构建详情条目——但 ext- 标识指向已托管
-// 的 VM 时改走本地形态返回（与列表差集一致，G1）。
-func (s *VMService) GetVM(ctx context.Context, id string) (*VMListItem, error) {
+// -> 400）。数字 id 走本地路径（getLocalVM，归属校验见下）；external 分支实时
+// 读取该节点 PVE 状态并复用 externalVMListItem 构建详情条目——但 ext- 标识
+// 指向已托管的 VM 时改走本地形态返回（与列表差集一致，G1）。身份分流（设计
+// D5）：管理员放行；用户仅能查看归属自己的 VM（无主 VM 在用户视角视同不存
+// 在，一律 403），external 对用户一律 403。
+func (s *VMService) GetVM(ctx context.Context, id string, identity *Identity) (*VMListItem, error) {
 	t, err := parseVMRef(id)
 	if err != nil {
 		return nil, err
 	}
 	if t.external {
-		return s.getExternalVM(ctx, t.nodeID, t.vmid)
+		return s.getExternalVM(ctx, t.nodeID, t.vmid, identity)
 	}
-	return s.getLocalVM(ctx, t.localID)
+	return s.getLocalVM(ctx, t.localID, identity)
 }
 
 // getExternalVM 实现 external 合成标识的详情查询（设计 D6）：按 nodeID 反查
@@ -386,11 +439,31 @@ func (s *VMService) GetVM(ctx context.Context, id string) (*VMListItem, error) {
 //
 // ext- 标识指向的 (nodeID, pve_vmid) 已有本地托管行时改走本地形态路径返回
 // （数字 id、含 uuid/ip 等本地字段，与列表差集语义一致），绝不返回 external
-// 形态——与 resolveVMTarget 的生命周期路由先例相同（G1）。
+// 形态——与 resolveVMTarget 的生命周期路由先例相同（G1）；该分支对用户身份
+// 适用本地行的归属校验（设计 D5）。纯 external（本地无托管行）对用户令牌
+// 一律 403（external 无归属，不可查看）。
 //
 // PVE 模板同样以 vm_not_found_on_node 呈现：模板是供克隆使用的基础镜像而非
 // 可查看的运行实体（与列表不并入、生命周期拒绝的语义一致）。
-func (s *VMService) getExternalVM(ctx context.Context, nodeID, vmid int64) (*VMListItem, error) {
+func (s *VMService) getExternalVM(ctx context.Context, nodeID, vmid int64, identity *Identity) (*VMListItem, error) {
+	// 本地托管检查（先于节点查询）：ext- 标识指向的 (nodeID, pve_vmid) 可能
+	// 已有本地行（列表以 PVE 全量摘要与本地记录做差集，两者可能并存）。命中
+	// 时改走本地形态路径（getLocalVM 按数字行 id 读取并合并实时状态），与
+	// 列表的差集呈现、resolveVMTarget 的生命周期路由保持一致（G1）。
+	local, err := s.vmRepo.GetVMByNodeVMID(ctx, nodeID, vmid)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("get external vm %d on node %d: check managed vm: %w", vmid, nodeID, err)
+	}
+	if local != nil {
+		return s.getLocalVM(ctx, local.ID, identity)
+	}
+	// 纯 external（本地无托管行）：非管理员一律 403（设计 D5：external 无
+	// 归属，用户不可查看；nil 身份 M1 fail-closed 同用户），管理员放行继续
+	// 读取 PVE。该检查在节点查询之前执行，用户请求绝不触碰节点/不泄露节点
+	// 状态。
+	if !identity.IsAdmin() {
+		return nil, forbiddenf("user cannot access external vm %s", externalVMID(nodeID, vmid))
+	}
 	node, err := s.nodeRepo.GetNode(ctx, nodeID)
 	if err != nil {
 		// 节点行已消失（与 vms 行相互独立地被禁用/移除）无法报告实时状态：
@@ -404,17 +477,6 @@ func (s *VMService) getExternalVM(ctx context.Context, nodeID, vmid int64) (*VML
 		// 节点已被禁用：无法报告实时状态，与 resolveVMTarget 相同的
 		// node_unavailable 语义（S1）。
 		return nil, nodeUnavailablef("node %q is disabled", nodeName(*node))
-	}
-	// 本地托管检查：ext- 标识指向的 (nodeID, pve_vmid) 可能已有本地行
-	//（列表以 PVE 全量摘要与本地记录做差集，两者可能并存）。命中时改走
-	// 本地形态路径（getLocalVM 按数字行 id 读取并合并实时状态），与列表的
-	// 差集呈现、resolveVMTarget 的生命周期路由保持一致（G1）。
-	local, err := s.vmRepo.GetVMByNodeVMID(ctx, nodeID, vmid)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("get external vm %d on node %d: check managed vm: %w", vmid, nodeID, err)
-	}
-	if local != nil {
-		return s.getLocalVM(ctx, local.ID)
 	}
 	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
 	vms, err := client.ListVMs(ctx, nodeName(*node))
@@ -436,7 +498,9 @@ func (s *VMService) getExternalVM(ctx context.Context, nodeID, vmid int64) (*VML
 }
 
 // getLocalVM 是数字本地行 id 的透传详情实现（任务 8.2，设计 D5）：本地元数据
-// 加上从 VM 所在节点读取的实时状态。
+// 加上从 VM 所在节点读取的实时状态。身份分流（设计 D5）：用户令牌仅能查看
+// 归属自己的 VM——无主（user_id 为 NULL）或归属他人的 VM 一律 403
+// （无主 VM 在用户视角视同不存在）。
 //
 //	VM 行不存在                 -> not_found
 //	pve_vmid == 0               -> creating（已设置 provision_error 时为 failed）
@@ -444,13 +508,17 @@ func (s *VMService) getExternalVM(ctx context.Context, nodeID, vmid int64) (*VML
 //	节点列表调用失败            -> node_unavailable (503)，绝不伪装成
 //	                               creating（任务 8.3）
 //	节点有响应但 VM 不存在      -> creating（设计 D5：PVE 不存在 → 创建中）
-func (s *VMService) getLocalVM(ctx context.Context, id int64) (*VMListItem, error) {
+func (s *VMService) getLocalVM(ctx context.Context, id int64, identity *Identity) (*VMListItem, error) {
 	vm, err := s.vmRepo.GetVM(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, notFoundf("vm %d not found", id)
 		}
 		return nil, fmt.Errorf("get vm %d: %w", id, err)
+	}
+	// 身份分流（设计 D5）：用户令牌仅能查看归属自己的 VM。
+	if err := checkVMOwnership(identity, &vm.VM); err != nil {
+		return nil, err
 	}
 	switch {
 	case vm.VM.ProvisionError != "":

@@ -41,6 +41,8 @@ servers:
   - url: /
 
 tags:
+  - name: auth
+    description: 认证（双身份登录与 JWT 签发）
   - name: zones
     description: 区域（zone）与 PVE 节点管理
   - name: ip-pools
@@ -51,15 +53,76 @@ tags:
     description: cloud 镜像目录管理
   - name: vms
     description: 云主机（VM）生命周期管理
+  - name: users
+    description: 用户管理（仅管理员令牌可访问）
   - name: system
     description: 健康检查
 
-# 当前 API 未接入认证：空 security 数组声明所有操作无安全要求
-#（OpenAPI 3.0 语义，根级空数组 = 无需任何认证/授权）；
-# 未来引入认证后在此声明 securitySchemes 并替换为具体方案。
-security: []
+# 认证：除登录端点（/auth/login、/auth/admin/login）与探活端点
+# （/healthz）外，全部业务路径要求 Bearer JWT（securitySchemes 见
+# components.securitySchemes.bearerAuth）。登录/探活端点在路径级以
+# security: [] 覆盖（OpenAPI 3.0 语义：操作级声明覆盖根级）。
+security:
+  - bearerAuth: []
 
 paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: 用户登录
+      operationId: loginUser
+      description: |
+        校验用户凭证与启用状态，成功签发 user JWT（Bearer，HS256，24h
+        有效，过期需重新登录）并返回身份信息。凭证无效（账号不存在、
+        密码错误、账号被禁用）统一返回 401 unauthorized，消息一致，
+        不泄露账号存在性（对外错误契约见 docs/api-errors.md）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserLoginResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/admin/login:
+    post:
+      tags: [auth]
+      summary: 管理员登录
+      operationId: loginAdmin
+      description: |
+        校验管理员凭证，成功签发 admin JWT（Bearer，HS256，24h 有效）
+        并返回身份信息。凭证无效统一返回 401 unauthorized，消息一致，
+        不泄露账号存在性。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminLoginResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /healthz:
     get:
       tags: [system]
@@ -68,6 +131,9 @@ paths:
       description: |
         探活端点，不属于业务 API：200 正常响应不携带 x-ms-error-code 头；
         503 degraded 响应携带 x-ms-error-code: service_unavailable。
+        /healthz 不受鉴权保护（探活器/负载均衡需要匿名可达），以
+        security: [] 覆盖根级 security。
+      security: []
       # 探活端点按设计无 4XX 响应（仅 200 正常 / 503 degraded，与
       # api/handlers/health.go 一致），operation-4xx-response 豁免记录于
       # .redocly.lint-ignore.yaml。
@@ -635,6 +701,185 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /users:
+    post:
+      tags: [users]
+      summary: 创建用户
+      description: |
+        创建前台用户（仅管理员令牌，requireAdmin）：username 必填且全局唯一
+        （重复返回 409 conflict）、password 必填（bcrypt 哈希落库，明文不
+        落库、不返回）、name 可选（缺省为空字符串）。成功返回 201 +
+        Location 指向新资源与用户信息（永不包含密码）。用户令牌访问本路径
+        返回 403 forbidden。
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+      responses:
+        "201":
+          description: 创建成功
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [users]
+      summary: 用户列表（分页）
+      description: |
+        按 id 升序返回一页用户（limit/offset 分页，语义与其余列表端点一致），
+        X-Total-Count 头携带匹配总数。仅管理员令牌可访问。
+      operationId: listUsers
+      parameters:
+        - $ref: "#/components/parameters/QueryLimit"
+        - $ref: "#/components/parameters/QueryOffset"
+      responses:
+        "200":
+          description: 分页后的用户列表（不含密码）
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/XTotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /users/{id}:
+    get:
+      tags: [users]
+      summary: 用户详情
+      description: |
+        :id 为数字本地行 id（users.id），非法值返回 400；用户不存在返回
+        404 not_found。仅管理员令牌可访问。
+      operationId: getUser
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: 用户信息（不含密码）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [users]
+      summary: 修改用户（name / 重置密码）
+      description: |
+        部分更新：name 与 password 至少提供其一（password 传新值即重置密码，
+        校验规则与创建一致，空串返回 400）。返回更新后的用户；用户不存在
+        返回 404 not_found。仅管理员令牌可访问。
+      operationId: updateUser
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateUserRequest"
+      responses:
+        "200":
+          description: 更新后的用户信息（不含密码）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [users]
+      summary: 删除用户
+      description: |
+        删除指定用户；名下仍关联虚拟机等资源（vms.user_id 外键引用）时返回
+        409 user_has_resources（区别于一般资源冲突的 conflict），用户不存在
+        返回 404 not_found。删除不影响其名下已存的操作记录（vm_operations
+        仅存 ID 引用，无级联）。成功返回无响应体的 204。仅管理员令牌可访问。
+      operationId: deleteUser
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "204":
+          description: 删除成功（无响应体）
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /users/{id}/status:
+    put:
+      tags: [users]
+      summary: 切换用户启用/禁用状态
+      description: |
+        切换用户的启用状态（enabled/disabled）：非法取值返回 400
+        bad_request；用户不存在返回 404 not_found。禁用后该用户的登录与
+        已签发令牌的操作由登录服务与鉴权中间件按 status 即时拒绝。
+        仅管理员令牌可访问。
+      operationId: setUserStatus
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateUserStatusRequest"
+      responses:
+        "200":
+          description: 更新后的用户信息（不含密码）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /vms:
     post:
       tags: [vms]
@@ -1037,6 +1282,17 @@ components:
         pattern: ^([1-9][0-9]*|ext-[1-9][0-9]*-[1-9][0-9]*)$
         example: ext-3-100
 
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        登录端点（POST /auth/login、POST /auth/admin/login）签发的 JWT
+        （HS256 签名，24h 有效）；请求携带 Authorization: Bearer <token>。
+        令牌缺失/非法/过期/账号被禁用返回 401 unauthorized；用户令牌
+        访问管理员接口返回 403 forbidden。
+
   headers:
     XTotalCount:
       description: 过滤后（分页前）的总条数
@@ -1071,6 +1327,32 @@ components:
             error:
               code: bad_request
               message: invalid limit query parameter
+    Unauthorized:
+      description: 凭证无效或身份不可信（unauthorized：登录失败、令牌缺失/非法/过期、账号被禁用）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: unauthorized
+              message: invalid credentials
+    Forbidden:
+      description: 身份有效但无权访问目标资源（forbidden：用户令牌访问管理员接口）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: forbidden
+              message: admin access required
     NotFound:
       description: 资源不存在（not_found / vm_not_found_on_node），或路径未匹配任何路由的全局 404 兜底（not_found）
       headers:
@@ -1085,7 +1367,7 @@ components:
               code: not_found
               message: vm 42 not found
     Conflict:
-      description: 与现有状态冲突（conflict / ip_exhausted / vm_not_ready / vm_already_managed）
+      description: 与现有状态冲突（conflict / ip_exhausted / vm_not_ready / vm_already_managed / user_has_resources）
       headers:
         x-ms-error-code:
           $ref: "#/components/headers/XMSErrorCode"
@@ -1166,6 +1448,8 @@ components:
           description: 稳定的机器可读错误码（客户端只可依赖 code）
           enum:
             - bad_request
+            - unauthorized
+            - forbidden
             - not_found
             - method_not_allowed
             - conflict
@@ -1182,6 +1466,7 @@ components:
             - vm_not_found_on_node
             - invalid_vm_id
             - operation_log_failed
+            - user_has_resources
         message:
           type: string
           description: 仅供人阅读，不可被程序解析
@@ -1204,6 +1489,114 @@ components:
           type: string
           description: up 或 down
           enum: [up, down]
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          description: 登录账号（user 身份域对应 users.username，admin 身份域对应 admins.username）
+          example: alice
+        password:
+          type: string
+          description: 明文密码（仅请求体传输；服务端以 bcrypt 哈希比对，密码本身不落库、不进日志）
+          example: s3cret
+
+    UserLoginResponse:
+      type: object
+      required: [token, user_id, username]
+      properties:
+        token:
+          type: string
+          description: user JWT（Bearer，HS256 签名，24h 有效）
+        user_id:
+          type: integer
+          format: int64
+          description: users 表 ID
+        username:
+          type: string
+        name:
+          type: string
+          description: 用户显示名
+
+    AdminLoginResponse:
+      type: object
+      required: [token, admin_id, username]
+      properties:
+        token:
+          type: string
+          description: admin JWT（Bearer，HS256 签名，24h 有效）
+        admin_id:
+          type: integer
+          format: int64
+          description: admins 表 ID
+        username:
+          type: string
+
+    User:
+      type: object
+      description: 公开的用户负载（password 永不包含在响应中）
+      required: [id, username, name, status, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: users 表 ID
+        username:
+          type: string
+          description: 登录账号（全局唯一）
+        name:
+          type: string
+          description: 显示名（缺省为空字符串）
+        status:
+          type: string
+          description: 启用状态；disabled 用户登录与已签发令牌的操作均被拒绝
+          enum: [enabled, disabled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateUserRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          maxLength: 128
+          description: 登录账号（必填，全局唯一，重复返回 409 conflict）
+        password:
+          type: string
+          maxLength: 72
+          description: 初始密码（必填；bcrypt 哈希落库，明文不落库、不返回、不进日志）
+        name:
+          type: string
+          description: 显示名（可选，缺省为空字符串）
+
+    UpdateUserRequest:
+      type: object
+      description: name 与 password 至少提供其一（两者都缺省返回 400 bad_request）
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          description: 修改显示名
+        password:
+          type: string
+          maxLength: 72
+          description: 重置密码（非空；校验规则与创建一致）
+
+    UpdateUserStatusRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          description: 目标状态；非法取值返回 400 bad_request
+          enum: [enabled, disabled]
 
     ZoneCreateRequest:
       type: object
@@ -1694,6 +2087,15 @@ components:
         password:
           type: string
           description: cloud-init 注入密码（仅创建时使用，不随响应返回）
+        user_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: |
+            归属用户（vms.user_id，可选）：仅管理员可指定（可为任意存在的
+            用户）；用户令牌只能指定为自身或留空（留空默认归属自身），
+            指定他人返回 403 forbidden。nil 表示无主 VM。响应中不暴露
+            user_id（VM 负载无归属字段）。
 
     ImportVMRequest:
       type: object
@@ -1722,6 +2124,14 @@ components:
           type: string
           maxLength: 128
           description: 认领后的 VM 名称，可选；空则取 PVE 配置名。名称须匹配 ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$；PVE 配置名超长时截断到 128 字符而非拒绝
+        user_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: |
+            归属用户（vms.user_id，可选）：仅管理员可指定；用户令牌只能
+            指定为自身或留空（留空默认归属自身），指定他人返回 403
+            forbidden。nil 表示无主 VM。响应中不暴露 user_id。
 
     VMResponse:
       type: object
@@ -1930,6 +2340,20 @@ components:
         error_message:
           type: string
           description: 失败原因（已脱敏）；受理成功时省略
+        operator_type:
+          type: string
+          description: |
+            操作者身份域（admin/user，设计 D5/D8）；两者为空表示旧记录
+            （无操作者信息）
+          enum: [admin, user]
+        operator_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: |
+            操作者 ID（对应 admins / users 表 ID）。user 令牌视角脱敏
+            （L2）：一律置空省略、仅保留 operator_type；admin 可见完整
+            操作者信息。两者为空表示旧记录
         created_at:
           type: string
           format: date-time
