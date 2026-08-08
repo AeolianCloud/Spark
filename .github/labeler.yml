@@ -1,6 +1,5 @@
 # PR 自动打标签配置（actions/labeler）
 # 作用：根据变更路径自动为 PR 添加 area 标签，便于按模块筛选审查
-version: 1
 labels:
   - label: "area:api"
     files:

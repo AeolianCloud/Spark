@@ -289,7 +289,7 @@ async function confirmDestroy(): Promise<void> {
             />
 
             <!-- 未纳管提示（design D7）：external 无本地元数据，提示可认领；
-                 creating/failed 状态禁用操作（后端 vm_not_ready 兜底） -->
+                 creating/failed 禁用启停/重启/调规格（后端 vm_not_ready 兜底）；failed 可销毁 -->
             <UAlert
               v-if="isExternal"
               color="warning"
