@@ -54,12 +54,20 @@ export function setAuth(token: string, identity: AuthIdentity): void {
   const s = safeStorage()
   const serialized = JSON.stringify(identity)
   if (s) {
-    s.setItem(TOKEN_KEY, token)
-    s.setItem(IDENTITY_KEY, serialized)
-  } else {
-    memoryStore.token = token
-    memoryStore.identity = serialized
+    try {
+      s.setItem(TOKEN_KEY, token)
+      s.setItem(IDENTITY_KEY, serialized)
+      return
+    } catch (err) {
+      // 写入失败（探测通过后仍抛异常、配额满等）：降级为内存 store（与 safeStorage 探测失败
+      // 分支同路径），并关闭 localStorage 通道保证后续读写一致（避免读到半写入的残留令牌）；
+      // 不向外抛异常，登录流程不受影响（刷新后登录态失效，行为等价未登录）
+      console.warn('localStorage 写入失败，登录态降级为内存存储（刷新后失效）', err)
+      storageAvailable = false
+    }
   }
+  memoryStore.token = token
+  memoryStore.identity = serialized
 }
 
 /** 清除登录态（登出 / 令牌失效 401 时调用） */

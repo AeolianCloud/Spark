@@ -24,4 +24,4 @@
 ## 6. 验证
 
 - [x] 6.1 `npm run lint`、`npm run typecheck`、`npm run api:check` 通过
-- [ ] 6.2 `npm run generate` 构建通过；浏览器/curl 验证：未登录访问跳转登录页、登录成功进首页、带令牌请求成功、无令牌/过期令牌 401 跳登录、登出清令牌
+- [x] 6.2 `npm run generate` 构建通过；浏览器/curl 验证：未登录访问跳转登录页、登录成功进首页、带令牌请求成功、无令牌/过期令牌 401 跳登录、登出清令牌

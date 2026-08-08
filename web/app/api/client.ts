@@ -94,9 +94,10 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<A
   }
 
   const headers: Record<string, string> = {}
-  // 登录路径与健康检查不注入令牌（后端安全规则：/auth/*、/healthz 匿名可达）
-  const authExempt = path.startsWith('/auth/') || path === '/healthz'
-  if (!authExempt) {
+  // 令牌注入豁免（skipAuthHeader）：登录端点（POST /auth/admin/login 等 /auth/ 前缀端点）
+  // 与健康检查 /healthz 匿名可达，不注入 Bearer 令牌（后端安全规则：/auth/*、/healthz 匿名可达）
+  const skipAuthHeader = path.startsWith('/auth/') || path === '/healthz'
+  if (!skipAuthHeader) {
     const token = getToken()
     if (token) headers['Authorization'] = `Bearer ${token}`
   }
@@ -111,17 +112,23 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<A
     res = await fetch(url, { method, headers, body: payload, signal })
   } catch (err) {
     // 网络层失败（断网、代理不可达、CORS 等）：fetch 仅对这类错误 reject 原生 TypeError，
-    // 统一包装为 ApiError（status 0 + code 'unknown'），保证所有失败路径均可被统一错误组件消费
-    const detail = err instanceof Error ? `（原始错误：${err.message}）` : ''
-    throw new ApiError(0, 'unknown', `网络请求失败，请检查网络连接${detail}`)
+    // 统一包装为 ApiError（status 0 + code 'unknown'），保证所有失败路径均可被统一错误组件消费。
+    // 对外固定文案，不拼接 err.message（网络错误信息可能含内部地址等敏感细节）；原始错误仅告警日志
+    console.warn('API 网络请求失败：', err)
+    throw new ApiError(0, 'unknown', '网络请求失败，请检查网络连接')
   }
 
   // 契约外的成功状态码（如 healthz 503 degraded）按数据响应处理
   if (!res.ok && !okStatuses?.includes(res.status)) {
     const err = await parseError(res)
-    // 令牌缺失/过期/被拒：清除本地登录态并全量跳转登录页（SPA 下保证状态干净）；
-    // 登录请求自身的 401 豁免（由登录页直接展示认证失败，避免跳转死循环）
-    if (res.status === 401 && !authExempt) {
+    // 401 跳转豁免（skip401Redirect）：登录端点自身的 401 不触发跳转，
+    // 由登录页直接展示认证失败，避免跳转死循环；当前 /auth/ 下仅登录端点，
+    // 若未来新增需鉴权的 /auth/me 类端点，须同步调整该判定
+    const skip401Redirect = path.startsWith('/auth/')
+    // 令牌缺失/过期/被拒：清除本地登录态并全量跳转登录页。必须全量跳转
+    // （window.location.assign）而非 SPA 内导航：useAuth 的模块级 ref 与这里直接
+    // clearAuth() 不同步，SPA 内导航无法重置其内存状态，全量加载才能恢复一致
+    if (res.status === 401 && !skip401Redirect) {
       clearAuth()
       window.location.assign('/login')
     }
@@ -150,8 +157,10 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<A
     result.data = (await res.json()) as T
   } catch (err) {
     // 契约要求成功响应均为 JSON；此处防御非 JSON 成功响应
-    // （如反代故障时返回的 HTML 错误页），保留 data 未定义并告警便于排查
-    console.warn(`响应体解析失败：HTTP ${res.status} 响应体不是预期 JSON，请检查反向代理/网关配置（url=${url}${err instanceof Error ? `，原始错误：${err.message}` : ''}）`)
+    // （如反代故障时返回的 HTML 错误页），保留 data 未定义并告警便于排查。
+    // 只打印 pathname 不打印完整 url：查询参数可能含用户可控内容，避免落日志
+    const pathname = url.split('?')[0]
+    console.warn(`响应体解析失败：HTTP ${res.status} 响应体不是预期 JSON，请检查反向代理/网关配置（path=${pathname}${err instanceof Error ? `，原始错误：${err.message}` : ''}）`)
   }
   return result
 }
