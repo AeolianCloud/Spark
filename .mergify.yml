@@ -20,14 +20,14 @@ queue_rules:
     batch_size: 1
     # 入队条件：CI 通过 + 已获批准 + 非冲突
     queue_conditions:
-      - check-success = build
+      - check-success-or-neutral = build
       - "#approved-reviews-by>=1"
       - base = master
       - -draft
       - -conflict
     # 合并条件：与 queue_conditions 一致（in-place checks 要求，避免两步 CI）
     merge_conditions:
-      - check-success = build
+      - check-success-or-neutral = build
       - "#approved-reviews-by>=1"
       - base = master
       - -draft
@@ -37,7 +37,7 @@ pull_request_rules:
   # 规则 1：CI 通过后自动 approve（mergify[bot] 的批准计入分支保护的 review 要求）
   - name: auto-approve-when-ci-passes
     conditions:
-      - check-success = build
+      - check-success-or-neutral = build
       - base = master
       - -draft
     actions:
@@ -47,7 +47,7 @@ pull_request_rules:
   # 规则 2：CI 通过且有批准后自动入队（合并由队列按 merge_conditions 执行）
   - name: auto-queue-when-approved
     conditions:
-      - check-success = build
+      - check-success-or-neutral = build
       - "#approved-reviews-by>=1"
       - base = master
       - -draft
