@@ -2,7 +2,7 @@
 
 定义配置加载行为：默认值、config.yaml、本地环境文件（.env.local）与进程环境变量的合并优先级，保证本地启动行为一致。
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: 配置加载优先级
 
