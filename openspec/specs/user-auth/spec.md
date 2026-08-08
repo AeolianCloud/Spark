@@ -2,7 +2,7 @@
 
 提供平台用户与管理员的双身份认证体系：账号密码登录、JWT 令牌签发与全接口鉴权，支撑用户自助服务与管理员运维两类身份。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: 用户登录
 

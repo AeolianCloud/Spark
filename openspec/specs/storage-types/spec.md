@@ -2,7 +2,7 @@
 
 提供抽象存储类型到 PVE 实际存储的映射层，使前端创建虚拟机时只感知抽象类型（如 SSD、普通磁盘），无需关心各节点的具体存储名。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: 存储类型定义
 
