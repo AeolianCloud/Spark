@@ -1,39 +1,39 @@
 # PR 自动打标签配置（actions/labeler）
 # 作用：根据变更路径自动为 PR 添加 area 标签，便于按模块筛选审查
 labels:
-  - label: "area:api"
+  - label: "区域:API"
     files:
       - "api/**"
-  - label: "area:service"
+  - label: "区域:服务层"
     files:
       - "service/**"
-  - label: "area:repository"
+  - label: "区域:数据访问层"
     files:
       - "repository/**"
-  - label: "area:database"
+  - label: "区域:数据库"
     files:
       - "database/**"
-  - label: "area:crypto"
+  - label: "区域:加密"
     files:
       - "crypto/**"
-  - label: "area:pve-client"
+  - label: "区域:PVE客户端"
     files:
       - "pve/**"
-  - label: "area:web"
+  - label: "区域:前端"
     files:
       - "web/**"
-  - label: "area:e2e"
+  - label: "区域:端到端测试"
     files:
       - "e2e/**"
-  - label: "area:contract"
+  - label: "区域:接口契约"
     files:
       - "docs/openapi.yaml"
       - "api/swagger/openapi.yaml"
       - "docs/api-errors.md"
-  - label: "area:openspec"
+  - label: "区域:OpenSpec"
     files:
       - "openspec/**"
-  - label: "area:docs"
+  - label: "区域:文档"
     files:
       - "docs/**"
       - "*.md"
