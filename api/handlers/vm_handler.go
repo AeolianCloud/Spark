@@ -42,6 +42,10 @@ const (
 	// CodeOperationLogFailed：PVE 已受理操作，但操作记录写入失败
 	// （500 —— 审计完整性优先，前端提示可刷新确认）。
 	CodeOperationLogFailed = "operation_log_failed"
+	// CodeNoAvailableIPPool：创建 VM 时区域没有 IP 池，或指定/遍历的池的
+	// 白名单∩启用节点候选集合为空（400 —— 区域池配置缺失，属于请求针对的
+	// 资源状态错误，区别于 node_unavailable 的节点可达性故障）。
+	CodeNoAvailableIPPool = "no_available_ip_pool"
 )
 
 // mapVMServiceError 将 service 层错误映射为统一的 API 错误契约。
@@ -67,6 +71,8 @@ func mapVMServiceError(err error) error {
 		return NewError(http.StatusBadRequest, CodeInvalidVMID, serr.Message)
 	case service.KindOperationLogFailed:
 		return NewError(http.StatusInternalServerError, CodeOperationLogFailed, serr.Message)
+	case service.KindNoAvailableIPPool:
+		return NewError(http.StatusBadRequest, CodeNoAvailableIPPool, serr.Message)
 	default:
 		return mapServiceErrorExtended(err)
 	}

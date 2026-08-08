@@ -47,6 +47,11 @@ const (
 	// KindOperationLogFailed：PVE 已受理操作，但操作记录写入失败（设计 D5
 	// 的审计完整性优先：返回 500，前端提示可刷新确认）。
 	KindOperationLogFailed ErrorKind = 108
+	// KindNoAvailableIPPool：创建 VM 时区域没有 IP 池，或指定/遍历的池的
+	// 白名单∩启用节点候选集合为空（区域池配置缺失）；区别于 KindNodeUnavailable
+	// （有池有候选但可达性探测失败）。池配置是创建 VM 的前置条件，即使镜像
+	// 也未下载，也优先暴露该错误。
+	KindNoAvailableIPPool ErrorKind = 110
 )
 
 func vmNotReadyf(format string, args ...any) *Error {
@@ -79,6 +84,13 @@ func invalidVMReff(format string, args ...any) *Error {
 // operationLogFailedf 构造一个 KindOperationLogFailed 服务错误。
 func operationLogFailedf(format string, args ...any) *Error {
 	return &Error{Kind: KindOperationLogFailed, Message: fmt.Sprintf(format, args...)}
+}
+
+// noAvailableIPPoolf 构造一个 KindNoAvailableIPPool 服务错误；消息由调用点
+// 区分两种子因：「区域无池」（"no available ip pool in zone %d"）与「池
+// 白名单∩启用节点为空」（"ip pool %d has no candidate nodes in zone %d"）。
+func noAvailableIPPoolf(format string, args ...any) *Error {
+	return &Error{Kind: KindNoAvailableIPPool, Message: fmt.Sprintf(format, args...)}
 }
 
 const (
@@ -221,6 +233,9 @@ type CreateVMRequest struct {
 	// UserID 可选归属用户（vms.user_id，设计 D3）：nil 表示无主 VM；
 	// 非 nil 时 CreateVM 校验用户存在且启用（禁用用户不得获得新资源）。
 	UserID *int64 `json:"user_id,omitempty"`
+	// PoolID 可选 IP 池（设计 2）：nil 表示缺省自动遍历区域全部池；
+	// 非 nil 时限定只在该池调度，CreateVM 校验其存在且属于该区域。
+	PoolID *int64 `json:"pool_id,omitempty"`
 }
 
 // validateCreateVMRequest 强制创建校验中与存在性无关的部分：名称、正数规格
@@ -366,11 +381,30 @@ func (s *VMService) CreateVM(ctx context.Context, identity *Identity, req Create
 		return nil, err
 	}
 
+	// 6. 可选池校验（设计 2）：指定 pool_id 时必须为正整数、存在且属于该
+	// 区域（指定不属于本区域的池按资源不存在 404 处理）；通过后限定只在
+	// 该池调度，缺省保持自动遍历区域全部池。
+	if req.PoolID != nil {
+		if *req.PoolID <= 0 {
+			return nil, badRequestf("pool_id must be a positive integer")
+		}
+		pool, err := s.ipPoolRepo.GetPool(ctx, *req.PoolID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, notFoundf("ip pool %d not found in zone %d", *req.PoolID, req.ZoneID)
+			}
+			return nil, fmt.Errorf("create vm: get ip pool: %w", err)
+		}
+		if pool.ZoneID != req.ZoneID {
+			return nil, notFoundf("ip pool %d not found in zone %d", *req.PoolID, req.ZoneID)
+		}
+	}
+
 	// 节点与池的选择（D4，镜像感知调度 5.6）：按 id 顺序遍历区域的池；对每个
 	// 池，其白名单节点与区域启用节点求交集后，先按镜像存在性过滤（仅保留
 	// local/import 存储上存在该镜像的节点），再从过滤结果中挑选第一个可达
 	// 节点；没有可用候选的池会被跳过，继续尝试下一个池。
-	pool, node, volid, err := s.selectPoolAndNode(ctx, req.ZoneID, image)
+	pool, node, volid, err := s.selectPoolAndNode(ctx, req.ZoneID, image, req.PoolID)
 	if err != nil {
 		return nil, err
 	}
@@ -556,20 +590,55 @@ func applyOperator(op *model.VMOperation, identity *Identity) {
 // 可达性探测，第一个可达节点胜出；没有带镜像候选的池会被跳过，继续尝试
 // 下一个池。
 //
+// poolID 非空时（调用方已校验池存在且属于该区域）只遍历该池，不再列举
+// 区域全部池；poolID 为空时保持缺省的全池自动遍历。两种形态下镜像扫描
+// （volIDs）都会执行：既用于候选过滤，也用于失败分支的镜像/可达性区分。
+//
 // 返回的 volid 是所选节点上该镜像的卷 ID（如 "local:import/xxx.qcow2"），
 // 由供给链用于 scsi0 的 import-from（任务 5.7），保证非空。
 //
-// 当没有任何池能产出"带镜像且可达"的节点时，区分两种失败：区域内没有任何
-// 启用节点存在该镜像 -> KindImageNotAvailable；有镜像但全部不可达 ->
-// KindNodeUnavailable。
-func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *model.Image) (model.IPPool, model.PVENode, string, error) {
+// 失败分支按优先级区分三种语义（设计 3）：
+// a. 池候选集合整体为空（区域无池、指定池的白名单∩启用节点为空、或全部
+//
+//	池的候选均为空）-> KindNoAvailableIPPool；该分支优先于镜像检查——
+//	池配置是创建 VM 的前置条件，即使镜像也未下载也先暴露池缺失。消息区分
+//	「区域无池」与「池无候选节点」两种子因（不再新增子错误码）。
+//
+// b. 池有候选但区域内没有任何启用节点确认存在该镜像 -> 扫描失败（节点
+//
+//	不可达）时 KindNodeUnavailable，全部扫描成功却无镜像时
+//	KindImageNotAvailable。
+//
+// c. 池有候选且镜像存在，但可达性探测全部失败 -> KindNodeUnavailable。
+func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *model.Image, poolID *int64) (model.IPPool, model.PVENode, string, error) {
 	enabledNodes, err := s.nodeRepo.ListEnabledNodesByZone(ctx, zoneID)
 	if err != nil {
 		return model.IPPool{}, model.PVENode{}, "", fmt.Errorf("select node: list enabled nodes: %w", err)
 	}
-	pools, err := s.ipPoolRepo.ListPoolsByZone(ctx, zoneID)
-	if err != nil {
-		return model.IPPool{}, model.PVENode{}, "", fmt.Errorf("select node: list pools: %w", err)
+	var pools []model.IPPool
+	if poolID != nil {
+		// 指定池：存在性与归属校验由 CreateVM 完成，这里重新读取完整池
+		// 对象（返回给调用方时须携带 NetworkCIDR 等供给链依赖的字段），
+		// 遍历逻辑与全池形态共用。
+		pool, err := s.ipPoolRepo.GetPool(ctx, *poolID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return model.IPPool{}, model.PVENode{}, "", notFoundf("ip pool %d not found in zone %d", *poolID, zoneID)
+			}
+			return model.IPPool{}, model.PVENode{}, "", fmt.Errorf("select node: pool %d: %w", *poolID, err)
+		}
+		// 纵深防御：调用方（CreateVM）已校验池属于该区域，这里再校验一次，
+		// 防止未来绕过 CreateVM 的调用路径把跨区池带入调度（404 语义与
+		// CreateVM 保持一致）。
+		if pool.ZoneID != zoneID {
+			return model.IPPool{}, model.PVENode{}, "", notFoundf("ip pool %d not found in zone %d", *poolID, zoneID)
+		}
+		pools = []model.IPPool{*pool}
+	} else {
+		pools, err = s.ipPoolRepo.ListPoolsByZone(ctx, zoneID)
+		if err != nil {
+			return model.IPPool{}, model.PVENode{}, "", fmt.Errorf("select node: list pools: %w", err)
+		}
 	}
 
 	// 镜像存在性过滤：并行扫描每个启用节点的 local/import 存储，建立
@@ -584,6 +653,11 @@ func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *
 		return model.IPPool{}, model.PVENode{}, "", err
 	}
 
+	// hasCandidatePool 记录是否出现过候选非空的池；poolTriedWithImage 记录
+	// 是否出现过候选带镜像的池。两者在失败分支用于区分「无可用池」（a）与
+	// 「有池但镜像/可达性失败」（b/c）。
+	hasCandidatePool := false
+	poolTriedWithImage := false
 	for _, pool := range pools {
 		poolNodes, err := s.ipPoolRepo.GetPoolNodes(ctx, pool.ID)
 		if err != nil {
@@ -593,6 +667,7 @@ func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *
 		if len(candidates) == 0 {
 			continue
 		}
+		hasCandidatePool = true
 		withImage := make([]model.PVENode, 0, len(candidates))
 		for _, n := range candidates {
 			if _, ok := volIDs[n.ID]; ok {
@@ -602,21 +677,31 @@ func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *
 		if len(withImage) == 0 {
 			continue // 池的候选节点均无该镜像：跳过该池，继续下一个
 		}
+		poolTriedWithImage = true
 		node, err := s.selectNode(ctx, withImage)
 		if err == nil {
 			return pool, node, volIDs[node.ID], nil
 		}
 		// KindNodeUnavailable：保留最后的错误并尝试下一个池。
 	}
-	if len(volIDs) == 0 {
-		// 没有任何启用节点确认存在该镜像。若存在扫描失败的节点（不可达，
-		// 无法确认镜像是否存在），优先呈现节点不可达；全部扫描成功却无镜像
-		// 才是镜像不可用。
+	// a. 池候选集合整体为空（优先级最高）：指定池时消息含池 id 与区域，
+	// 未指定（区域无池或全部池均无候选）时消息含区域。
+	if !hasCandidatePool {
+		if poolID != nil {
+			return model.IPPool{}, model.PVENode{}, "", noAvailableIPPoolf("ip pool %d has no candidate nodes in zone %d", *poolID, zoneID)
+		}
+		return model.IPPool{}, model.PVENode{}, "", noAvailableIPPoolf("no available ip pool in zone %d", zoneID)
+	}
+	// b. 池有候选但没有任何启用节点确认存在该镜像。若存在扫描失败的节点
+	// （不可达，无法确认镜像是否存在），优先呈现节点不可达；全部扫描成功却
+	// 无镜像才是镜像不可用。
+	if !poolTriedWithImage && len(volIDs) == 0 {
 		if len(scanFailures) > 0 {
 			return model.IPPool{}, model.PVENode{}, "", nodeUnavailablef("no reachable node with image %q in zone %d", image.Name, zoneID)
 		}
 		return model.IPPool{}, model.PVENode{}, "", imageNotAvailablef("image %q is not available on any enabled node of zone %d", image.Name, zoneID)
 	}
+	// c. 池有候选且镜像存在，但可达性探测全部失败（真实的依赖故障）。
 	return model.IPPool{}, model.PVENode{}, "", nodeUnavailablef("no reachable node with image %q in zone %d", image.Name, zoneID)
 }
 

@@ -60,6 +60,12 @@ func TestMapVMServiceErrorImportKinds(t *testing.T) {
 			wantStatus: http.StatusInternalServerError,
 			wantCode:   CodeOperationLogFailed,
 		},
+		{
+			name:       "no available ip pool maps to 400 no_available_ip_pool",
+			serr:       &service.Error{Kind: service.KindNoAvailableIPPool, Message: "no available ip pool in zone 1"},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeNoAvailableIPPool,
+		},
 	}
 
 	for _, tt := range tests {

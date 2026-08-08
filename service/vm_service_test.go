@@ -817,6 +817,79 @@ func TestCreateVMValidationOrder(t *testing.T) {
 	}
 }
 
+// TestCreateVMSpecifiedPool 验证指定 pool_id 时限定只在该池调度：createEnv
+// 的池 1 白名单含节点 1（有镜像且可达），指定后成功创建（设计 2）。
+func TestCreateVMSpecifiedPool(t *testing.T) {
+	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+	vmRepo := &fakeVMRepository{}
+	ipRepo.claimResults = []claimResult{{ip: model.IP{ID: 7, PoolID: 1, IP: "10.0.0.5", Status: model.IPStatusUsed}}}
+	svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	poolID := int64(1)
+	req := validCreateRequest()
+	req.PoolID = &poolID
+	vm, err := svc.CreateVM(context.Background(), adminIdentity(), req)
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if vm.VM.ID != 1 || vm.VM.Name != "vm1" || vm.VM.NodeID != 1 {
+		t.Fatalf("vm = %+v, want id 1 / name vm1 / node 1", vm.VM)
+	}
+	if vm.IP != "10.0.0.5" {
+		t.Fatalf("ip = %q, want 10.0.0.5", vm.IP)
+	}
+	// 事务顺序不变：抢占先关联已创建的 vm id。
+	if len(ipRepo.claimedVMIDs) != 1 || ipRepo.claimedVMIDs[0] != 1 {
+		t.Fatalf("claimed vm ids = %v, want [1]", ipRepo.claimedVMIDs)
+	}
+	waitForProvision(t, vmRepo)
+}
+
+// TestCreateVMSpecifiedPoolNotFound 验证指定不存在的 pool_id -> not_found。
+func TestCreateVMSpecifiedPoolNotFound(t *testing.T) {
+	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	poolID := int64(99)
+	req := validCreateRequest()
+	req.PoolID = &poolID
+	if _, err := svc.CreateVM(context.Background(), adminIdentity(), req); !isKind(err, KindNotFound) {
+		t.Fatalf("unknown pool err = %v, want KindNotFound", err)
+	}
+}
+
+// TestCreateVMSpecifiedPoolWrongZone 验证指定不属于请求区域的池 -> not_found
+// （"指定不属于该区域的池"场景，设计 2）。
+func TestCreateVMSpecifiedPoolWrongZone(t *testing.T) {
+	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+	// 池 2 属于区域 2：请求区域 1 指定它必须被拒绝。
+	ipRepo.pools = append(ipRepo.pools, model.IPPool{ID: 2, ZoneID: 2, Name: "other-zone-pool", NetworkCIDR: "10.1.0.0/24", Gateway: "10.1.0.1"})
+	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	poolID := int64(2)
+	req := validCreateRequest()
+	req.PoolID = &poolID
+	if _, err := svc.CreateVM(context.Background(), adminIdentity(), req); !isKind(err, KindNotFound) {
+		t.Fatalf("cross-zone pool err = %v, want KindNotFound", err)
+	}
+}
+
+// TestCreateVMSpecifiedPoolInvalid 验证 pool_id 非正整数 -> bad_request
+// （仿 zone_id 的校验风格）。
+func TestCreateVMSpecifiedPoolInvalid(t *testing.T) {
+	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+	svc := newVMService(t, &fakeVMRepository{}, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	for _, id := range []int64{0, -1} {
+		poolID := id
+		req := validCreateRequest()
+		req.PoolID = &poolID
+		if _, err := svc.CreateVM(context.Background(), adminIdentity(), req); !isKind(err, KindBadRequest) {
+			t.Fatalf("pool_id = %d err = %v, want KindBadRequest", id, err)
+		}
+	}
+}
+
 func TestCreateVMClaimRetriesThenSucceeds(t *testing.T) {
 	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
 	vmRepo := &fakeVMRepository{}
@@ -930,6 +1003,13 @@ func TestCreateVMNodeUnavailableWhenImageNodesUnreachable(t *testing.T) {
 // 名返回预置的 local/import 存储清单；未配置的节点返回空清单。供镜像感知
 // 调度测试（任务 5.6）注入 newClient 使用。
 func newStorageContentServer(contents map[string][]pve.StorageContent) *httptest.Server {
+	return newStorageContentServerWithFailures(contents, nil)
+}
+
+// newStorageContentServerWithFailures 与 newStorageContentServer 相同，但
+// fail 集合中的节点一律返回 500：用于构造"节点不可达（扫描失败）"场景，
+// 触达 selectPoolAndNode 的 scanFailures 分支。
+func newStorageContentServerWithFailures(contents map[string][]pve.StorageContent, fail map[string]bool) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/storage/local/content") {
 			http.NotFound(w, r)
@@ -937,6 +1017,10 @@ func newStorageContentServer(contents map[string][]pve.StorageContent) *httptest
 		}
 		node := strings.TrimPrefix(r.URL.Path, "/nodes/")
 		node = node[:strings.Index(node, "/")]
+		if fail[node] {
+			http.Error(w, "scan failed", http.StatusInternalServerError)
+			return
+		}
 		items := contents[node]
 		if items == nil {
 			items = []pve.StorageContent{}
@@ -993,7 +1077,7 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 	// 池 1 的唯一节点没有镜像（且不可达），池 2 的节点有镜像且可达 -> 池 2
 	// 胜出，返回该节点上的镜像卷 ID。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve-dead": true})
-	pool, node, volid, err := svc.selectPoolAndNode(context.Background(), 1, image)
+	pool, node, volid, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
 	if err != nil {
 		t.Fatalf("selectPoolAndNode: %v", err)
 	}
@@ -1006,16 +1090,17 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 
 	// 两个池的节点都有镜像但都不可达 -> node_unavailable。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve-dead": true, "pve-alive": true})
-	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, nil)
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
 
-	// 完全没有池 -> node_unavailable（候选集为空；区域仍有节点带镜像）。
+	// 完全没有池 -> no_available_ip_pool（区域无池，优先级高于镜像检查：
+	// 区域仍有节点带镜像但没有任何池可用）。
 	ipRepo.pools = nil
-	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image)
-	if !isKind(err, KindNodeUnavailable) {
-		t.Fatalf("no pools err = %v, want KindNodeUnavailable", err)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	if !isKind(err, KindNoAvailableIPPool) {
+		t.Fatalf("no pools err = %v, want KindNoAvailableIPPool", err)
 	}
 
 	// 区域内所有启用节点都没有该镜像 -> image_not_available（与不可达区分）。
@@ -1029,9 +1114,149 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 		{ID: 1, ZoneID: 1, Name: "dead-pool", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
 		{ID: 2, ZoneID: 1, Name: "alive-pool", NetworkCIDR: "10.0.1.0/24", Gateway: "10.0.1.1"},
 	}
-	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, nil)
 	if !isKind(err, KindImageNotAvailable) {
 		t.Fatalf("no image err = %v, want KindImageNotAvailable", err)
+	}
+}
+
+// TestSelectPoolAndNodeScanFailureNoImageNodeUnavailable 验证失败分支 b：
+// 候选池有节点但均无镜像，且存在扫描失败（不可达）的节点时返回
+// KindNodeUnavailable（区别于全部扫描成功却无镜像的 image_not_available）。
+// 扫描失败节点只需是区域启用节点即可计入 scanFailures，无需在池白名单内。
+func TestSelectPoolAndNodeScanFailureNoImageNodeUnavailable(t *testing.T) {
+	image := testDebianImage()
+	image.DownloadURL += "?version=1"
+	imageNode := model.PVENode{ID: 1, ZoneID: 1, Name: "pve-image-less", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
+	scanFailNode := model.PVENode{ID: 2, ZoneID: 1, Name: "pve-scan-fail", Host: "h2", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{imageNode, scanFailNode}}
+	ipRepo := &fakeVMIPPoolRepository{
+		pools: []model.IPPool{
+			{ID: 1, ZoneID: 1, Name: "p1", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
+		},
+		// 池 1 白名单只含候选节点 pve-image-less：候选非空但该节点无镜像。
+		poolNodes: map[int64][]model.PVENode{1: {imageNode}},
+	}
+	// pve-image-less 扫描成功但无镜像，pve-scan-fail 扫描失败（500）。
+	contentSrv := newStorageContentServerWithFailures(nil, map[string]bool{"pve-scan-fail": true})
+	defer contentSrv.Close()
+	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, &fakeVMUserRepository{}, testCipher(t))
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	if !isKind(err, KindNodeUnavailable) {
+		t.Fatalf("err = %v, want KindNodeUnavailable (scan failure wins over image_not_available)", err)
+	}
+	var serr *Error
+	if !errors.As(err, &serr) || !strings.Contains(serr.Message, `no reachable node with image`) ||
+		!strings.Contains(serr.Message, "zone 1") {
+		t.Fatalf("err = %v, want message mentioning image and zone 1", err)
+	}
+}
+
+// TestSelectPoolAndNodeNoPools 验证区域没有任何 IP 池时（节点带镜像）返回
+// KindNoAvailableIPPool，消息含区域（设计 3 优先级 a：区域无池）。
+func TestSelectPoolAndNodeNoPools(t *testing.T) {
+	image := testDebianImage()
+	node := testPVENode(1)
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{node}}
+	ipRepo := &fakeVMIPPoolRepository{pools: nil} // 区域无池
+	// 节点上有镜像：无池分支优先于镜像检查。
+	contentSrv := newStorageContentServer(map[string][]pve.StorageContent{
+		"pve1": {{VolID: "local:import/debian-12-genericcloud-amd64.qcow2", Name: "debian-12-genericcloud-amd64.qcow2"}},
+	})
+	defer contentSrv.Close()
+	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, &fakeVMUserRepository{}, testCipher(t))
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	if !isKind(err, KindNoAvailableIPPool) {
+		t.Fatalf("err = %v, want KindNoAvailableIPPool", err)
+	}
+	var serr *Error
+	if !errors.As(err, &serr) || !strings.Contains(serr.Message, "zone 1") {
+		t.Fatalf("err = %v, want message mentioning zone 1", err)
+	}
+}
+
+// TestSelectPoolAndNodeNoPoolsNoImage 验证区域无池且无镜像时仍返回
+// KindNoAvailableIPPool（设计 3 优先级 a 置于镜像检查之前：池配置缺失优先
+// 暴露，即使镜像也未下载）。
+func TestSelectPoolAndNodeNoPoolsNoImage(t *testing.T) {
+	image := testDebianImage()
+	node := testPVENode(1)
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{node}}
+	ipRepo := &fakeVMIPPoolRepository{pools: nil} // 区域无池
+	// 节点上没有镜像（content 扫描无匹配）。
+	emptySrv := newStorageContentServer(nil)
+	defer emptySrv.Close()
+	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, &fakeVMUserRepository{}, testCipher(t))
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(emptySrv.URL), pve.WithHTTPClient(emptySrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	if !isKind(err, KindNoAvailableIPPool) {
+		t.Fatalf("err = %v, want KindNoAvailableIPPool (no pool wins over no image)", err)
+	}
+}
+
+// TestSelectPoolAndNodePoolWhiteListEmpty 验证池白名单∩启用节点为空时返回
+// KindNoAvailableIPPool：未指定池时消息含区域（区域有池但全部无候选），
+// 指定该池时消息含池 id 与区域。
+func TestSelectPoolAndNodePoolWhiteListEmpty(t *testing.T) {
+	image := testDebianImage()
+	node := testPVENode(1)
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{node}}
+	ipRepo := &fakeVMIPPoolRepository{
+		pools: []model.IPPool{
+			{ID: 1, ZoneID: 1, Name: "empty-pool", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
+		},
+		poolNodes: map[int64][]model.PVENode{}, // 池 1 白名单为空
+	}
+	contentSrv := newStorageContentServer(map[string][]pve.StorageContent{
+		"pve1": {{VolID: "local:import/debian-12-genericcloud-amd64.qcow2", Name: "debian-12-genericcloud-amd64.qcow2"}},
+	})
+	defer contentSrv.Close()
+	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, &fakeVMUserRepository{}, testCipher(t))
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	// 未指定池：全池遍历全部因候选为空跳过 -> 消息含区域。
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	if !isKind(err, KindNoAvailableIPPool) {
+		t.Fatalf("err = %v, want KindNoAvailableIPPool", err)
+	}
+	var serr *Error
+	if !errors.As(err, &serr) || !strings.Contains(serr.Message, "zone 1") {
+		t.Fatalf("err = %v, want message mentioning zone 1", err)
+	}
+
+	// 指定该池：消息含池 id 与区域。
+	poolID := int64(1)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, &poolID)
+	if !isKind(err, KindNoAvailableIPPool) {
+		t.Fatalf("specified pool err = %v, want KindNoAvailableIPPool", err)
+	}
+	if !errors.As(err, &serr) || !strings.Contains(serr.Message, "ip pool 1") || !strings.Contains(serr.Message, "zone 1") {
+		t.Fatalf("specified pool err = %v, want message mentioning pool 1 and zone 1", err)
 	}
 }
 
