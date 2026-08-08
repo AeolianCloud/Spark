@@ -14,6 +14,7 @@ updates:
       include: "scope"
 
   # 前端依赖（web/package.json，含 Nuxt UI 等）
+  # 仅跟踪小版本升级，跨大版本升级（如 typescript 5→7）风险较高，忽略
   - package-ecosystem: "npm"
     directory: "/web"
     schedule:
@@ -23,8 +24,12 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions（.github/workflows/*.yml）
+  # 仅跟踪小版本升级，Actions 大版本升级（如 checkout 4→7）存在兼容性风险，忽略
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -33,3 +38,6 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
