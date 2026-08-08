@@ -40,8 +40,9 @@ openssl rand -base64 32
 
 > 生产环境必须替换 `config/config.yaml` 中的示例密钥（启动时检测到示例值会打印警告）。
 > 本地敏感配置（真实数据库密码、加密密钥）可放入仓库根目录的 `.env.local`（已 gitignore），
-> 通过 `set -a; source .env.local; set +a; go run ./cmd/server` 加载，`config/config.yaml`
-> 只保留占位示例值。
+> `go run ./cmd/server` 启动时自动读取（**须从仓库根目录启动**，其他工作目录静默跳过）；
+> 优先级链：默认值 < `config/config.yaml` < `.env.local` < 进程环境变量（显式设置的
+> 进程环境变量优先于 `.env.local`）。如需手动加载，也可改用 `set -a; source .env.local; set +a` 方式。
 
 ### 构建与运行
 
