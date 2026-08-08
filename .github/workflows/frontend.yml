@@ -3,19 +3,15 @@
 # 契约红线：docs/openapi.yaml 是唯一事实来源，前端 client 由其生成且生成物入库。
 # api:check 重新生成 client 并与已提交版本 diff，diff 非空即失败——
 # 契约变更未同步生成 client 的 PR 不允许合并（见 AGENTS.md 接口契约同步红线）。
+#
+# 注意：不做 paths 过滤（对全部 push/PR 运行）——分支保护要求 build 检查
+# 必须存在且通过，若按路径过滤则纯文档/配置 PR 无 build 检查，永远无法合并
+#（Mergify 的 check-success 条件同理失效）。
 name: frontend
 
 on:
   push:
-    paths:
-      - 'web/**'
-      - 'docs/openapi.yaml'
-      - '.github/workflows/frontend.yml'
   pull_request:
-    paths:
-      - 'web/**'
-      - 'docs/openapi.yaml'
-      - '.github/workflows/frontend.yml'
 
 permissions:
   contents: read
