@@ -47,9 +47,9 @@ type _Assert40Ops = Assert<
 
 /* ---------------------------------- 2.4：写操作请求体/响应体校验 ---------------------------------- */
 
-// createVM：CreateVMRequest 必填字段不变，user_id 可选（归属用户，仅管理员可指定）
+// createVM：CreateVMRequest 必填字段不变，user_id/pool_id 可选（pool_id 指定时仅在该池内调度，缺省按区域自动选池）
 type _AssertCreateVMReq = Assert<Equal<keyof components['schemas']['CreateVMRequest'],
-  'name' | 'cpu' | 'mem_mb' | 'disk_gb' | 'image_id' | 'storage_type_id' | 'zone_id' | 'password' | 'user_id'>>
+  'name' | 'cpu' | 'mem_mb' | 'disk_gb' | 'image_id' | 'storage_type_id' | 'zone_id' | 'pool_id' | 'password' | 'user_id'>>
 type _AssertCreateVMReqRequired = Assert<Equal<RequiredKeys<components['schemas']['CreateVMRequest']>,
   'name' | 'cpu' | 'mem_mb' | 'disk_gb' | 'image_id' | 'storage_type_id' | 'zone_id' | 'password'>>
 // createVM 函数签名：请求体即 CreateVMRequest；响应 201 为 VMResponse + Location

@@ -600,6 +600,93 @@ func e2eOperations(t *testing.T, client *http.Client, token, base, ref string, w
 // 注册 zone/node/IP 池/存储类型/镜像，创建虚拟机（在 fake PVE 上异步配置），
 // 执行 start/stop/restart，resize（缩小被 422 拒绝、扩容生效），
 // 验证透传的列表与详情，销毁，并断言 IP 已被释放、数据库行已被删除。
+// TestE2EVMNoPoolRejected 验证「区域无 IP 池」场景的错误语义：环境只有
+// zone、节点、存储类型与镜像（镜像已存在于 fake PVE 的 import 目录，排除
+// 镜像因素），刻意不创建 IP 池；创建 VM 被 400 no_available_ip_pool 拒绝
+// （设计 3 优先级 a：池配置缺失优先于镜像检查暴露）。
+func TestE2EVMNoPoolRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+
+	pool, err := database.New(ctx, e2eDSN())
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	defer pool.Close()
+
+	if err := database.Migrate(ctx, pool, database.MigrationFS); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	truncateBusinessTables(t, ctx, pool)
+	defer truncateBusinessTables(t, ctx, pool)
+
+	fakePVE := newFakePVE(t)
+	pveServer := httptest.NewTLSServer(fakePVE)
+	defer pveServer.Close()
+	pvePort := pveServer.Listener.Addr().(*net.TCPAddr).Port
+
+	router := api.NewRouter(pool, e2eCipher(t),
+		api.WithJWTSecret(e2eJWTSecret),
+		api.WithVMClientFactory(func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+			return pve.NewClient(host, apiUser, apiTokenSecret,
+				pve.WithPort(port),
+				pve.WithHTTPClient(pveServer.Client()),
+				pve.WithTimeout(5*time.Second))
+		}))
+	app := httptest.NewServer(router)
+	defer app.Close()
+
+	client := app.Client()
+	base := app.URL
+
+	adminToken := e2eAdminToken(t, ctx, pool, client, base, "e2e-nopool-admin", "e2e-nopool-pass")
+
+	// 注册部署环境：zone、节点、存储类型、镜像——刻意不创建 IP 池。
+	zone := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/zones", map[string]any{"name": "e2e-nopool-zone"}, http.StatusCreated))
+	zoneID := int64(zone["id"].(float64))
+
+	e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/zones/%d/nodes", zoneID),
+		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
+		http.StatusCreated)
+
+	st := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/storage-types", map[string]any{
+		"name": "ssd", "display_name": "SSD", "pve_storage": "local-lvm",
+	}, http.StatusCreated))
+	stID := int64(st["id"].(float64))
+
+	img := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/images", map[string]any{
+		"name":         "debian-12-cloud",
+		"default_user": "debian",
+		"download_url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2",
+	}, http.StatusCreated))
+	imgID := int64(img["id"].(float64))
+
+	// 镜像存在于 fake PVE 的 import 目录：节点选择扫描（storage content）
+	// 能命中镜像，从而排除镜像因素，纯粹验证"区域无池"分支。
+	fakePVE.addImportFile("local", "debian-12-genericcloud-amd64.qcow2")
+
+	// 区域无池创建 VM -> 400 no_available_ip_pool（不落库、不占 IP）。
+	rejected := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms", map[string]any{
+		"name": "e2e-vm-nopool", "cpu": 2, "mem_mb": int64(2048), "disk_gb": int64(10),
+		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": "s3cret-pw",
+	}, http.StatusBadRequest))
+	rejectedErr := e2eObj(t, rejected["error"])
+	if code, _ := rejectedErr["code"].(string); code != "no_available_ip_pool" {
+		t.Fatalf("create vm without ip pool: error code = %q, want no_available_ip_pool", code)
+	}
+
+	// 拒绝发生在落库之前：列表不得出现该测试创建的 VM 名称（不落库证明）。
+	list := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, "/vms", nil, http.StatusOK))
+	for _, raw := range list["vms"].([]any) {
+		item := raw.(map[string]any)
+		if item["name"] == "e2e-vm-nopool" {
+			t.Fatalf("GET /vms contains the rejected VM name %q: rejected create must not persist a row", item["name"])
+		}
+	}
+}
+
 func TestE2EVMFullLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()

@@ -49,11 +49,12 @@ x-ms-error-code: not_found
 | `internal_error` | 500 | 服务器内部错误 | 未归类异常的统一兜底，不暴露内部细节 |
 | `service_unavailable` | 503 | 服务不可用 | `/healthz` 数据库探活失败时的 degraded 状态（业务 API 暂无触发） |
 | `dependency_failed` | — | 依赖子系统失败 | 未使用（预留），已定义、暂未接线 |
-| `node_unavailable` | 503 | 无可用的 PVE 节点 | 创建 VM 时所有候选节点不可达或被禁用；节点实时状态查询（GET /nodes/:id/status）时 PVE 不可达/API 令牌无效/超时 |
+| `node_unavailable` | 503 | 无可用的 PVE 节点 | 创建 VM 时存在带镜像的池候选节点但全部不可达或被禁用；节点实时状态查询（GET /nodes/:id/status）时 PVE 不可达/API 令牌无效/超时 |
 | `ip_exhausted` | 409 | IP 池无空闲地址 | 所有候选 IP 池的地址均已分配完毕 |
 | `vm_not_ready` | 409 | VM 尚不可操作 | 供给未完成或 PVE 侧 VM 已不存在时执行生命周期操作 |
 | `disk_shrink_not_allowed` | 422 | 磁盘不支持缩小 | resize 请求中 `disk_gb` 小于当前磁盘大小 |
-| `image_not_available_in_zone` | 400 | 镜像在该区域不可用 | 区域内没有任何启用节点存在该镜像（可用性语义：至少一个启用节点存在即可用，已由"全部节点交集"放宽为"至少一个节点存在"） |
+| `no_available_ip_pool` | 400 | 区域无可用 IP 池 | 创建 VM 时区域没有任何 IP 池，或全部 IP 池的白名单节点与启用节点交集为空（消息区分"无池"与"池无候选节点"）；该错误优先于镜像不可用与节点不可用 |
+| `image_not_available_in_zone` | 400 | 镜像在该区域不可用 | 区域内存在可用 IP 池候选但没有任何启用节点存在该镜像（可用性语义：至少一个启用节点存在即可用） |
 | `vm_not_found_on_node` | 404 | 节点 PVE 可达但 VM 不在该节点上 | 认领（import）不存在的 pve_vmid，或对 ext- 标识指向的已移除/不存在的 VM 执行生命周期操作（区别于 zone/node 自身不存在的 `not_found`） |
 | `vm_already_managed` | 409 | 该节点上的 pve_vmid 已被托管 | 重复认领同一 PVE VMID（区别于一般资源冲突的 `conflict`） |
 | `invalid_vm_id` | 400 | VM id 无法解析 | 生命周期操作/操作记录查询的 `:id` 既非正整数也非 `ext-{nodeID}-{vmid}` 合成标识 |

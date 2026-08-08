@@ -462,9 +462,10 @@ export interface paths {
          * @description 分配 IP → 落库 → 异步 PVE 创建链，立即返回 201（status 为 creating）。
          *     密码仅用于 cloud-init 一次性注入，不随响应返回。
          *
-         *     错误场景：400 请求体非法，或镜像在该区域不可用（image_not_available_in_zone）；
-         *     404 区域/镜像/存储类型不存在（not_found）；409 IP 池地址耗尽（ip_exhausted）；
-         *     503 所有候选节点不可达或被禁用（node_unavailable）。
+         *      错误场景：400 请求体非法（含 pool_id 非正整数）；区域无可用 IP 池
+         *      （no_available_ip_pool）；镜像在该区域不可用（image_not_available_in_zone）；
+         *      404 区域/镜像/存储类型不存在（not_found）；409 IP 池地址耗尽（ip_exhausted）；
+         *      503 存在带镜像的候选节点但全部不可达/被禁用（node_unavailable）。
          */
         post: operations["createVM"];
         delete?: never;
@@ -658,7 +659,7 @@ export interface components {
              * @description 稳定的机器可读错误码（客户端只可依赖 code）
              * @enum {string}
              */
-            code: "bad_request" | "unauthorized" | "forbidden" | "not_found" | "method_not_allowed" | "conflict" | "unprocessable_entity" | "internal_error" | "service_unavailable" | "dependency_failed" | "node_unavailable" | "ip_exhausted" | "vm_not_ready" | "disk_shrink_not_allowed" | "image_not_available_in_zone" | "vm_already_managed" | "vm_not_found_on_node" | "invalid_vm_id" | "operation_log_failed" | "user_has_resources";
+            code: "bad_request" | "unauthorized" | "forbidden" | "not_found" | "method_not_allowed" | "conflict" | "unprocessable_entity" | "internal_error" | "service_unavailable" | "dependency_failed" | "no_available_ip_pool" | "node_unavailable" | "ip_exhausted" | "vm_not_ready" | "disk_shrink_not_allowed" | "image_not_available_in_zone" | "vm_already_managed" | "vm_not_found_on_node" | "invalid_vm_id" | "operation_log_failed" | "user_has_resources";
             /** @description 仅供人阅读，不可被程序解析 */
             message: string;
         };
@@ -1086,6 +1087,11 @@ export interface components {
             storage_type_id: number;
             /** Format: int64 */
             zone_id: number;
+            /**
+             * Format: int64
+             * @description 可选 IP 池 ID，不传时按区域 IP 池自动选择，指定时仅在该池内调度
+             */
+            pool_id?: number;
             /** @description cloud-init 注入密码（仅创建时使用，不随响应返回） */
             password: string;
             /**
@@ -1328,7 +1334,7 @@ export interface components {
         };
     };
     responses: {
-        /** @description 请求参数非法（bad_request / invalid_vm_id；也用于 image_not_available_in_zone） */
+        /** @description 请求参数非法（bad_request / invalid_vm_id；也用于 no_available_ip_pool / image_not_available_in_zone） */
         BadRequest: {
             headers: {
                 "x-ms-error-code": components["headers"]["XMSErrorCode"];

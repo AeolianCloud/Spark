@@ -10,12 +10,13 @@
  *   直至 PVE 状态生效，两段式 toast；失败展示后端错误且状态不变
  * - 操作记录弹窗已移除（后端审计端点保留，见 design D8）
  */
-import type { Image, NodeWarning, StorageType, VMListItem, ZoneResponse } from '~/api'
+import type { Image, NodeWarning, Pool, StorageType, VMListItem, ZoneResponse } from '~/api'
 import {
   ApiError,
   createVM,
   destroyVM,
   listImagesByZone,
+  listPools,
   listStorageTypes,
   listVMs,
   listZones
@@ -261,7 +262,8 @@ const createForm = reactive({
   disk_gb: 20,
   zone_id: undefined as number | undefined,
   storage_type_id: undefined as number | undefined,
-  image_id: undefined as number | undefined
+  image_id: undefined as number | undefined,
+  pool_id: undefined as number | undefined
 })
 
 // 注入密码：仅用于提交，提交后立即清空，不持久化/不回显/不打印
@@ -272,9 +274,12 @@ const zones = ref<ZoneResponse[]>([])
 const storageTypes = ref<StorageType[]>([])
 const images = ref<Image[]>([])
 const imagesLoading = ref(false)
+const pools = ref<Pool[]>([])
+const poolsLoading = ref(false)
 const zonesLoadError = ref<ApiError | null>(null)
 const storageTypesLoadError = ref<ApiError | null>(null)
 const imagesLoadError = ref<ApiError | null>(null)
+const poolsLoadError = ref<ApiError | null>(null)
 
 // 内存快捷档位（MB）
 const MEM_PRESETS = [1024, 2048, 4096, 8192]
@@ -282,17 +287,15 @@ const MEM_PRESETS = [1024, 2048, 4096, 8192]
 const zoneOptions = computed(() => zones.value.map(z => ({ label: z.name, value: z.id })))
 const storageTypeOptions = computed(() => storageTypes.value.map(s => ({ label: `${s.display_name}（${s.name}）`, value: s.id })))
 const imageOptions = computed(() => images.value.map(i => ({ label: `${i.name}（默认用户 ${i.default_user}）`, value: i.id })))
+const poolOptions = computed(() => pools.value.map(p => ({ label: p.name, value: p.id })))
 
 // 镜像列表请求序号守卫：Zone 快速切换时丢弃过期响应，防止旧 Zone 的镜像覆盖新 Zone
 let imagesSeq = 0
+// IP 池列表请求序号守卫：与镜像同模式，防止旧 Zone 的池列表覆盖新 Zone
+let poolsSeq = 0
 
-// 可用区切换 → 镜像按该 Zone 过滤（契约 listImagesByZone 支持 zone_id；镜像可用性依赖 Zone）
-watch(() => createForm.zone_id, async (zoneId) => {
-  createForm.image_id = undefined // 切换 Zone 后原镜像可能不可用，强制重新选择
-  images.value = []
-  imagesLoadError.value = null
-  if (zoneId === undefined) return
-  const seq = ++imagesSeq
+// 按 Zone 并行加载镜像列表：独立 async 请求，序号守卫/错误处理/loading 恢复互不影响（镜像接口慢不阻塞池列表）
+async function loadImagesForZone(zoneId: number, seq: number): Promise<void> {
   imagesLoading.value = true
   try {
     // 区域过滤分支响应为 ImageZoneItem[]（image + 各启用节点存在状态），仅需 image 元数据
@@ -306,6 +309,39 @@ watch(() => createForm.zone_id, async (zoneId) => {
   } finally {
     if (seq === imagesSeq) imagesLoading.value = false
   }
+}
+
+// 按 Zone 并行加载 IP 池列表：与镜像同模式，独立 async 请求，失败不影响镜像加载
+async function loadPoolsForZone(zoneId: number, poolSeq: number): Promise<void> {
+  poolsLoading.value = true
+  try {
+    const res = await listPools({ zone_id: zoneId, limit: 100 })
+    // 过期响应丢弃：期间 Zone 已再次切换
+    if (poolSeq !== poolsSeq || zoneId !== createForm.zone_id) return
+    pools.value = res.data
+  } catch (err) {
+    if (poolSeq !== poolsSeq || zoneId !== createForm.zone_id) return
+    poolsLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
+  } finally {
+    if (poolSeq === poolsSeq) poolsLoading.value = false
+  }
+}
+
+// 可用区切换 → 镜像按该 Zone 过滤（契约 listImagesByZone 支持 zone_id；镜像可用性依赖 Zone）；
+// IP 池按该 Zone 过滤（契约 listPools 支持 zone_id 过滤），两者共用同一 watch 同步重置并并行加载
+watch(() => createForm.zone_id, (zoneId) => {
+  createForm.image_id = undefined // 切换 Zone 后原镜像可能不可用，强制重新选择
+  createForm.pool_id = undefined // 切换 Zone 后原池可能不属于新 Zone，强制重新选择（防提交撞 404）
+  images.value = []
+  pools.value = []
+  imagesLoadError.value = null
+  poolsLoadError.value = null
+  if (zoneId === undefined) return
+  // 两个请求相互独立，并行发起互不等待（Promise 各自 resolve/reject）
+  const seq = ++imagesSeq
+  const poolSeq = ++poolsSeq
+  void loadImagesForZone(zoneId, seq)
+  void loadPoolsForZone(zoneId, poolSeq)
 })
 
 // 可用区列表懒加载（创建/导入两个弹窗共用；加载失败记录错误 ref，弹窗内给出轻量提示，重新打开会重试）
@@ -374,6 +410,8 @@ async function submitCreate(): Promise<void> {
       image_id: createForm.image_id!,
       storage_type_id: createForm.storage_type_id!,
       zone_id: createForm.zone_id!,
+      // pool_id 为可选字段：未选择时不携带该键（契约可选，缺省由后端按区域自动选池）
+      ...(createForm.pool_id !== undefined ? { pool_id: createForm.pool_id } : {}),
       password: pwd
     })
     // 成功后清空整个表单并关闭弹窗，刷新列表可见新 VM（status 为 creating）
@@ -384,7 +422,9 @@ async function submitCreate(): Promise<void> {
     createForm.zone_id = undefined
     createForm.storage_type_id = undefined
     createForm.image_id = undefined
+    createForm.pool_id = undefined
     images.value = []
+    pools.value = []
     createOpen.value = false
     toast.add({ title: '创建已受理', description: '虚拟机创建中，稍后刷新可见', color: 'success', icon: 'i-lucide-check-circle-2' })
     void fetchVMs()
@@ -779,6 +819,41 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
                   @update:model-value="(v: number | undefined) => { createForm.image_id = v }"
                 />
               </UFormField>
+            </div>
+
+            <!-- IP 池（可选）：Zone 联动加载，不选择时后端按区域自动选池 -->
+            <UFormField
+              name="pool_id"
+              label="IP 池（可选）"
+              :description="poolsLoadError
+                ? `IP 池列表加载失败（${poolsLoadError.code}），请重新选择可用区重试`
+                : (createForm.zone_id === undefined ? '请先选择可用区以加载 IP 池' : undefined)"
+            >
+              <USelect
+                :model-value="createForm.pool_id"
+                :items="poolOptions"
+                :loading="poolsLoading"
+                :disabled="createForm.zone_id === undefined"
+                placeholder="不选择则自动分配"
+                class="w-full"
+                @update:model-value="(v: number | undefined) => { createForm.pool_id = v }"
+              />
+            </UFormField>
+
+            <!-- 该区域未配置 IP 池：创建必然失败，引导前往 IP 池管理页配置（加载失败时仅展示错误文案，不重复提示） -->
+            <div
+              v-if="createForm.zone_id !== undefined && !poolsLoading && poolsLoadError === null && pools.length === 0"
+              class="flex items-center gap-2 text-sm text-warning"
+            >
+              <span>该区域未配置 IP 池，创建将失败</span>
+              <UButton
+                size="xs"
+                variant="link"
+                color="primary"
+                :to="'/ip-pools'"
+              >
+                前往配置
+              </UButton>
             </div>
 
             <UFormField
