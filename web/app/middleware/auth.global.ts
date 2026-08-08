@@ -5,11 +5,15 @@
  */
 import { getToken } from '~/utils/auth'
 
+// 公开路径白名单：无需登录即可访问的页面。
+// SPA 无 /healthz 路由页（健康检查由后端/反代处理，不经过前端路由），故白名单仅登录页
+const publicPaths = ['/login']
+
 export default defineNuxtRouteMiddleware((to) => {
   const loggedIn = getToken() !== null
 
-  // 未登录访问业务页（/login 与 /healthz 之外的路径）：导向登录页
-  if (to.path !== '/login' && !loggedIn) {
+  // 未登录访问白名单之外的路径：导向登录页
+  if (!publicPaths.includes(to.path) && !loggedIn) {
     return navigateTo('/login')
   }
 

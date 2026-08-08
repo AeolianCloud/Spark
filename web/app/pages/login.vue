@@ -2,7 +2,7 @@
 // 管理员登录页：独立轻量布局（不套默认侧边栏，layout: false），居中卡片表单。
 // 提交调 useAuth.login()（内部走 POST /auth/admin/login，登录请求不注入令牌、
 // 401 不触发全局跳转），成功跳转首页，失败展示后端脱敏错误信息并停留。
-import type { ApiError } from '~/api/client'
+import { ApiError } from '~/api/client'
 import { useAuth } from '~/composables/useAuth'
 import type { FormValidateError } from '~/utils/format'
 
@@ -38,8 +38,11 @@ async function onSubmit(): Promise<void> {
     await login(form.username.trim(), form.password)
     await navigateTo('/dashboard')
   } catch (err) {
-    // 登录失败：仅展示后端脱敏后的 ApiError message，不展示任何令牌/敏感信息
-    loginError.value = err as ApiError
+    // 登录失败：仅展示后端脱敏后的 ApiError message，不展示任何令牌/敏感信息；
+    // 非 ApiError 的未知异常（如运行时 bug）也兜底为固定文案，保证任何失败都有可见反馈
+    loginError.value = err instanceof ApiError
+      ? err
+      : new ApiError(0, 'unknown', '登录失败，请稍后重试')
   } finally {
     submitting.value = false
   }
@@ -110,7 +113,6 @@ async function onSubmit(): Promise<void> {
 
       <template #footer>
         <UButton
-          type="submit"
           color="primary"
           class="w-full"
           icon="i-lucide-log-in"
