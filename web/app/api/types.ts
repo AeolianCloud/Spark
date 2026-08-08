@@ -39,3 +39,7 @@ export type VMOperation = components['schemas']['VMOperation']
 export type VMOperationsResponse = components['schemas']['VMOperationsResponse']
 export type ErrorDetail = components['schemas']['ErrorDetail']
 export type ErrorBody = components['schemas']['ErrorBody']
+// 认证：契约中登录请求 schema 名为 LoginRequest（user/admin 身份域共用同一结构），
+// 此处按管理员登录业务语义重导出为 AdminLoginRequest 别名，与 adminLogin 封装对应
+export type AdminLoginRequest = components['schemas']['LoginRequest']
+export type AdminLoginResponse = components['schemas']['AdminLoginResponse']

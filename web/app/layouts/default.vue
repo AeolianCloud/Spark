@@ -1,5 +1,9 @@
 <script setup lang="ts">
 import type { NavigationMenuItem } from '@nuxt/ui'
+import { useAuth } from '~/composables/useAuth'
+
+// 登录态：页脚展示当前登录管理员身份，提供登出入口（登出走 useAuth.logout）
+const { identity, logout } = useAuth()
 
 // 侧边导航项：全部管理模块入口（分组导航，便于后续扩展子项）
 const items: NavigationMenuItem[][] = [[{
@@ -62,13 +66,23 @@ const items: NavigationMenuItem[][] = [[{
         />
       </template>
 
-      <template #footer="{ collapsed }">
+      <template #footer>
         <div class="flex w-full items-center justify-between gap-2">
           <span
-            v-if="!collapsed"
-            class="text-xs text-muted"
-          >无鉴权管理面 · 请网络层隔离</span>
-          <UColorModeButton />
+            class="min-w-0 truncate text-xs text-muted"
+            :title="identity?.username"
+          >{{ identity?.username }}</span>
+          <div class="flex shrink-0 items-center gap-1">
+            <UButton
+              icon="i-lucide-log-out"
+              variant="ghost"
+              color="neutral"
+              size="sm"
+              aria-label="退出登录"
+              @click="logout"
+            />
+            <UColorModeButton />
+          </div>
         </div>
       </template>
     </UDashboardSidebar>

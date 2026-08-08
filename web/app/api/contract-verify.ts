@@ -6,6 +6,7 @@
  * 契约新增/删除/改名端点或字段时，此处断言在 `npm run typecheck` 中失败。
  */
 import type { components, operations } from './generated/schema'
+import type { adminLogin } from './auth'
 import type { createVM, destroyVM, getVM, importVM, listVMOperations, listVMs, resizeVM, restartVM, startVM, stopVM } from './vms'
 import type { createNode, getNodeStatus, updateNode } from './nodes'
 import type { createPool, listPools, setPoolNodes } from './pools'
@@ -13,7 +14,7 @@ import type { createImage, downloadImage, getImage, getImageNodeStatus, listImag
 import type { createStorageType, listStorageTypes, updateStorageType } from './storage-types'
 import type { createZone, listZones } from './zones'
 import type { ApiResponse, LocatedResponse, ListResponse } from './client'
-import type { AcceptedResponse, Image, ImageDownloadRequest, ImageOperation, ImageZoneItem, NodeImageStatus, NodeResponse, NodeStatusResponse, StorageType, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
+import type { AcceptedResponse, AdminLoginRequest, AdminLoginResponse, Image, ImageDownloadRequest, ImageOperation, ImageZoneItem, NodeImageStatus, NodeResponse, NodeStatusResponse, StorageType, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
 
 /** 恒真断言：约束类型推导结果必须为 true */
 type Assert<T extends true> = T
@@ -24,27 +25,31 @@ type RequiredKeys<T> = { [K in keyof T]-?: undefined extends T[K] ? never : K }[
 /** 取对象可选键 */
 type OptionalKeys<T> = Exclude<keyof T, RequiredKeys<T>>
 
-/* ---------------------------------- 2.2：32 端点全覆盖 ---------------------------------- */
+/* ---------------------------------- 2.2：40 端点全覆盖 ---------------------------------- */
+// 说明：契约含 40 个操作。loginUser 与 users 相关操作（createUser/listUsers/getUser/
+// updateUser/deleteUser/setUserStatus）前端暂未封装（用户侧功能未开展，仅本次实现了
+// 管理员登录 adminLogin），此处仍断言契约端点全集，防止契约新增/删除端点时遗漏同步。
 
 type OpKeys = keyof operations
-type _Assert32Ops = Assert<
+type _Assert40Ops = Assert<
   Equal<
     OpKeys,
-    | 'healthz' | 'createZone' | 'listZones' | 'createNode' | 'listNodesByZone' | 'updateNode'
+    | 'loginUser' | 'loginAdmin' | 'healthz' | 'createZone' | 'listZones' | 'createNode' | 'listNodesByZone' | 'updateNode'
     | 'getNodeStatus'
     | 'createPool' | 'listPools' | 'setPoolNodes' | 'getPoolNodes'
     | 'createStorageType' | 'listStorageTypes' | 'getStorageType' | 'updateStorageType' | 'deleteStorageType'
     | 'createImage' | 'listImages' | 'getImage' | 'listImageNodeStatus' | 'downloadImage' | 'listImageOperations'
-    | 'createVM' | 'listVMs' | 'getVM' | 'resizeVM' | 'destroyVM' | 'startVM' | 'stopVM' | 'restartVM'
-    | 'listVMOperations' | 'importVM'
+    | 'createUser' | 'listUsers' | 'getUser' | 'updateUser' | 'deleteUser' | 'setUserStatus'
+    | 'createVM' | 'listVMs' | 'importVM' | 'getVM' | 'resizeVM' | 'destroyVM' | 'startVM' | 'stopVM' | 'restartVM'
+    | 'listVMOperations'
   >
 >
 
 /* ---------------------------------- 2.4：写操作请求体/响应体校验 ---------------------------------- */
 
-// createVM：CreateVMRequest 全字段必填，与契约一一对应
+// createVM：CreateVMRequest 必填字段不变，user_id 可选（归属用户，仅管理员可指定）
 type _AssertCreateVMReq = Assert<Equal<keyof components['schemas']['CreateVMRequest'],
-  'name' | 'cpu' | 'mem_mb' | 'disk_gb' | 'image_id' | 'storage_type_id' | 'zone_id' | 'password'>>
+  'name' | 'cpu' | 'mem_mb' | 'disk_gb' | 'image_id' | 'storage_type_id' | 'zone_id' | 'password' | 'user_id'>>
 type _AssertCreateVMReqRequired = Assert<Equal<RequiredKeys<components['schemas']['CreateVMRequest']>,
   'name' | 'cpu' | 'mem_mb' | 'disk_gb' | 'image_id' | 'storage_type_id' | 'zone_id' | 'password'>>
 // createVM 函数签名：请求体即 CreateVMRequest；响应 201 为 VMResponse + Location
@@ -308,10 +313,9 @@ type _AssertStopVMFn = Assert<Equal<ReturnType<typeof stopVM>,
 type _AssertRestartVMFn = Assert<Equal<ReturnType<typeof restartVM>,
   Promise<LocatedResponse<AcceptedResponse>>>>
 
-// importVM：ImportVMRequest 仅 zone_id/node_id/pve_vmid 必填（ip/name 可选）；
-// 响应 201 为 VMListItem（含 PVE 实时透传字段）+ Location
+// importVM：ImportVMRequest 必填字段不变（zone_id/node_id/pve_vmid），user_id 可选（归属用户）
 type _AssertImportVMReq = Assert<Equal<keyof components['schemas']['ImportVMRequest'],
-  'zone_id' | 'node_id' | 'pve_vmid' | 'ip' | 'name'>>
+  'zone_id' | 'node_id' | 'pve_vmid' | 'ip' | 'name' | 'user_id'>>
 type _AssertImportVMReqRequired = Assert<Equal<RequiredKeys<components['schemas']['ImportVMRequest']>,
   'zone_id' | 'node_id' | 'pve_vmid'>>
 type _AssertImportVMFn = Assert<Equal<Parameters<typeof importVM>[0], components['schemas']['ImportVMRequest']>>
@@ -337,11 +341,35 @@ type _AssertListOperationsFn = Assert<Equal<ReturnType<typeof listVMOperations>,
 type _AssertListOperationsTotalHeader = Assert<
   'X-Total-Count' extends keyof operations['listVMOperations']['responses'][200]['headers'] ? true : false
 >
+
+// adminLogin：请求体为 LoginRequest（契约中登录请求 schema 名，user/admin 身份域共用），
+// 响应 200 为 AdminLoginResponse；401 为契约错误体（凭证无效，由登录页展示）
+type _AssertLoginRequestFields = Assert<Equal<keyof components['schemas']['LoginRequest'],
+  'username' | 'password'>>
+type _AssertLoginRequestRequired = Assert<Equal<RequiredKeys<components['schemas']['LoginRequest']>,
+  'username' | 'password'>>
+type _AssertLoginAdminFn = Assert<Equal<Parameters<typeof adminLogin>[0],
+  components['schemas']['LoginRequest']>>
+type _AssertLoginAdminRes = Assert<Equal<ReturnType<typeof adminLogin>,
+  Promise<ApiResponse<AdminLoginResponse>>>>
+type _AssertLoginAdmin200Content = Assert<Equal<
+  operations['loginAdmin']['responses'][200]['content']['application/json'],
+  components['schemas']['AdminLoginResponse']
+>>
+type _AssertLoginAdmin401Content = Assert<Equal<
+  operations['loginAdmin']['responses'][401]['content']['application/json'],
+  components['schemas']['ErrorBody']
+>>
+// types.ts 别名与契约镜像一致（登录请求/响应；AdminLoginRequest 为 LoginRequest 语义别名）
+type _AssertAdminLoginReqAlias = Assert<Equal<AdminLoginRequest, components['schemas']['LoginRequest']>>
+type _AssertAdminLoginResAlias = Assert<Equal<AdminLoginResponse, components['schemas']['AdminLoginResponse']>>
 // types.ts 别名与契约镜像一致（操作记录相关）
 type _AssertVMOperationAlias = Assert<Equal<VMOperation, components['schemas']['VMOperation']>>
 type _AssertVMOperationsResAlias = Assert<Equal<VMOperationsResponse, components['schemas']['VMOperationsResponse']>>
+// VMOperation：操作记录字段含操作者信息（operator_type/operator_id，admin 视角完整，
+// user 视角 operator_id 脱敏省略；两者为空表示旧记录）
 type _AssertVMOperationFields = Assert<Equal<keyof components['schemas']['VMOperation'],
-  'id' | 'node_id' | 'pve_vmid' | 'action' | 'result' | 'error_message' | 'created_at'>>
+  'id' | 'node_id' | 'pve_vmid' | 'action' | 'result' | 'error_message' | 'operator_type' | 'operator_id' | 'created_at'>>
 // 生命周期/操作记录路径参数 PathVMRef 为 ext-{nodeID}-{vmid} 或数字 id 的字符串形态
 type _AssertVMOperationIdRef = Assert<Equal<
   components['parameters']['PathVMRef'],
@@ -356,7 +384,7 @@ type _AssertImageOperationAlias = Assert<Equal<ImageOperation, components['schem
 
 // 兜底引用：确保以上断言类型被程序包含（import type 已保证在类型图中）
 export type {
-  _Assert32Ops,
+  _Assert40Ops,
   _AssertCreateVMReq,
   _AssertCreateVMReqRequired,
   _AssertCreateVMFn,
@@ -460,6 +488,14 @@ export type {
   _AssertListOperationsBody,
   _AssertListOperationsFn,
   _AssertListOperationsTotalHeader,
+  _AssertLoginRequestFields,
+  _AssertLoginRequestRequired,
+  _AssertLoginAdminFn,
+  _AssertLoginAdminRes,
+  _AssertLoginAdmin200Content,
+  _AssertLoginAdmin401Content,
+  _AssertAdminLoginReqAlias,
+  _AssertAdminLoginResAlias,
   _AssertVMOperationAlias,
   _AssertVMOperationsResAlias,
   _AssertVMOperationFields,
