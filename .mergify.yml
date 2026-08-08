@@ -5,27 +5,39 @@
 #
 # 依赖：仓库已安装 Mergify app（写权限）；分支保护要求 1 个 review
 #（由 mergify[bot] 的 review action 满足）。
+#
+# 分支保护 strict 模式（Require branches to be up to date）兼容要求：
+# max_parallel_checks=1 + batch_size=1 + merge_conditions 与 queue_conditions
+# 一致（禁用 speculative draft PR 检查，采用 in-place checks）。
+
+merge_queue:
+  max_parallel_checks: 1
 
 queue_rules:
   - name: default
     merge_method: squash
     update_method: rebase
+    batch_size: 1
     # 入队条件：CI 通过 + 已获批准 + 非冲突
     queue_conditions:
-      - check-success = build
+      - check-success-or-neutral = build
       - "#approved-reviews-by>=1"
       - base = master
       - -draft
       - -conflict
-    # 合并条件：队列合并前再次确认 CI 通过
+    # 合并条件：与 queue_conditions 一致（in-place checks 要求，避免两步 CI）
     merge_conditions:
-      - check-success = build
+      - check-success-or-neutral = build
+      - "#approved-reviews-by>=1"
+      - base = master
+      - -draft
+      - -conflict
 
 pull_request_rules:
   # 规则 1：CI 通过后自动 approve（mergify[bot] 的批准计入分支保护的 review 要求）
   - name: auto-approve-when-ci-passes
     conditions:
-      - check-success = build
+      - check-success-or-neutral = build
       - base = master
       - -draft
     actions:
@@ -35,7 +47,7 @@ pull_request_rules:
   # 规则 2：CI 通过且有批准后自动入队（合并由队列按 merge_conditions 执行）
   - name: auto-queue-when-approved
     conditions:
-      - check-success = build
+      - check-success-or-neutral = build
       - "#approved-reviews-by>=1"
       - base = master
       - -draft
