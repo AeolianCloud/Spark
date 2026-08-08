@@ -31,6 +31,11 @@ const (
 	KindNotFound
 	// KindConflict：操作与现有状态冲突（名称重复、资源仍在使用中）。
 	KindConflict
+	// KindUnauthorized：凭证无效或身份不可信（登录失败、令牌非法/过期、
+	// 账号被禁用）。消息统一，不区分具体原因，防止泄露账号存在性。
+	KindUnauthorized
+	// KindForbidden：身份有效但无权访问目标资源（用户令牌访问管理员接口）。
+	KindForbidden
 )
 
 // Error 是携带 kind 和 message 的服务层错误，其消息可安全地展示给 API 客户端。
@@ -51,4 +56,14 @@ func notFoundf(format string, args ...any) *Error {
 
 func conflictf(format string, args ...any) *Error {
 	return &Error{Kind: KindConflict, Message: fmt.Sprintf(format, args...)}
+}
+
+// unauthorizedf 构造一个 KindUnauthorized 服务错误（401）。
+func unauthorizedf(format string, args ...any) *Error {
+	return &Error{Kind: KindUnauthorized, Message: fmt.Sprintf(format, args...)}
+}
+
+// forbiddenf 构造一个 KindForbidden 服务错误（403）。
+func forbiddenf(format string, args ...any) *Error {
+	return &Error{Kind: KindForbidden, Message: fmt.Sprintf(format, args...)}
 }

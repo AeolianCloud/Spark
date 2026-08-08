@@ -40,6 +40,8 @@ x-ms-error-code: not_found
 | 错误码 | HTTP 状态 | 含义 | 触发场景 |
 | --- | --- | --- | --- |
 | `bad_request` | 400 | 请求参数非法 | 请求体无法解析、必填参数缺失、路径/查询参数格式错误；镜像下载请求 `node_ids` 与 `zone_id` 同时提供或都不提供、`node_ids` 超过 64 个、`download_url` 非 http(s) 或 host 不在下载源白名单（`images.download_host_allowlist`，空列表拒绝一切下载）、`download_url` 文件名非法（非空、非 `.`/`..`、不含路径分隔符） |
+| `unauthorized` | 401 | 凭证无效或身份不可信 | 登录失败（账号不存在/密码错误/账号被禁用，消息统一不泄露原因）、令牌缺失/非法/过期/篡改（Bearer JWT 解析与声明校验失败，含无 exp、sub 非正整数、签名算法非 HS256）、身份查库失效（账号被删除或用户被禁用） |
+| `forbidden` | 403 | 身份有效但无权访问目标资源 | 用户令牌访问管理员接口（requireAdmin 拒绝） |
 | `not_found` | 404 | 资源不存在 | 引用不存在的 zone / node / ip-pool / storage-type / image / VM，或路径未匹配任何路由 |
 | `method_not_allowed` | 405 | 请求方法不允许 | 路径存在但请求方法未注册（响应携带 Allow 头列出允许的方法） |
 | `conflict` | 409 | 与现有状态冲突 | 重名（zone / storage-type / image 等唯一约束）、IP 池网段重叠、删除仍被引用的资源、镜像下载幂等拒绝（目标节点已有该镜像 running 下载） |

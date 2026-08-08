@@ -3,6 +3,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -34,6 +35,10 @@ type routerOptions struct {
 	// 为拒绝所有下载。为 nil 时镜像服务保持其内置默认白名单（与
 	// config.Default 一致）。
 	imageDownloadHostAllowlist []string
+	// jwtSecret 是 JWT 签发与校验的 HMAC-SHA256 密钥（config
+	// auth.jwt_secret）；为空时 auth 服务构造失败并 panic（config 层
+	// 已保证必填且足够长，见 G1）。
+	jwtSecret string
 }
 
 // RouterOption 定制路由的构造过程。它主要是一个测试接缝：
@@ -58,6 +63,13 @@ func WithImageClientFactory(fn func(host string, port int, apiUser, apiTokenSecr
 // 生产部署由 cmd/server 传入 config.Images.DownloadHostAllowlist。
 func WithImageDownloadHostAllowlist(hosts []string) RouterOption {
 	return func(o *routerOptions) { o.imageDownloadHostAllowlist = hosts }
+}
+
+// WithJWTSecret 注入 JWT 签发与校验密钥（config auth.jwt_secret）。
+// 生产部署由 cmd/server 传入；测试注入固定密钥以签发测试令牌。
+// 密钥为空时 registerRoutes 会 panic（config 层已保证必填且足够长）。
+func WithJWTSecret(secret string) RouterOption {
+	return func(o *routerOptions) { o.jwtSecret = secret }
 }
 
 // NewRouter 构建带中间件和全部路由的 gin 引擎。
@@ -176,6 +188,23 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	storageTypeRepo := repository.NewStorageTypeRepository(pool)
 	imageRepo := repository.NewImageRepository(pool)
 
+	// ===== 认证（task 3.x）与鉴权分层（task 4.3，设计 D4） =====
+	// auth 仓储只承担登录/鉴权的最小只读查询（任务 5.x 将新增完整
+	// User 仓储做 CRUD）。
+	authRepo := repository.NewAuthRepository(pool)
+	authSvc, err := service.NewAuthService([]byte(options.jwtSecret), authRepo)
+	if err != nil {
+		// config.validate 已强制 jwt_secret 非空且足够长（G1），密钥
+		// 为空属启动期配置错误，panic 由 middleware.Recovery 兜底。
+		panic(fmt.Errorf("auth service: %w", err))
+	}
+	// 公开组：双登录入口，不加鉴权。
+	handlers.RegisterAuthRoutes(r.Group("/auth"), authSvc)
+
+	// 受保护组：全部业务路由挂 requireAuth——解析 Bearer JWT 并按角色
+	// 查库校验身份有效（设计 D4），身份注入 gin.Context 供 handler 分流。
+	protected := r.Group("", middleware.RequireAuth([]byte(options.jwtSecret), authRepo))
+
 	// 功能服务；每对 repo/service 自成一体，因此各组之间不存在依赖环。
 	zoneSvc := service.NewZoneService(zoneRepo, nodeRepo)
 	ipPoolSvc := service.NewIPPoolService(ipPoolRepo, zoneRepo, nodeRepo)
@@ -189,26 +218,30 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 		imageSvc.SetDownloadHostAllowlist(options.imageDownloadHostAllowlist)
 	}
 
+	// 管理员专用挂载点（设计 D6）：任务 5.x 的用户 CRUD 路由将挂在这里，
+	// 如 protected.Group("", middleware.RequireAdmin()).Group("/users")
+	// ——user 令牌访问返回 403 forbidden，仅管理员令牌放行。
+
 	// ===== zones 处理器（task 4.1）+ pve nodes 处理器（task 4.2） =====
 	// RegisterZonesRoutes 接收 /zones 和 /nodes 两个分组：node 路由大多
 	// 位于 /zones/:zone_id/nodes 之下，但 PUT /nodes/:id 位于 /zones 之外。
-	handlers.RegisterZonesRoutes(r.Group("/zones"), r.Group("/nodes"), zoneSvc)
+	handlers.RegisterZonesRoutes(protected.Group("/zones"), protected.Group("/nodes"), zoneSvc)
 
 	// ===== node 实时状态处理器（task 3.x） =====
 	// RegisterNodeStatusRoutes 挂在独立的 /nodes 分组实例上（与
 	// RegisterZonesRoutes 的分组互不干扰，路由可并存）：
 	// GET /nodes/:id/status 实时拉取 PVE 状态并聚合返回。
 	nodeStatusSvc := service.NewNodeStatusService(nodeRepo)
-	handlers.RegisterNodeStatusRoutes(r.Group("/nodes"), nodeStatusSvc)
+	handlers.RegisterNodeStatusRoutes(protected.Group("/nodes"), nodeStatusSvc)
 
 	// ===== ip pool 处理器（task 5.x） =====
-	handlers.RegisterIPPoolsRoutes(r.Group("/ip-pools"), ipPoolSvc)
+	handlers.RegisterIPPoolsRoutes(protected.Group("/ip-pools"), ipPoolSvc)
 
 	// ===== storage types 处理器（task 6.1） =====
-	handlers.RegisterStorageTypesRoutes(r.Group("/storage-types"), storageTypeSvc)
+	handlers.RegisterStorageTypesRoutes(protected.Group("/storage-types"), storageTypeSvc)
 
 	// ===== images 处理器（task 6.2） =====
-	handlers.RegisterImagesRoutes(r.Group("/images"), imageSvc)
+	handlers.RegisterImagesRoutes(protected.Group("/images"), imageSvc)
 
 	// ===== vm 生命周期处理器（task 7.x） =====
 	// NewVMService 将 pool 作为其事务入口点：IP 分配/销毁的事务编排
@@ -219,5 +252,5 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	if options.vmClientFactory != nil {
 		vmSvc.SetClientFactory(options.vmClientFactory)
 	}
-	handlers.RegisterVMsRoutes(r.Group("/vms"), vmSvc)
+	handlers.RegisterVMsRoutes(protected.Group("/vms"), vmSvc)
 }

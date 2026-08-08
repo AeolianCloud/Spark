@@ -22,6 +22,10 @@ func mapServiceError(err error) error {
 		return NewError(http.StatusNotFound, CodeNotFound, serr.Message)
 	case service.KindConflict:
 		return NewError(http.StatusConflict, CodeConflict, serr.Message)
+	case service.KindUnauthorized:
+		return NewError(http.StatusUnauthorized, CodeUnauthorized, serr.Message)
+	case service.KindForbidden:
+		return NewError(http.StatusForbidden, CodeForbidden, serr.Message)
 	default:
 		return err
 	}

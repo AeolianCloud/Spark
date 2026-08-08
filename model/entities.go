@@ -80,6 +80,38 @@ type Image struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+// Admin 是管理员账号（双身份认证的管理员身份域，设计 D3）。
+// PasswordHash 保存 bcrypt 不可逆哈希（设计 D1），仅用于登录校验；
+// json:"-" 保证序列化时永不对外返回，防止哈希泄露。
+type Admin struct {
+	ID           int64     `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"-"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// User 状态常量（users.status 列取值，设计 D3）。
+const (
+	// UserStatusEnabled：启用状态，可正常登录与操作。
+	UserStatusEnabled = "enabled"
+	// UserStatusDisabled：禁用状态，登录与鉴权一律拒绝（设计 D4/D5）。
+	UserStatusDisabled = "disabled"
+)
+
+// User 是前台用户账号（双身份认证的用户身份域，设计 D3）。
+// PasswordHash 保存 bcrypt 不可逆哈希（设计 D1），仅用于登录校验；
+// json:"-" 保证序列化时永不对外返回，防止哈希泄露。
+type User struct {
+	ID           int64     `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"-"`
+	Name         string    `json:"name"`
+	Status       string    `json:"status"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 // VM 状态常量，用于虚拟机尚未（或暂时未）存在于 PVE 侧时。
 // 实时状态本身是透传的（从 PVE 查询，不存储）。
 const (
@@ -128,7 +160,10 @@ type VM struct {
 	ProvisionError string `json:"provision_error,omitempty"`
 	// Source 标识 VM 的来源（spark_created/claimed，设计 D3）。external
 	// 由列表接口对 PVE 全量摘要与本地记录实时差集判定，不落库。
-	Source    string    `json:"source"`
+	Source string `json:"source"`
+	// UserID 归属用户（vms.user_id，设计 D3）：创建/认领时可选绑定，
+	// nil（SQL NULL）表示无主 VM，与 source 互不冲突。
+	UserID    *int64    `json:"user_id,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -157,9 +192,17 @@ type VMOperation struct {
 	Result  string `json:"result"`
 	// ErrorMessage 记录失败原因；受理成功时为空。
 	ErrorMessage string `json:"error_message,omitempty"`
-	// UserID 预留：用户体系（单独提案）启用前恒为 NULL。
-	UserID    *int64    `json:"user_id,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	// UserID 是 0008 迁移预留的可空列（用户体系启用前恒为 NULL）；
+	// 实际操作者以 OperatorType / OperatorID 为准，本字段仅保留用于
+	// 与旧 schema 对齐，避免与操作者语义混淆。
+	UserID *int64 `json:"user_id,omitempty"`
+	// OperatorType 记录实际操作者的身份域（admin/user，设计 D5/D8）：
+	// admin 指管理员，user 指前台用户。
+	OperatorType string `json:"operator_type,omitempty"`
+	// OperatorID 是实际操作者在对应身份域表（admins/users）中的 ID；
+	// 与 OperatorType 均为空（nil）表示旧记录（无操作者信息）。
+	OperatorID *int64    `json:"operator_id,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // 镜像下载操作的动作与结果常量（image_operations 列取值）。
