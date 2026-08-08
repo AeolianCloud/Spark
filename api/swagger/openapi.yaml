@@ -158,6 +158,11 @@ paths:
     post:
       tags: [zones]
       summary: 创建区域
+      description: |
+        创建区域（资源容器）。区域是节点/存储/虚拟机归属的资源容器，且节点
+        注册会自动触发所属 zone 的存储扫描（SyncZone）——容器创建与存储快照
+        注入面必须由管理员控制。仅管理员令牌可访问（用户令牌返回 403
+        forbidden）。
       operationId: createZone
       requestBody:
         required: true
@@ -177,6 +182,10 @@ paths:
                 $ref: "#/components/schemas/ZoneResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
     get:
@@ -205,6 +214,12 @@ paths:
     post:
       tags: [zones]
       summary: 登记 PVE 节点
+      description: |
+        登记 PVE 节点（host/api_user/api_token 必填）。节点注册成功会自动
+        触发所属 zone 的一次存储扫描（SyncZone），从节点 PVE 拉取存储清单
+        同步本地快照——放行普通用户会形成"注册伪造节点 → 从攻击者控制的
+        服务器拉取伪造存储清单注入/篡改存储快照"的攻击链。仅管理员令牌
+        可访问（用户令牌返回 403 forbidden）。
       operationId: createNode
       parameters:
         - $ref: "#/components/parameters/PathZoneID"
@@ -226,6 +241,10 @@ paths:
                 $ref: "#/components/schemas/NodeResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -254,7 +273,11 @@ paths:
     put:
       tags: [zones]
       summary: 更新节点
-      description: 空 api_token 保留原密钥；enabled 缺省时保留现值。
+      description: |
+        更新节点的名称/PVE 集群节点名/host/凭据/启用开关；空 api_token
+        保留原密钥；enabled 缺省时保留现值。节点是存储扫描（SyncZone）的
+        数据源与虚拟机调度面，节点数据面变更必须由管理员控制。仅管理员
+        令牌可访问（用户令牌返回 403 forbidden）。
       operationId: updateNode
       parameters:
         - $ref: "#/components/parameters/PathID"
@@ -273,6 +296,10 @@ paths:
                 $ref: "#/components/schemas/NodeResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -406,37 +433,18 @@ paths:
           $ref: "#/components/responses/NotFound"
 
   /storage-types:
-    post:
-      tags: [storage-types]
-      summary: 登记存储类型
-      operationId: createStorageType
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/StorageTypeRequest"
-      responses:
-        "201":
-          description: 登记成功
-          headers:
-            Location:
-              $ref: "#/components/headers/Location"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StorageType"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "409":
-          $ref: "#/components/responses/Conflict"
     get:
       tags: [storage-types]
       summary: 存储类型列表
+      description: |
+        存储类型由扫描（POST /storage-types/scan）从 PVE 自动同步产生，
+        不再支持手动登记。响应携带按存储内容快照派生的能力布尔集合
+        （capabilities），前端据此展示"可放磁盘映像/ISO"等标签。
       operationId: listStorageTypes
       parameters:
         - $ref: "#/components/parameters/QueryLimit"
         - $ref: "#/components/parameters/QueryOffset"
+        - $ref: "#/components/parameters/QueryZoneID"
       responses:
         "200":
           description: 分页后的存储类型列表
@@ -451,11 +459,50 @@ paths:
                   $ref: "#/components/schemas/StorageType"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [storage-types]
+      summary: 触发存储扫描
+      description: |
+        对指定 zone 手动触发一次存储扫描：从该 zone 集群读取存储清单并
+        同步本地，返回同步摘要 {created, updated, deleted, skipped}。
+        zone 内没有任何可达的启用节点时返回 503 node_unavailable，且不
+        产生部分同步。节点注册成功时系统会自动触发所属 zone 的一次扫描，
+        本端点供管理员手动刷新。仅管理员令牌可访问（用户令牌返回 403
+        forbidden）。
+      operationId: scanStorageTypes
+      parameters:
+        - name: zone_id
+          in: query
+          required: true
+          description: 要扫描的区域 ID（正整数；缺失或格式非法返回 400）
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        "200":
+          description: 扫描完成，返回同步摘要
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageScanSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /storage-types/{id}:
     get:
       tags: [storage-types]
       summary: 存储类型详情
+      description: |
+        返回单个存储类型的详情（含能力派生对象）。
       operationId: getStorageType
       parameters:
         - $ref: "#/components/parameters/PathID"
@@ -468,11 +515,18 @@ paths:
                 $ref: "#/components/schemas/StorageType"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
     put:
       tags: [storage-types]
       summary: 更新存储类型
+      description: |
+        仅允许修改管理员元数据：name（业务名，可空，最长 255 字符；传空串
+        表示置空为 NULL，展示回退到 pve_storage）与 enabled（启用开关）。
+        pve_storage 是扫描权威字段，不可修改。仅管理员令牌可访问（用户
+        令牌返回 403 forbidden）。
       operationId: updateStorageType
       parameters:
         - $ref: "#/components/parameters/PathID"
@@ -481,7 +535,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/StorageTypeRequest"
+              $ref: "#/components/schemas/StorageTypeUpdateRequest"
       responses:
         "200":
           description: 更新成功
@@ -491,13 +545,18 @@ paths:
                 $ref: "#/components/schemas/StorageType"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
     delete:
       tags: [storage-types]
       summary: 删除存储类型
+      description: |
+        删除存储类型；仍被虚拟机引用的存储返回 409 conflict。仅管理员
+        令牌可访问（用户令牌返回 403 forbidden）。
       operationId: deleteStorageType
       parameters:
         - $ref: "#/components/parameters/PathID"
@@ -506,6 +565,10 @@ paths:
           description: 删除成功，无响应体
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -890,8 +953,10 @@ paths:
 
          错误场景：400 请求体非法（含 pool_id 非正整数）；区域无可用 IP 池
          （no_available_ip_pool）；镜像在该区域不可用（image_not_available_in_zone）；
-         404 区域/镜像/存储类型不存在（not_found）；409 IP 池地址耗尽（ip_exhausted）；
-         503 存在带镜像的候选节点但全部不可达/被禁用（node_unavailable）。
+         所选存储未挂载任何可调度的候选节点（storage_not_available_in_zone，
+         nodes 快照为空即不限制节点时不会触发）；404 区域/镜像/存储类型
+         不存在（not_found）；409 IP 池地址耗尽（ip_exhausted）；503 存在
+         带镜像的候选节点但全部不可达/被禁用（node_unavailable）。
       operationId: createVM
       requestBody:
         required: true
@@ -1316,7 +1381,7 @@ components:
 
   responses:
     BadRequest:
-      description: 请求参数非法（bad_request / invalid_vm_id；也用于 no_available_ip_pool / image_not_available_in_zone）
+      description: 请求参数非法（bad_request / invalid_vm_id；也用于 no_available_ip_pool / image_not_available_in_zone / storage_not_available_in_zone）
       headers:
         x-ms-error-code:
           $ref: "#/components/headers/XMSErrorCode"
@@ -1902,36 +1967,117 @@ components:
             type: integer
             format: int64
 
-    StorageTypeRequest:
+    StorageTypeUpdateRequest:
       type: object
-      required: [name, display_name, pve_storage]
+      description: |
+        更新存储类型的管理员元数据（name 与 enabled 均可省略，省略表示
+        不更新）：name 为业务名，可空，传空串（""）表示置空为 NULL，
+        展示回退到 pve_storage；enabled 为启用开关，禁用后该存储不可被
+        创建虚拟机选用。
       properties:
         name:
           type: string
-          description: 对外抽象名（唯一），如 ssd
-        display_name:
-          type: string
-          description: 展示名
-        pve_storage:
-          type: string
-          description: 真实 PVE 存储名，如 local-ssd
+          nullable: true
+          maxLength: 255
+          description: 业务名（可空，可置空；最长 255 字符，trim 后超限返回 400）
+        enabled:
+          type: boolean
+          description: 启用开关
 
     StorageType:
       type: object
-      required: [id, name, display_name, pve_storage, created_at]
+      required: [id, zone_id, name, pve_storage, enabled, type, content, nodes, capabilities, created_at]
       properties:
         id:
           type: integer
           format: int64
+        zone_id:
+          type: integer
+          format: int64
+          description: 所属区域（一个 zone 对应一个 PVE 集群）
         name:
           type: string
-        display_name:
-          type: string
+          nullable: true
+          description: 业务名；null 表示未命名，展示回退到 pve_storage
         pve_storage:
           type: string
+          description: PVE 存储名（集群内唯一），由扫描权威填充，不可手改
+        enabled:
+          type: boolean
+          description: 管理员启用开关，默认开启
+        type:
+          type: string
+          nullable: true
+          description: PVE 存储类型快照（dir/lvm/zfspool/nfs/cifs 等）；尚未扫描过的存量为 null
+        content:
+          type: string
+          nullable: true
+          description: PVE 内容能力快照（逗号分隔，如 "images,iso"）；null 表示尚未扫描，空串表示无内容类型声明
+        nodes:
+          type: array
+          items:
+            type: string
+          description: |
+            该存储挂载的节点名列表（PVE 集群节点名，与节点登记的
+            pve_name/name 对应，扫描快照不可写）；空数组 = 不限制节点、
+            所有节点可用。创建虚拟机时只在挂载了所选存储的候选节点中调度。
+        capabilities:
+          $ref: "#/components/schemas/StorageTypeCapabilities"
         created_at:
           type: string
           format: date-time
+
+    StorageTypeCapabilities:
+      type: object
+      description: |
+        由扫描快照（type/content）派生的能力布尔集合，覆盖 PVE 全部内容
+        枚举；can_download_image 仅在存储类型为 dir（本地路径类）时为
+        true（只有这类存储可代发云镜像下载）。
+      required: [can_store_images, can_store_iso, can_store_backup, can_store_vztmpl, can_store_rootdir, can_store_snippets, can_download_image]
+      properties:
+        can_store_images:
+          type: boolean
+          description: 可存放磁盘映像（创建虚拟机磁盘的硬性前提）
+        can_store_iso:
+          type: boolean
+          description: 可存放 ISO 镜像
+        can_store_backup:
+          type: boolean
+          description: 可存放备份
+        can_store_vztmpl:
+          type: boolean
+          description: 可存放容器模板
+        can_store_rootdir:
+          type: boolean
+          description: 可存放容器根目录
+        can_store_snippets:
+          type: boolean
+          description: 可存放脚本片段
+        can_download_image:
+          type: boolean
+          description: 可代发云镜像下载（dir 类型为 true）
+
+    StorageScanSummary:
+      type: object
+      description: 一次存储扫描（SyncZone）的同步摘要
+      required: [created, updated, deleted, skipped]
+      properties:
+        created:
+          type: integer
+          format: int32
+          description: PVE 存在而本地缺失、本次新建的存储数
+        updated:
+          type: integer
+          format: int32
+          description: 两边都存在、仅刷新 type/content 快照的存储数
+        deleted:
+          type: integer
+          format: int32
+          description: PVE 已消失、本次删除的存储数
+        skipped:
+          type: integer
+          format: int32
+          description: PVE 已消失但被本地 VM 引用（或并发已删）而跳过删除的存储数
 
     ImageRequest:
       type: object

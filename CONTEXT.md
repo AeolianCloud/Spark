@@ -35,7 +35,7 @@ _Avoid_: 公网 IP、弹性 IP
 _Avoid_: 模板、template
 
 **StorageType（存储类型）**:
-对 PVE 存储（如 local-ssd）的显示名抽象，供 VM 选择磁盘目标。
+对 PVE 存储（如 local-ssd）的记录，由 PVE `GET /storage` 扫描自动同步，按 zone 归属（一个 zone 对应一个 PVE 集群）。`name` 为可空业务名（展示回退 `pve_storage`），`enabled` 为管理员启用开关，`type/content` 为 PVE 能力快照（据此派生"可放磁盘映像/ISO"等能力）。PVE 上消失的存储同步删除，被 VM 引用时跳过。仅供 VM 选择磁盘目标。
 _Avoid_: storage、磁盘类型（指抽象记录时）
 
 ## 计算实例

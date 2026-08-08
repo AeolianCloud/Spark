@@ -123,9 +123,9 @@ Web 管理界面（`web/`）的生产部署（nginx 静态托管 + `/api` 反代
 | GET | `/ip-pools` | IP 池列表（可按 `zone_id` 过滤；分页） | `zone_id?`、`limit?`、`offset?` |
 | PUT | `/ip-pools/:id/nodes` | 勾选该池可用的节点白名单 | `node_ids` |
 | GET | `/ip-pools/:id/nodes` | 池的节点白名单 | — |
-| POST | `/storage-types` | 登记存储类型 | `name`、`display_name`、`pve_storage` |
-| GET | `/storage-types` | 存储类型列表（分页） | `limit?`、`offset?` |
-| GET/PUT/DELETE | `/storage-types/:id` | 存储类型查/改/删（DELETE → 204） | — |
+| POST | `/storage-types/scan` | 触发指定 zone 的存储扫描（同步入库并返回摘要） | `zone_id`（必填） |
+| GET | `/storage-types` | 存储类型列表（可按 `zone_id` 过滤；分页） | `zone_id?`、`limit?`、`offset?` |
+| GET/PUT/DELETE | `/storage-types/:id` | 存储类型查/改/删（PUT 仅 `name?`、`enabled?`；DELETE → 204；管理员） | — |
 | POST | `/images` | 登记 cloud 镜像 | `name`、`default_user`、`download_url`（http(s)，必填） |
 | GET | `/images` | 镜像列表；`?zone_id=` 返回区域内至少一个启用节点存在该镜像的条目（含各节点存在状态；分页） | `zone_id?`、`limit?`、`offset?` |
 | GET | `/images/:id` | 镜像详情 | — |
@@ -144,7 +144,7 @@ Web 管理界面（`web/`）的生产部署（nginx 静态托管 + `/api` 反代
 - **区域（zone）**：部署分区，聚合节点、IP 池与 VM。
 - **节点（pve_nodes）**：PVE 节点登记（host + API token），可启停（`enabled`）。
 - **IP 池（ip_pools / ips）**：池登记网段/网关/DNS，展开为逐地址记录；节点白名单（`ip_pool_nodes`）限定哪些节点可用该池。分配采用「随机选 + 条件 UPDATE 原子占位」，并发安全。
-- **存储抽象（storage_types）**：`name/display_name` 对外，`pve_storage` 映射真实 PVE 存储。
+- **存储（storage_types）**：由 PVE `GET /storage` 扫描自动同步（按 zone 隔离，一个 zone 一个集群）；`name` 可空（展示回退 `pve_storage`），`enabled` 控制是否可被 VM 选用；`type/content` 快照派生能力（磁盘映像/ISO 等）；PVE 上消失的存储同步删除（被 VM 引用时跳过）。
 - **镜像目录（images）**：登记镜像元数据（`name`/`default_user`/`download_url`）；镜像在各节点的存在状态由 PVE 实时扫描（local 存储 import content，即 `/var/lib/vz/import/`）；区域可用镜像 = 区域内至少一个启用节点存在该镜像。
 - **VM 状态语义**：DB 不存状态镜像（穿透式）。创建返回 `creating`；异步供给链失败后详情/列表返回 `failed`（`provision_error` 携带原因）；供给成功后的状态实时读取自 PVE（`running`/`stopped` 等）。
 

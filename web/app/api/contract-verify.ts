@@ -11,10 +11,10 @@ import type { createVM, destroyVM, getVM, importVM, listVMOperations, listVMs, r
 import type { createNode, getNodeStatus, updateNode } from './nodes'
 import type { createPool, listPools, setPoolNodes } from './pools'
 import type { createImage, downloadImage, getImage, getImageNodeStatus, listImageOperations, listImages, listImagesByZone } from './images'
-import type { createStorageType, listStorageTypes, updateStorageType } from './storage-types'
+import type { listStorageTypes, scanStorageTypes, updateStorageType } from './storage-types'
 import type { createZone, listZones } from './zones'
 import type { ApiResponse, LocatedResponse, ListResponse } from './client'
-import type { AcceptedResponse, AdminLoginRequest, AdminLoginResponse, Image, ImageDownloadRequest, ImageOperation, ImageZoneItem, NodeImageStatus, NodeResponse, NodeStatusResponse, StorageType, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
+import type { AcceptedResponse, AdminLoginRequest, AdminLoginResponse, Image, ImageDownloadRequest, ImageOperation, ImageZoneItem, NodeImageStatus, NodeResponse, NodeStatusResponse, StorageScanSummary, StorageType, StorageTypeCapabilities, VMListItem, VMListResponse, VMOperation, VMOperationsResponse, VMResponse, ZoneResponse } from './types'
 
 /** 恒真断言：约束类型推导结果必须为 true */
 type Assert<T extends true> = T
@@ -37,7 +37,7 @@ type _Assert40Ops = Assert<
     | 'loginUser' | 'loginAdmin' | 'healthz' | 'createZone' | 'listZones' | 'createNode' | 'listNodesByZone' | 'updateNode'
     | 'getNodeStatus'
     | 'createPool' | 'listPools' | 'setPoolNodes' | 'getPoolNodes'
-    | 'createStorageType' | 'listStorageTypes' | 'getStorageType' | 'updateStorageType' | 'deleteStorageType'
+    | 'listStorageTypes' | 'scanStorageTypes' | 'getStorageType' | 'updateStorageType' | 'deleteStorageType'
     | 'createImage' | 'listImages' | 'getImage' | 'listImageNodeStatus' | 'downloadImage' | 'listImageOperations'
     | 'createUser' | 'listUsers' | 'getUser' | 'updateUser' | 'deleteUser' | 'setUserStatus'
     | 'createVM' | 'listVMs' | 'importVM' | 'getVM' | 'resizeVM' | 'destroyVM' | 'startVM' | 'stopVM' | 'restartVM'
@@ -222,17 +222,15 @@ type _AssertListImageOpsTotalHeader = Assert<
   'X-Total-Count' extends keyof operations['listImageOperations']['responses'][200]['headers'] ? true : false
 >
 
-// createStorageType/updateStorageType：StorageTypeRequest 全字段必填（name/display_name/pve_storage）
-type _AssertStorageTypeReq = Assert<Equal<keyof components['schemas']['StorageTypeRequest'],
-  'name' | 'display_name' | 'pve_storage'>>
-type _AssertStorageTypeReqRequired = Assert<Equal<RequiredKeys<components['schemas']['StorageTypeRequest']>,
-  'name' | 'display_name' | 'pve_storage'>>
-type _AssertCreateStorageTypeFn = Assert<Equal<Parameters<typeof createStorageType>[0],
-  components['schemas']['StorageTypeRequest']>>
+// updateStorageType：StorageTypeUpdateRequest 全字段可选（name 可空可省略、enabled 可省略，
+// 省略表示不更新）；display_name/pve_storage 不可写（扫描权威字段），POST 手动登记已移除
+type _AssertStorageTypeReq = Assert<Equal<keyof components['schemas']['StorageTypeUpdateRequest'],
+  'name' | 'enabled'>>
+type _AssertStorageTypeReqOptional = Assert<Equal<OptionalKeys<components['schemas']['StorageTypeUpdateRequest']>,
+  'name' | 'enabled'>>
+type _AssertStorageTypeReqNameNullable = Assert<Equal<components['schemas']['StorageTypeUpdateRequest']['name'], string | null | undefined>>
 type _AssertUpdateStorageTypeFn = Assert<Equal<Parameters<typeof updateStorageType>[1],
-  components['schemas']['StorageTypeRequest']>>
-type _AssertCreateStorageTypeRes = Assert<Equal<ReturnType<typeof createStorageType>,
-  Promise<LocatedResponse<StorageType>>>>
+  components['schemas']['StorageTypeUpdateRequest']>>
 type _AssertUpdateStorageTypeRes = Assert<Equal<ReturnType<typeof updateStorageType>,
   Promise<ApiResponse<StorageType>>>>
 type _AssertStorageTypeContent = Assert<Equal<
@@ -240,8 +238,41 @@ type _AssertStorageTypeContent = Assert<Equal<
   components['schemas']['StorageType']
 >>
 
-// 列表端点 query 参数：limit/offset 可选；listImages 契约 query 另有可选 zone_id（区域过滤）。
-// 无区域封装（listImages）不带 zone_id；区域过滤由 listImagesByZone（首位必填 zoneId 参数）承载，
+// StorageType：含 zone_id/enabled/type/content/nodes 与嵌套 capabilities（六枚举 + can_download_image），
+// name 可空（null），无 display_name（已移除）
+type _AssertStorageTypeFields = Assert<Equal<keyof components['schemas']['StorageType'],
+  'id' | 'zone_id' | 'name' | 'pve_storage' | 'enabled' | 'type' | 'content' | 'nodes' | 'capabilities' | 'created_at'>>
+type _AssertStorageTypeNameNullable = Assert<Equal<components['schemas']['StorageType']['name'], string | null>>
+// nodes：挂载节点名列表（string[]），空数组 = 不限制节点、所有节点可用（扫描快照不可写）
+type _AssertStorageTypeNodes = Assert<Equal<components['schemas']['StorageType']['nodes'], string[]>>
+type _AssertStorageTypeNoDisplayName = Assert<'display_name' extends keyof components['schemas']['StorageType'] ? false : true>
+type _AssertStorageTypeCapabilitiesAlias = Assert<Equal<StorageTypeCapabilities,
+  components['schemas']['StorageTypeCapabilities']>>
+type _AssertStorageTypeCapabilitiesFields = Assert<Equal<keyof components['schemas']['StorageTypeCapabilities'],
+  'can_store_images' | 'can_store_iso' | 'can_store_backup' | 'can_store_vztmpl' | 'can_store_rootdir' | 'can_store_snippets' | 'can_download_image'>>
+
+// scanStorageTypes：query 必填 zone_id（正整数）；200 响应体为 StorageScanSummary；
+// 封装函数首位必填 zoneId 参数，返回 ApiResponse<StorageScanSummary>
+type _AssertScanStorageTypesQuery = Assert<Equal<
+  Exclude<operations['scanStorageTypes']['parameters']['query'], undefined>,
+  { zone_id: components['parameters']['QueryZoneID'] }
+>>
+type _AssertScanStorageTypesContent = Assert<Equal<
+  operations['scanStorageTypes']['responses'][200]['content']['application/json'],
+  components['schemas']['StorageScanSummary']
+>>
+type _AssertScanStorageTypesFn = Assert<Equal<Parameters<typeof scanStorageTypes>[0],
+  components['parameters']['QueryZoneID']>>
+type _AssertScanStorageTypesRes = Assert<Equal<ReturnType<typeof scanStorageTypes>,
+  Promise<ApiResponse<StorageScanSummary>>>>
+type _AssertStorageScanSummaryAlias = Assert<Equal<StorageScanSummary,
+  components['schemas']['StorageScanSummary']>>
+type _AssertStorageScanSummaryFields = Assert<Equal<keyof components['schemas']['StorageScanSummary'],
+  'created' | 'updated' | 'deleted' | 'skipped'>>
+
+// 列表端点 query 参数：limit/offset 可选；listImages/listStorageTypes 契约 query 另有可选
+// zone_id（区域过滤）。无区域封装（listImages）不带 zone_id；区域过滤由 listImagesByZone
+// （首位必填 zoneId 参数）承载；listStorageTypes 直接以可选 zone_id 参数承载区域过滤。
 // 两者共享 limit/offset 分页参数，与契约 query 的 limit/offset 类型一致
 // （契约 query 类型为 `{...} | undefined`；封装函数参数带默认值故 Parameters 亦含 undefined，
 //   两侧均 Exclude 后逐一比对）
@@ -453,12 +484,23 @@ export type {
   _AssertListImageOpsFn,
   _AssertListImageOpsTotalHeader,
   _AssertStorageTypeReq,
-  _AssertStorageTypeReqRequired,
-  _AssertCreateStorageTypeFn,
+  _AssertStorageTypeReqOptional,
+  _AssertStorageTypeReqNameNullable,
   _AssertUpdateStorageTypeFn,
-  _AssertCreateStorageTypeRes,
   _AssertUpdateStorageTypeRes,
   _AssertStorageTypeContent,
+  _AssertStorageTypeFields,
+  _AssertStorageTypeNameNullable,
+  _AssertStorageTypeNodes,
+  _AssertStorageTypeNoDisplayName,
+  _AssertStorageTypeCapabilitiesAlias,
+  _AssertStorageTypeCapabilitiesFields,
+  _AssertScanStorageTypesQuery,
+  _AssertScanStorageTypesContent,
+  _AssertScanStorageTypesFn,
+  _AssertScanStorageTypesRes,
+  _AssertStorageScanSummaryAlias,
+  _AssertStorageScanSummaryFields,
   _AssertListZonesQuery,
   _AssertListPoolsQuery,
   _AssertListStorageTypesQuery,

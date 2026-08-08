@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sort"
@@ -30,6 +31,10 @@ type routerOptions struct {
 	// 为 nil 时保持默认值（https://{host}:{port}/api2/json，port 取
 	// 节点持久化的端口）。
 	imageClientFactory func(host string, port int, apiUser, apiTokenSecret string) *pve.Client
+	// storageTypeClientFactory 在设置时替换存储类型服务（扫描）的 PVE
+	// 客户端工厂；为 nil 时保持默认值（https://{host}:{port}/api2/json，
+	// port 取节点持久化的端口）。
+	storageTypeClientFactory func(host string, port int, apiUser, apiTokenSecret string) *pve.Client
 	// imageDownloadHostAllowlist 是镜像下载源域名白名单（SSRF 面控制）：
 	// download_url 的 host 必须精确命中才受理镜像创建与下载；空列表语义
 	// 为拒绝所有下载。为 nil 时镜像服务保持其内置默认白名单（与
@@ -56,6 +61,13 @@ func WithVMClientFactory(fn func(host string, port int, apiUser, apiTokenSecret 
 // 镜像存在性扫描与下载编排指向模拟 PVE 服务器。
 func WithImageClientFactory(fn func(host string, port int, apiUser, apiTokenSecret string) *pve.Client) RouterOption {
 	return func(o *routerOptions) { o.imageClientFactory = fn }
+}
+
+// WithStorageTypeClientFactory 覆盖存储类型服务（扫描）使用的 PVE 客户端
+// 工厂，使测试可以将存储扫描（SyncZone 的集群级 GET /storage）指向模拟
+// PVE 服务器；否则扫描会连接节点登记的默认端口（8006）。
+func WithStorageTypeClientFactory(fn func(host string, port int, apiUser, apiTokenSecret string) *pve.Client) RouterOption {
+	return func(o *routerOptions) { o.storageTypeClientFactory = fn }
 }
 
 // WithImageDownloadHostAllowlist 覆盖镜像服务用于下载受理校验的域名白名单
@@ -208,7 +220,18 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	// 功能服务；每对 repo/service 自成一体，因此各组之间不存在依赖环。
 	zoneSvc := service.NewZoneService(zoneRepo, nodeRepo)
 	ipPoolSvc := service.NewIPPoolService(ipPoolRepo, zoneRepo, nodeRepo)
-	storageTypeSvc := service.NewStorageTypeService(storageTypeRepo)
+	// 存储类型服务依赖节点仓储（扫描时选 zone 的首个可达启用节点执行
+	// 集群级 GET /storage）与 zone 仓储（校验扫描目标 zone 存在）。
+	storageTypeSvc := service.NewStorageTypeService(storageTypeRepo, nodeRepo, zoneRepo)
+	if options.storageTypeClientFactory != nil {
+		storageTypeSvc.SetClientFactory(options.storageTypeClientFactory)
+	}
+	// 节点注册成功后自动触发所属 zone 的一次存储扫描（设计 D6）：扫描是
+	// 注册主流程的副作用，失败仅记日志、绝不阻断节点注册返回。
+	zoneSvc.SetStorageSync(func(ctx context.Context, zoneID int64) error {
+		_, err := storageTypeSvc.SyncZone(ctx, zoneID)
+		return err
+	})
 	imageOpRepo := repository.NewImageOperationRepository(pool)
 	imageSvc := service.NewImageService(imageRepo, nodeRepo, imageOpRepo)
 	if options.imageClientFactory != nil {
@@ -227,9 +250,16 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	handlers.RegisterUsersRoutes(protected.Group("/users", middleware.RequireAdmin()), userSvc)
 
 	// ===== zones 处理器（task 4.1）+ pve nodes 处理器（task 4.2） =====
-	// RegisterZonesRoutes 接收 /zones 和 /nodes 两个分组：node 路由大多
-	// 位于 /zones/:zone_id/nodes 之下，但 PUT /nodes/:id 位于 /zones 之外。
-	handlers.RegisterZonesRoutes(protected.Group("/zones"), protected.Group("/nodes"), zoneSvc)
+	// 权限粒度拆分（H1 安全修复）：读操作（GET /zones、GET
+	// /zones/:zone_id/nodes）只挂 requireAuth；写操作（POST /zones、POST
+	// /zones/:zone_id/nodes、PUT /nodes/:id）挂 requireAdmin——节点注册成功
+	// 会自动触发所属 zone 的存储扫描（SyncZone），若放行 user 会形成
+	// "注册伪造节点 → 从攻击者控制的服务器拉取伪造存储清单注入快照"的攻击
+	// 链；zone 创建同为资源容器写操作一并收紧。PUT /nodes/:id 位于
+	// /zones 之外，单独挂 admin 分组。
+	handlers.RegisterZonesRoutes(protected.Group("/zones"),
+		protected.Group("/zones", middleware.RequireAdmin()),
+		protected.Group("/nodes", middleware.RequireAdmin()), zoneSvc)
 
 	// ===== node 实时状态处理器（task 3.x） =====
 	// RegisterNodeStatusRoutes 挂在独立的 /nodes 分组实例上（与
@@ -242,7 +272,13 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	handlers.RegisterIPPoolsRoutes(protected.Group("/ip-pools"), ipPoolSvc)
 
 	// ===== storage types 处理器（task 6.1） =====
-	handlers.RegisterStorageTypesRoutes(protected.Group("/storage-types"), storageTypeSvc)
+	// 权限粒度拆分（B1）：读操作（GET 列表/详情）只挂 requireAuth——
+	// storage_type_id 是 user 创建 VM 的必填字段，存储列表/详情是创建
+	// 流程的必要输入（与 /images、/ip-pools 的粒度一致）；写操作（扫描/
+	// 改名/启停/删除）挂 requireAdmin——user 令牌访问返回 403 forbidden。
+	// 两组路径相同但中间件不同，gin 允许同名分组共存。
+	handlers.RegisterStorageTypesRoutes(protected.Group("/storage-types"),
+		protected.Group("/storage-types", middleware.RequireAdmin()), storageTypeSvc)
 
 	// ===== images 处理器（task 6.2） =====
 	handlers.RegisterImagesRoutes(protected.Group("/images"), imageSvc)

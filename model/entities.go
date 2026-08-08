@@ -61,13 +61,35 @@ type IP struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// StorageType 用一个显示名称对 PVE 存储（如 local-ssd）进行抽象。
+// StorageType 抽象一个由扫描同步产生的 PVE 存储（如 local-ssd），按 zone
+// 归属（一个 zone 对应一个 PVE 集群）。pve_storage/type/content 由扫描权威
+// 填充（只读），name（业务名）与 enabled（启用开关）由管理员维护；name 为
+// 空时对外展示回退到 pve_storage。
 type StorageType struct {
-	ID          int64     `json:"id"`
-	Name        string    `json:"name"`
-	DisplayName string    `json:"display_name"`
-	PVEStorage  string    `json:"pve_storage"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID     int64 `json:"id"`
+	ZoneID int64 `json:"zone_id"`
+	// Name 是业务名；扫描新建时为 NULL（nil），展示时回退到 pve_storage。
+	// JSON 序列化 name 为 null 时输出 null 而非省略字段（不加 omitempty）。
+	Name *string `json:"name"`
+	// PVEStorage 是 PVE 存储名（集群内唯一），由扫描权威决定，不可手改。
+	PVEStorage string `json:"pve_storage"`
+	// Enabled 是管理员启用开关，默认开启；禁用后该存储不可被创建 VM 选用。
+	Enabled bool `json:"enabled"`
+	// Type 是 PVE 存储类型快照（dir/lvm/zfspool/nfs/cifs 等）；
+	// 尚未扫描过的存量行为 NULL（nil）。
+	Type *string `json:"type"`
+	// Content 是 PVE 内容能力快照（逗号分隔，如 "images,iso"）；
+	// 尚未扫描过的存量行为 NULL（nil），空串表示无内容类型声明。
+	Content *string `json:"content"`
+	// Nodes 是该存储挂载的节点名列表（PVE GET /storage 的 nodes 快照，
+	// 由逗号分隔原文拆分而来，节点名与 PVE 集群节点名一致）；空切片
+	// （[]）表示不限制节点、所有节点可用（设计 D8）。由扫描权威填充，
+	// 管理员不可经 API 修改；创建 VM 调度时据此过滤候选节点。
+	// 用 []string 值而非指针：序列化始终输出数组，nil 一律归一为空
+	// 切片（不省略字段），避免 null/[] 双形态。
+	Nodes []string `json:"nodes"`
+	// CreatedAt 是行创建时间。
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Image 是已注册的云镜像条目，包含名称、默认登录用户与下载地址

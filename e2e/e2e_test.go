@@ -57,6 +57,16 @@ type fakePVEVM struct {
 	template bool
 }
 
+// fakePVEStorage 是 fake 服务器上登记的一个集群存储（GET /storage 应答）。
+type fakePVEStorage struct {
+	storage string
+	stype   string
+	content string
+	// nodes 是存储的节点挂载快照原文（真实 PVE 为逗号分隔字符串，如
+	// "pve1,pve2"）；空串 = 不限制节点、所有节点可用（设计 D8）。
+	nodes string
+}
+
 // fakePVE 是服务所依赖的 PVE JSON API 端点的内存实现。
 // 所有状态都由 mu 保护：应用的后台配置 goroutine 与测试 goroutine 会并发访问它。
 type fakePVE struct {
@@ -65,6 +75,15 @@ type fakePVE struct {
 	mu       sync.Mutex
 	nextVMID int64
 	vms      map[int64]*fakePVEVM
+	// storages 是集群存储清单（GET /storage 应答，按存储名索引），供
+	// 存储扫描（SyncZone 的集群级 GET /storage）使用。初始预置
+	// local/local-lvm/iso-store 三个存储（见 newFakePVE），测试可经
+	// setStorage/removeStorage 增删以驱动扫描的 created/deleted 语义。
+	storages map[string]fakePVEStorage
+	// clusterNodes 是集群节点名列表（GET /nodes 应答）。默认只含 pve1
+	// （与多数测试的单节点假设一致）；需要多节点调度场景时经
+	// addClusterNode 扩充（节点注册按该列表校验业务名）。
+	clusterNodes []string
 	// statusErrors 让指定 vmid 的 status 操作（start/stop/reboot）返回
 	// PVE 错误（HTTP 500 + errors 封装）：模拟 PVE 拒绝操作，供"失败
 	// 操作也写入审计记录"的端到端断言使用。值为 PVE 错误消息。
@@ -81,7 +100,45 @@ type fakePVE struct {
 }
 
 func newFakePVE(t *testing.T) *fakePVE {
-	return &fakePVE{t: t, nextVMID: 100, vms: map[int64]*fakePVEVM{}, statusErrors: map[int64]string{}, importFiles: map[string][]string{}}
+	return &fakePVE{
+		t: t, nextVMID: 100, vms: map[int64]*fakePVEVM{},
+		statusErrors: map[int64]string{},
+		importFiles:  map[string][]string{},
+		// 预置集群存储（GET /storage 应答）：local（dir，可放镜像/ISO，
+		// 供云镜像下载与 import 目录，只挂 pve1）、local-lvm（lvm，虚拟机
+		// 磁盘目标，挂 pve1+pve2，与既有 e2e 的 scsi0=local-lvm 断言一致）、
+		// iso-store（dir，仅 ISO，未声明节点挂载 = 不限制节点，用于"不支持
+		// 磁盘映像的存储被拒"场景）。
+		storages: map[string]fakePVEStorage{
+			"local":     {storage: "local", stype: "dir", content: "images,iso", nodes: "pve1"},
+			"local-lvm": {storage: "local-lvm", stype: "lvm", content: "images,rootdir", nodes: "pve1,pve2"},
+			"iso-store": {storage: "iso-store", stype: "dir", content: "iso", nodes: ""},
+		},
+		clusterNodes: []string{"pve1"},
+	}
+}
+
+// setStorage 向集群存储清单登记（或覆盖）一个存储，供扫描的 created/
+// updated 语义使用。nodes 为该存储的节点挂载快照原文（逗号分隔或空串）。
+func (f *fakePVE) setStorage(name, stype, content, nodes string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.storages[name] = fakePVEStorage{storage: name, stype: stype, content: content, nodes: nodes}
+}
+
+// removeStorage 从集群存储清单移除一个存储，供扫描的 deleted 语义使用。
+func (f *fakePVE) removeStorage(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.storages, name)
+}
+
+// addClusterNode 向集群节点名列表追加一个节点，使同名节点可以登记成功
+// （多节点调度场景，设计 D8）。
+func (f *fakePVE) addClusterNode(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clusterNodes = append(f.clusterNodes, name)
 }
 
 // addImportFile 向指定存储登记一个已下载完成的镜像文件（模拟 PVE 侧
@@ -134,8 +191,29 @@ func (f *fakePVE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == "/version" && r.Method == http.MethodGet:
 		f.writeJSON(w, map[string]any{"version": "8.2.7", "release": "8.2", "repoid": "fake"})
 	case p == "/nodes" && r.Method == http.MethodGet:
-		// 集群节点名列表（任务 4.1 探测入口）：fake 集群只有一个节点 pve1。
-		f.writeJSON(w, []map[string]any{{"node": "pve1", "status": "online"}})
+		// 集群节点名列表（任务 4.1 探测入口）：默认单节点 pve1，多节点
+		// 场景经 addClusterNode 扩充。
+		f.mu.Lock()
+		list := make([]map[string]any, 0, len(f.clusterNodes))
+		for _, n := range f.clusterNodes {
+			list = append(list, map[string]any{"node": n, "status": "online"})
+		}
+		f.mu.Unlock()
+		f.writeJSON(w, list)
+	case p == "/storage" && r.Method == http.MethodGet:
+		// 集群级存储清单（存储扫描数据源）：nodes 按真实 PVE 形态返回
+		// 逗号分隔字符串（空串 = 不限制节点），shared 返回数字 1/0
+		// （PveBool 双格式兼容）。
+		f.mu.Lock()
+		list := make([]map[string]any, 0, len(f.storages))
+		for _, s := range f.storages {
+			list = append(list, map[string]any{
+				"storage": s.storage, "type": s.stype, "content": s.content,
+				"shared": 1, "nodes": s.nodes,
+			})
+		}
+		f.mu.Unlock()
+		f.writeJSON(w, list)
 	case p == "/cluster/nextid" && r.Method == http.MethodGet:
 		f.mu.Lock()
 		vmid := f.nextVMID
@@ -561,6 +639,51 @@ type opExpect struct {
 	vmid   int64
 }
 
+// e2eStorageTypeID 从 GET /storage-types?zone_id=X 的响应中查找 pve_storage
+// 匹配的存储类型并返回其 id。存储类型由扫描自动产生（节点注册自动触发、
+// 或 POST /storage-types/scan 手动触发），不再支持手动登记（提案
+// auto-scan-pve-storage 移除 POST /storage-types）。
+func e2eStorageTypeID(t *testing.T, client *http.Client, token, base string, zoneID int64, pveStorage string) int64 {
+	t.Helper()
+	list := e2eDo(t, client, token, base, http.MethodGet,
+		fmt.Sprintf("/storage-types?zone_id=%d", zoneID), nil, http.StatusOK).([]any)
+	for _, raw := range list {
+		st := e2eObj(t, raw)
+		if st["pve_storage"] == pveStorage {
+			id, ok := st["id"].(float64)
+			if !ok {
+				t.Fatalf("storage type %s has no numeric id: %+v", pveStorage, st)
+			}
+			return int64(id)
+		}
+	}
+	t.Fatalf("GET /storage-types?zone_id=%d has no storage %q (all: %+v)", zoneID, pveStorage, list)
+	return 0
+}
+
+// e2eWaitProvisioned 轮询 VM 详情直至脱离 creating/failed（预算 15 秒，
+// 与 TestE2EVMFullLifecycle 的等待模式一致）：配置失败即为测试失败并打印
+// 脱敏的 provision_error。返回最终详情供调用方继续断言。
+func e2eWaitProvisioned(t *testing.T, client *http.Client, token, base string, vmID int64) map[string]any {
+	t.Helper()
+	var detail map[string]any
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		detail = e2eObj(t, e2eDo(t, client, token, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
+		switch detail["status"] {
+		case "failed":
+			t.Fatalf("provisioning failed: %v", detail["provision_error"])
+		case "creating":
+			if time.Now().After(deadline) {
+				t.Fatalf("provisioning did not finish within 15s (last status %q)", detail["status"])
+			}
+			time.Sleep(200 * time.Millisecond)
+		default:
+			return detail
+		}
+	}
+}
+
 // e2eOperations 请求 GET /vms/{ref}/operations（ref 为数字本地行 id 或
 // ext- 合成标识），断言记录数等于 want 且按时间倒序逐条匹配动作/结果/
 // 节点/VMID，并检查 created_at 非空。返回解析出的记录供调用方补充
@@ -633,6 +756,14 @@ func TestE2EVMNoPoolRejected(t *testing.T) {
 				pve.WithPort(port),
 				pve.WithHTTPClient(pveServer.Client()),
 				pve.WithTimeout(5*time.Second))
+		}),
+		// 存储扫描（SyncZone 的集群级 GET /storage）同样需要指向 fake PVE
+		// 的客户端工厂。
+		api.WithStorageTypeClientFactory(func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+			return pve.NewClient(host, apiUser, apiTokenSecret,
+				pve.WithPort(port),
+				pve.WithHTTPClient(pveServer.Client()),
+				pve.WithTimeout(5*time.Second))
 		}))
 	app := httptest.NewServer(router)
 	defer app.Close()
@@ -651,10 +782,10 @@ func TestE2EVMNoPoolRejected(t *testing.T) {
 		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
 		http.StatusCreated)
 
-	st := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/storage-types", map[string]any{
-		"name": "ssd", "display_name": "SSD", "pve_storage": "local-lvm",
-	}, http.StatusCreated))
-	stID := int64(st["id"].(float64))
+	// 存储类型由节点注册成功时自动触发的一次存储扫描产生（提案
+	// auto-scan-pve-storage：POST /storage-types 已移除）：fake /storage
+	// 预置 local/local-lvm/iso-store，注册节点后自动同步到本地。
+	stID := e2eStorageTypeID(t, client, adminToken, base, zoneID, "local-lvm")
 
 	img := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/images", map[string]any{
 		"name":         "debian-12-cloud",
@@ -721,6 +852,14 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 		// port 是节点的 API 端口。客户端按默认 https 构造 base URL 后由
 		// WithPort 覆盖端口，请求真实打到 fake PVE 的监听端口（任务 6.3）。
 		api.WithVMClientFactory(func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+			return pve.NewClient(host, apiUser, apiTokenSecret,
+				pve.WithPort(port),
+				pve.WithHTTPClient(pveServer.Client()),
+				pve.WithTimeout(5*time.Second))
+		}),
+		// 存储扫描（SyncZone 的集群级 GET /storage）同样需要指向 fake PVE
+		// 的客户端工厂。
+		api.WithStorageTypeClientFactory(func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 			return pve.NewClient(host, apiUser, apiTokenSecret,
 				pve.WithPort(port),
 				pve.WithHTTPClient(pveServer.Client()),
@@ -801,10 +940,10 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	e2eDo(t, client, adminToken, base, http.MethodPut, fmt.Sprintf("/ip-pools/%d/nodes", poolID),
 		map[string]any{"node_ids": []int64{nodeID}}, http.StatusOK)
 
-	st := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/storage-types", map[string]any{
-		"name": "ssd", "display_name": "SSD", "pve_storage": "local-lvm",
-	}, http.StatusCreated))
-	stID := int64(st["id"].(float64))
+	// 存储类型由节点注册成功时自动触发的一次存储扫描产生（提案
+	// auto-scan-pve-storage：POST /storage-types 已移除）：fake /storage
+	// 预置 local/local-lvm/iso-store，注册节点后自动同步到本地。
+	stID := e2eStorageTypeID(t, client, adminToken, base, zoneID, "local-lvm")
 
 	img := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/images", map[string]any{
 		"name":         "debian-12-cloud",
@@ -1831,7 +1970,10 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 		// 密钥 panic；登录/鉴权链路使用该密钥签发与校验测试令牌。
 		api.WithJWTSecret(e2eJWTSecret),
 		api.WithVMClientFactory(newFakeClient),
-		api.WithImageClientFactory(newFakeClient))
+		api.WithImageClientFactory(newFakeClient),
+		// 存储扫描（SyncZone 的集群级 GET /storage）同样需要指向 fake PVE
+		// 的客户端工厂。
+		api.WithStorageTypeClientFactory(newFakeClient))
 	app := httptest.NewServer(router)
 	defer app.Close()
 
@@ -1863,10 +2005,10 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 	poolID := int64(poolRes["id"].(float64))
 	e2eDo(t, client, adminToken, base, http.MethodPut, fmt.Sprintf("/ip-pools/%d/nodes", poolID),
 		map[string]any{"node_ids": []int64{nodeID}}, http.StatusOK)
-	st := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/storage-types", map[string]any{
-		"name": "ssd", "display_name": "SSD", "pve_storage": "local-lvm",
-	}, http.StatusCreated))
-	stID := int64(st["id"].(float64))
+	// 存储类型由节点注册成功时自动触发的一次存储扫描产生（提案
+	// auto-scan-pve-storage：POST /storage-types 已移除）：fake /storage
+	// 预置 local/local-lvm/iso-store，注册节点后自动同步到本地。
+	stID := e2eStorageTypeID(t, client, adminToken, base, zoneID, "local-lvm")
 
 	// 1. 登记镜像（download_url）：登记本身不产生任何节点上的文件。
 	const imgURL = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
@@ -2034,4 +2176,365 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 	if upid, ok := failedOp["upid"]; ok && upid != "" {
 		t.Fatalf("failed op upid = %v, want empty (受理失败)", upid)
 	}
+}
+
+// TestE2EStorageScan 覆盖存储扫描的端到端语义（提案 auto-scan-pve-storage）：
+// 节点注册成功自动触发所属 zone 的一次扫描（fake /storage 预置
+// local/local-lvm/iso-store）；列表返回能力派生（capabilities）；手动
+// POST /storage-types/scan 对新增/消失的存储同步（created/deleted）且不
+// 覆盖管理员的 name/enabled；PUT 仅能修改 name/enabled；创建 VM 选禁用
+// 或不支持磁盘映像的存储被 400 拒绝；被 VM 引用的消失存储跳过删除
+// （skipped），VM 清理后再次扫描即删除。
+func TestE2EStorageScan(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+
+	pool, err := database.New(ctx, e2eDSN())
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	defer pool.Close()
+
+	if err := database.Migrate(ctx, pool, database.MigrationFS); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	truncateBusinessTables(t, ctx, pool)
+	defer truncateBusinessTables(t, ctx, pool)
+
+	fakePVE := newFakePVE(t)
+	pveServer := httptest.NewTLSServer(fakePVE)
+	defer pveServer.Close()
+	pvePort := pveServer.Listener.Addr().(*net.TCPAddr).Port
+
+	newFakeClient := func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient(host, apiUser, apiTokenSecret,
+			pve.WithPort(port),
+			pve.WithHTTPClient(pveServer.Client()),
+			pve.WithTimeout(5*time.Second))
+	}
+	router := api.NewRouter(pool, e2eCipher(t),
+		api.WithJWTSecret(e2eJWTSecret),
+		api.WithVMClientFactory(newFakeClient),
+		api.WithStorageTypeClientFactory(newFakeClient))
+	app := httptest.NewServer(router)
+	defer app.Close()
+
+	client := app.Client()
+	base := app.URL
+
+	adminToken := e2eAdminToken(t, ctx, pool, client, base, "e2e-storage-admin", "e2e-storage-pass")
+
+	// 1. 创建 zone 并注册节点：注册成功自动触发一次存储扫描（同步副作用，
+	// 节点注册响应返回前已完成）。
+	zone := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/zones",
+		map[string]any{"name": "e2e-storage-zone"}, http.StatusCreated))
+	zoneID := int64(zone["id"].(float64))
+	node := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/zones/%d/nodes", zoneID),
+		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
+		http.StatusCreated))
+	nodeID := int64(node["id"].(float64))
+
+	// 1b. 多节点调度场景（设计 D8）：fake 集群追加 pve2（/nodes 应答），
+	// 注册第二个节点 pve2 成功（注册按 /nodes 校验业务名），并再次自动
+	// 触发一次存储扫描（幂等）。
+	fakePVE.addClusterNode("pve2")
+	node2 := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/zones/%d/nodes", zoneID),
+		map[string]any{"name": "pve2", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
+		http.StatusCreated))
+	node2ID := int64(node2["id"].(float64))
+
+	// 2. 自动扫描结果：local/local-lvm/iso-store 已落库，业务名为 null
+	//（展示回退 pve_storage）、默认启用；capabilities 按 type/content 快照
+	// 派生（dir 存储可下载镜像，lvm 不可）。
+	listStorage := func() map[string]map[string]any {
+		t.Helper()
+		raw := e2eDo(t, client, adminToken, base, http.MethodGet,
+			fmt.Sprintf("/storage-types?zone_id=%d", zoneID), nil, http.StatusOK).([]any)
+		out := map[string]map[string]any{}
+		for _, r := range raw {
+			st := e2eObj(t, r)
+			out[st["pve_storage"].(string)] = st
+		}
+		return out
+	}
+	stByPVE := listStorage()
+	for _, name := range []string{"local", "local-lvm", "iso-store"} {
+		st, ok := stByPVE[name]
+		if !ok {
+			t.Fatalf("auto scan has no storage %q (all: %+v)", name, stByPVE)
+		}
+		if st["name"] != nil || st["enabled"] != true {
+			t.Fatalf("storage %s after auto scan = name=%v enabled=%v, want null name and enabled", name, st["name"], st["enabled"])
+		}
+	}
+	// 节点挂载快照（设计 D8）：local 只挂 pve1、local-lvm 挂 pve1+pve2
+	//（逗号串拆分）、iso-store 未声明（空数组 = 不限制节点）。
+	if nodes := stByPVE["local"]["nodes"].([]any); len(nodes) != 1 || nodes[0] != "pve1" {
+		t.Fatalf("local nodes = %v, want [pve1]", stByPVE["local"]["nodes"])
+	}
+	if nodes := stByPVE["local-lvm"]["nodes"].([]any); len(nodes) != 2 || nodes[0] != "pve1" || nodes[1] != "pve2" {
+		t.Fatalf("local-lvm nodes = %v, want [pve1 pve2]", stByPVE["local-lvm"]["nodes"])
+	}
+	if nodes := stByPVE["iso-store"]["nodes"].([]any); len(nodes) != 0 {
+		t.Fatalf("iso-store nodes = %v, want [] (unlimited)", stByPVE["iso-store"]["nodes"])
+	}
+	if caps := e2eObj(t, stByPVE["local"]["capabilities"]); caps["can_store_images"] != true || caps["can_store_iso"] != true || caps["can_download_image"] != true {
+		t.Fatalf("local capabilities = %+v, want images/iso and downloadable (dir)", caps)
+	}
+	if caps := e2eObj(t, stByPVE["local-lvm"]["capabilities"]); caps["can_store_images"] != true || caps["can_download_image"] != false {
+		t.Fatalf("local-lvm capabilities = %+v, want images but not downloadable (lvm)", caps)
+	}
+	if caps := e2eObj(t, stByPVE["iso-store"]["capabilities"]); caps["can_store_images"] != false || caps["can_store_iso"] != true {
+		t.Fatalf("iso-store capabilities = %+v, want iso only", caps)
+	}
+	stLocalLvmID := int64(stByPVE["local-lvm"]["id"].(float64))
+	stISOID := int64(stByPVE["iso-store"]["id"].(float64))
+
+	// 3. 手动扫描：fake 新增 local-ssd（只挂 pve2）-> created=1，其余三个
+	// 已存在 -> updated=3；响应结构 {created, updated, deleted, skipped}。
+	fakePVE.setStorage("local-ssd", "dir", "images", "pve2")
+	scan := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneID), nil, http.StatusOK))
+	if scan["created"] != float64(1) || scan["updated"] != float64(3) || scan["deleted"] != float64(0) || scan["skipped"] != float64(0) {
+		t.Fatalf("manual scan summary = %+v, want created=1 updated=3 deleted=0 skipped=0", scan)
+	}
+	stByPVE = listStorage()
+	if _, ok := stByPVE["local-ssd"]; !ok {
+		t.Fatalf("local-ssd missing after scan (all: %+v)", stByPVE)
+	}
+
+	// 4. PUT 仅改 name/enabled：设置业务名与禁用，随后再次扫描不覆盖
+	// 管理员状态（只刷新 type/content 快照）。
+	renamed := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPut,
+		fmt.Sprintf("/storage-types/%d", int64(stByPVE["local-ssd"]["id"].(float64))),
+		map[string]any{"name": "SSD 高速盘", "enabled": true}, http.StatusOK))
+	if renamed["name"] != "SSD 高速盘" || renamed["enabled"] != true {
+		t.Fatalf("PUT storage = %+v, want name=SSD 高速盘 enabled", renamed)
+	}
+	// PVE 侧 content 变更后扫描：快照刷新（can_store_iso 翻转为 false），
+	// 但业务名保留。
+	fakePVE.setStorage("local-ssd", "dir", "backup", "pve2")
+	scan = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneID), nil, http.StatusOK))
+	if scan["created"] != float64(0) || scan["updated"] != float64(4) {
+		t.Fatalf("rescan summary = %+v, want created=0 updated=4", scan)
+	}
+	stByPVE = listStorage()
+	if got := stByPVE["local-ssd"]["name"]; got != "SSD 高速盘" {
+		t.Fatalf("rescan overwrote admin name = %v, want SSD 高速盘 preserved", got)
+	}
+	if caps := e2eObj(t, stByPVE["local-ssd"]["capabilities"]); caps["can_store_iso"] != false || caps["can_download_image"] != true {
+		t.Fatalf("local-ssd capabilities after rescan = %+v, want iso revoked, download kept (dir)", caps)
+	}
+
+	// 5. 创建 VM 的存储可用性两道闸（设计 D5）：需要合法镜像行（存储校验
+	// 在镜像存在性之后、池检查之前）。
+	img := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/images", map[string]any{
+		"name": "e2e-storage-scan-img", "default_user": "debian",
+		"download_url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2",
+	}, http.StatusCreated))
+	imgID := int64(img["id"].(float64))
+	createVMBody := func(stID int64) map[string]any {
+		return map[string]any{"name": "e2e-storage-reject", "cpu": 1, "mem_mb": 1024, "disk_gb": 10,
+			"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": "s3cret-pw"}
+	}
+	// 5a. 禁用存储：PUT enabled=false 后创建 VM -> 400 bad_request
+	//（storage type is disabled）。
+	e2eDo(t, client, adminToken, base, http.MethodPut,
+		fmt.Sprintf("/storage-types/%d", stLocalLvmID), map[string]any{"enabled": false}, http.StatusOK)
+	disabledErr := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms",
+		createVMBody(stLocalLvmID), http.StatusBadRequest))
+	disabledCode, _ := disabledErr["error"].(map[string]any)["code"].(string)
+	if disabledCode != "bad_request" {
+		t.Fatalf("create vm on disabled storage: error code = %q, want bad_request", disabledCode)
+	}
+	e2eDo(t, client, adminToken, base, http.MethodPut,
+		fmt.Sprintf("/storage-types/%d", stLocalLvmID), map[string]any{"enabled": true}, http.StatusOK)
+	// 5b. 不支持磁盘映像的存储（iso-store 只有 iso）：创建 VM -> 400
+	// bad_request（storage type cannot store VM disks）。
+	noDiskErr := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms",
+		createVMBody(stISOID), http.StatusBadRequest))
+	noDiskCode, _ := noDiskErr["error"].(map[string]any)["code"].(string)
+	if noDiskCode != "bad_request" {
+		t.Fatalf("create vm on iso-only storage: error code = %q, want bad_request", noDiskCode)
+	}
+
+	// 5c. 节点挂载调度的端到端场景（设计 D8）：创建覆盖 pve1+pve2 白名单的
+	// IP 池，镜像预置到 fake 的 local/import（两节点扫描同一 fake，镜像
+	// 都存在）；按挂载快照过滤后只有挂载节点可被调度。
+	poolRes := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/ip-pools", map[string]any{
+		"zone_id": zoneID, "name": "e2e-storage-pool", "network_cidr": "10.30.0.0/24",
+		"gateway": "10.30.0.1", "dns": "1.1.1.1",
+	}, http.StatusCreated))
+	poolID := int64(poolRes["id"].(float64))
+	e2eDo(t, client, adminToken, base, http.MethodPut, fmt.Sprintf("/ip-pools/%d/nodes", poolID),
+		map[string]any{"node_ids": []int64{nodeID, node2ID}}, http.StatusOK)
+	fakePVE.addImportFile("local", "debian-12-genericcloud-amd64.qcow2")
+	// 三个挂载形态各异的存储：mount-pve2（只挂 pve2）、ghost-ssd（挂在
+	// 集群外节点，任何候选都不挂）、unlimited-ssd（未声明 = 不限制节点）。
+	fakePVE.setStorage("mount-pve2", "dir", "images", "pve2")
+	fakePVE.setStorage("ghost-ssd", "dir", "images", "ghost-node")
+	fakePVE.setStorage("unlimited-ssd", "dir", "images", "")
+	scan = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneID), nil, http.StatusOK))
+	if scan["created"] != float64(3) {
+		t.Fatalf("scan for mount storages = %+v, want created=3", scan)
+	}
+	stMountID := e2eStorageTypeID(t, client, adminToken, base, zoneID, "mount-pve2")
+	stGhostID := e2eStorageTypeID(t, client, adminToken, base, zoneID, "ghost-ssd")
+	stUnlimitedID := e2eStorageTypeID(t, client, adminToken, base, zoneID, "unlimited-ssd")
+	createSchedVM := func(name string, stID int64) map[string]any {
+		return map[string]any{"name": name, "cpu": 1, "mem_mb": 1024, "disk_gb": 10,
+			"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": "s3cret-pw"}
+	}
+
+	// 5c-1. 存储只挂 pve2：VM 被调度到 pve2（池候选 pve1+pve2 中剔除
+	// 未挂载的 pve1），并在 pve2 上完成供给。
+	mountVM := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms",
+		createSchedVM("e2e-mount-pve2", stMountID), http.StatusCreated))
+	if mountVM["node_id"] != float64(node2ID) {
+		t.Fatalf("mount-pve2 vm node_id = %v, want %d (pve2, the only mounted node)", mountVM["node_id"], node2ID)
+	}
+	e2eWaitProvisioned(t, client, adminToken, base, int64(mountVM["id"].(float64)))
+	e2eDo(t, client, adminToken, base, http.MethodDelete,
+		fmt.Sprintf("/vms/%d", int64(mountVM["id"].(float64))), nil, http.StatusNoContent)
+
+	// 5c-2. 候选全排除：存储挂载快照不含任何池候选节点 -> 400
+	// storage_not_available_in_zone（不落库、不占 IP）。
+	// 记录拒绝前池的空闲 IP 数，供拒绝后断言"数不变"。
+	var freeIPsBefore int64
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ips WHERE pool_id=$1 AND status='free'", poolID).Scan(&freeIPsBefore); err != nil {
+		t.Fatalf("count free ips before ghost create: %v", err)
+	}
+	ghostErr := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms",
+		createSchedVM("e2e-mount-ghost", stGhostID), http.StatusBadRequest))
+	ghostCode, _ := ghostErr["error"].(map[string]any)["code"].(string)
+	if ghostCode != "storage_not_available_in_zone" {
+		t.Fatalf("create vm on unmounted storage: error code = %q, want storage_not_available_in_zone", ghostCode)
+	}
+	// 5c-2b. 被拒绝的创建不落库、不占 IP（11.4）：GET /vms 无该 VM 行，
+	// 池空闲 IP 数不变。
+	ghostList := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, "/vms", nil, http.StatusOK))
+	for _, raw := range ghostList["vms"].([]any) {
+		if e2eObj(t, raw)["name"] == "e2e-mount-ghost" {
+			t.Fatal("rejected ghost vm leaked into GET /vms")
+		}
+	}
+	var freeIPsAfter int64
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ips WHERE pool_id=$1 AND status='free'", poolID).Scan(&freeIPsAfter); err != nil {
+		t.Fatalf("count free ips after ghost rejection: %v", err)
+	}
+	if freeIPsAfter != freeIPsBefore {
+		t.Fatalf("free ip count changed by rejected create: before=%d after=%d", freeIPsBefore, freeIPsAfter)
+	}
+
+	// 5c-3. 未声明节点挂载（nodes 空 = 不限制节点）：放行全部候选，落在
+	// 白名单第一个节点（pve1），并完成供给。
+	unlimitedVM := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms",
+		createSchedVM("e2e-mount-unlimited", stUnlimitedID), http.StatusCreated))
+	if unlimitedVM["node_id"] != float64(nodeID) {
+		t.Fatalf("unlimited vm node_id = %v, want %d (pve1, first whitelisted candidate)", unlimitedVM["node_id"], nodeID)
+	}
+	e2eWaitProvisioned(t, client, adminToken, base, int64(unlimitedVM["id"].(float64)))
+	e2eDo(t, client, adminToken, base, http.MethodDelete,
+		fmt.Sprintf("/vms/%d", int64(unlimitedVM["id"].(float64))), nil, http.StatusNoContent)
+
+	// 5c-4. 场景清理：移除三个挂载存储（扫描 deleted=3），恢复后续步骤的
+	// 存储清单（步骤 6/7 的删除/跳过断言只针对 local-ssd / local-lvm）。
+	fakePVE.removeStorage("mount-pve2")
+	fakePVE.removeStorage("ghost-ssd")
+	fakePVE.removeStorage("unlimited-ssd")
+	scan = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneID), nil, http.StatusOK))
+	if scan["deleted"] != float64(3) {
+		t.Fatalf("cleanup scan = %+v, want deleted=3", scan)
+	}
+
+	// 6. 消失的存储被同步删除：fake 移除 local-ssd -> deleted=1，列表不再
+	// 出现。
+	fakePVE.removeStorage("local-ssd")
+	scan = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneID), nil, http.StatusOK))
+	if scan["deleted"] != float64(1) {
+		t.Fatalf("scan after removal = %+v, want deleted=1", scan)
+	}
+	stByPVE = listStorage()
+	if _, ok := stByPVE["local-ssd"]; ok {
+		t.Fatalf("local-ssd still listed after scan (all: %+v)", stByPVE)
+	}
+
+	// 7. 被 VM 引用的消失存储跳过删除（skipped）：直接落库一行引用
+	// local-lvm 的 VM（与既有 e2e 直查 pool 的风格一致），fake 移除
+	// local-lvm 后扫描 -> skipped=1 且 local-lvm 仍在；清理 VM 后再次
+	// 扫描 -> deleted=1。
+	if _, err := pool.Exec(ctx, `INSERT INTO vms (uuid, name, zone_id, node_id, pve_vmid, image_id, storage_type_id, cpu, mem_mb, disk_gb, password_encrypted)
+		VALUES ('e2e-scan-ref', 'ref-vm', $1, $2, 300, $3, $4, 1, 1024, 10, 'enc')`,
+		zoneID, nodeID, imgID, stLocalLvmID); err != nil {
+		t.Fatalf("insert referencing vm: %v", err)
+	}
+	fakePVE.removeStorage("local-lvm")
+	scan = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneID), nil, http.StatusOK))
+	if scan["skipped"] != float64(1) || scan["deleted"] != float64(0) {
+		t.Fatalf("scan with referencing vm = %+v, want skipped=1 deleted=0", scan)
+	}
+	stByPVE = listStorage()
+	if _, ok := stByPVE["local-lvm"]; !ok {
+		t.Fatalf("referenced storage local-lvm was deleted (all: %+v)", stByPVE)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM vms WHERE uuid='e2e-scan-ref'"); err != nil {
+		t.Fatalf("delete referencing vm: %v", err)
+	}
+	scan = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneID), nil, http.StatusOK))
+	if scan["deleted"] != float64(1) || scan["skipped"] != float64(0) {
+		t.Fatalf("scan after vm cleanup = %+v, want deleted=1 skipped=0", scan)
+	}
+
+	// 8. 参数与节点错误语义：zone_id 缺失 -> 400；zone 无任何节点 ->
+	// 503 node_unavailable（不产生部分同步）。
+	missing := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		"/storage-types/scan", nil, http.StatusBadRequest))
+	missingCode, _ := missing["error"].(map[string]any)["code"].(string)
+	if missingCode != "bad_request" {
+		t.Fatalf("scan without zone_id: error code = %q, want bad_request", missingCode)
+	}
+	zoneNoNode := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/zones",
+		map[string]any{"name": "e2e-storage-zone2"}, http.StatusCreated))
+	zoneNoNodeID := int64(zoneNoNode["id"].(float64))
+	noNodeErr := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneNoNodeID), nil, http.StatusServiceUnavailable))
+	noNodeCode, _ := noNodeErr["error"].(map[string]any)["code"].(string)
+	if noNodeCode != "node_unavailable" {
+		t.Fatalf("scan of node-less zone: error code = %q, want node_unavailable", noNodeCode)
+	}
+
+	// 9. 鉴权分层（B1 权限粒度拆分）：/storage-types 读操作（GET 列表）
+	// 只挂 requireAuth——storage_type_id 是 user 创建 VM 的必填字段，列表
+	// 是创建流程的必要输入，user 令牌放行 200；写操作（扫描/PUT/DELETE）
+	// 挂 requireAdmin，user 令牌一律 403 forbidden（鉴权拦截先于任何业务
+	// 逻辑）。
+	e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/users", map[string]any{
+		"username": "e2e-storage-user", "password": "storage-u-pass", "name": "Storage User",
+	}, http.StatusCreated))
+	userLogin := e2eObj(t, e2eDo(t, client, "", base, http.MethodPost, "/auth/login",
+		map[string]any{"username": "e2e-storage-user", "password": "storage-u-pass"}, http.StatusOK))
+	userToken, _ := userLogin["token"].(string)
+	if userToken == "" {
+		t.Fatalf("storage user login response has no token: %+v", userLogin)
+	}
+	userList := e2eDo(t, client, userToken, base, http.MethodGet,
+		fmt.Sprintf("/storage-types?zone_id=%d", zoneID), nil, http.StatusOK)
+	if _, ok := userList.([]any); !ok {
+		t.Fatalf("user storage-types list = %T, want []any (200)", userList)
+	}
+	e2eDo(t, client, userToken, base, http.MethodPost,
+		fmt.Sprintf("/storage-types/scan?zone_id=%d", zoneID), nil, http.StatusForbidden)
+	e2eDo(t, client, userToken, base, http.MethodPut,
+		fmt.Sprintf("/storage-types/%d", stLocalLvmID), map[string]any{"name": "hack"}, http.StatusForbidden)
+	e2eDo(t, client, userToken, base, http.MethodDelete,
+		fmt.Sprintf("/storage-types/%d", stLocalLvmID), nil, http.StatusForbidden)
 }

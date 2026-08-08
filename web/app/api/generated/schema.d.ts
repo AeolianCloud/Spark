@@ -82,7 +82,13 @@ export interface paths {
         /** 区域列表（含各区域完整节点列表） */
         get: operations["listZones"];
         put?: never;
-        /** 创建区域 */
+        /**
+         * 创建区域
+         * @description 创建区域（资源容器）。区域是节点/存储/虚拟机归属的资源容器，且节点
+         *     注册会自动触发所属 zone 的存储扫描（SyncZone）——容器创建与存储快照
+         *     注入面必须由管理员控制。仅管理员令牌可访问（用户令牌返回 403
+         *     forbidden）。
+         */
         post: operations["createZone"];
         delete?: never;
         options?: never;
@@ -100,7 +106,14 @@ export interface paths {
         /** 区域节点列表 */
         get: operations["listNodesByZone"];
         put?: never;
-        /** 登记 PVE 节点 */
+        /**
+         * 登记 PVE 节点
+         * @description 登记 PVE 节点（host/api_user/api_token 必填）。节点注册成功会自动
+         *     触发所属 zone 的一次存储扫描（SyncZone），从节点 PVE 拉取存储清单
+         *     同步本地快照——放行普通用户会形成"注册伪造节点 → 从攻击者控制的
+         *     服务器拉取伪造存储清单注入/篡改存储快照"的攻击链。仅管理员令牌
+         *     可访问（用户令牌返回 403 forbidden）。
+         */
         post: operations["createNode"];
         delete?: never;
         options?: never;
@@ -118,7 +131,10 @@ export interface paths {
         get?: never;
         /**
          * 更新节点
-         * @description 空 api_token 保留原密钥；enabled 缺省时保留现值。
+         * @description 更新节点的名称/PVE 集群节点名/host/凭据/启用开关；空 api_token
+         *     保留原密钥；enabled 缺省时保留现值。节点是存储扫描（SyncZone）的
+         *     数据源与虚拟机调度面，节点数据面变更必须由管理员控制。仅管理员
+         *     令牌可访问（用户令牌返回 403 forbidden）。
          */
         put: operations["updateNode"];
         post?: never;
@@ -195,11 +211,24 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 存储类型列表 */
+        /**
+         * 存储类型列表
+         * @description 存储类型由扫描（POST /storage-types/scan）从 PVE 自动同步产生，
+         *     不再支持手动登记。响应携带按存储内容快照派生的能力布尔集合
+         *     （capabilities），前端据此展示"可放磁盘映像/ISO"等标签。
+         */
         get: operations["listStorageTypes"];
         put?: never;
-        /** 登记存储类型 */
-        post: operations["createStorageType"];
+        /**
+         * 触发存储扫描
+         * @description 对指定 zone 手动触发一次存储扫描：从该 zone 集群读取存储清单并
+         *     同步本地，返回同步摘要 {created, updated, deleted, skipped}。
+         *     zone 内没有任何可达的启用节点时返回 503 node_unavailable，且不
+         *     产生部分同步。节点注册成功时系统会自动触发所属 zone 的一次扫描，
+         *     本端点供管理员手动刷新。仅管理员令牌可访问（用户令牌返回 403
+         *     forbidden）。
+         */
+        post: operations["scanStorageTypes"];
         delete?: never;
         options?: never;
         head?: never;
@@ -213,12 +242,25 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 存储类型详情 */
+        /**
+         * 存储类型详情
+         * @description 返回单个存储类型的详情（含能力派生对象）。
+         */
         get: operations["getStorageType"];
-        /** 更新存储类型 */
+        /**
+         * 更新存储类型
+         * @description 仅允许修改管理员元数据：name（业务名，可空，最长 255 字符；传空串
+         *     表示置空为 NULL，展示回退到 pve_storage）与 enabled（启用开关）。
+         *     pve_storage 是扫描权威字段，不可修改。仅管理员令牌可访问（用户
+         *     令牌返回 403 forbidden）。
+         */
         put: operations["updateStorageType"];
         post?: never;
-        /** 删除存储类型 */
+        /**
+         * 删除存储类型
+         * @description 删除存储类型；仍被虚拟机引用的存储返回 409 conflict。仅管理员
+         *     令牌可访问（用户令牌返回 403 forbidden）。
+         */
         delete: operations["deleteStorageType"];
         options?: never;
         head?: never;
@@ -464,8 +506,10 @@ export interface paths {
          *
          *      错误场景：400 请求体非法（含 pool_id 非正整数）；区域无可用 IP 池
          *      （no_available_ip_pool）；镜像在该区域不可用（image_not_available_in_zone）；
-         *      404 区域/镜像/存储类型不存在（not_found）；409 IP 池地址耗尽（ip_exhausted）；
-         *      503 存在带镜像的候选节点但全部不可达/被禁用（node_unavailable）。
+         *      所选存储未挂载任何可调度的候选节点（storage_not_available_in_zone，
+         *      nodes 快照为空即不限制节点时不会触发）；404 区域/镜像/存储类型
+         *      不存在（not_found）；409 IP 池地址耗尽（ip_exhausted）；503 存在
+         *      带镜像的候选节点但全部不可达/被禁用（node_unavailable）。
          */
         post: operations["createVM"];
         delete?: never;
@@ -960,22 +1004,89 @@ export interface components {
             /** @description 白名单节点 ID 列表（整体替换） */
             node_ids: number[];
         };
-        StorageTypeRequest: {
-            /** @description 对外抽象名（唯一），如 ssd */
-            name: string;
-            /** @description 展示名 */
-            display_name: string;
-            /** @description 真实 PVE 存储名，如 local-ssd */
-            pve_storage: string;
+        /**
+         * @description 更新存储类型的管理员元数据（name 与 enabled 均可省略，省略表示
+         *     不更新）：name 为业务名，可空，传空串（""）表示置空为 NULL，
+         *     展示回退到 pve_storage；enabled 为启用开关，禁用后该存储不可被
+         *     创建虚拟机选用。
+         */
+        StorageTypeUpdateRequest: {
+            /** @description 业务名（可空，可置空；最长 255 字符，trim 后超限返回 400） */
+            name?: string | null;
+            /** @description 启用开关 */
+            enabled?: boolean;
         };
         StorageType: {
             /** Format: int64 */
             id: number;
-            name: string;
-            display_name: string;
+            /**
+             * Format: int64
+             * @description 所属区域（一个 zone 对应一个 PVE 集群）
+             */
+            zone_id: number;
+            /** @description 业务名；null 表示未命名，展示回退到 pve_storage */
+            name: string | null;
+            /** @description PVE 存储名（集群内唯一），由扫描权威填充，不可手改 */
             pve_storage: string;
+            /** @description 管理员启用开关，默认开启 */
+            enabled: boolean;
+            /** @description PVE 存储类型快照（dir/lvm/zfspool/nfs/cifs 等）；尚未扫描过的存量为 null */
+            type: string | null;
+            /** @description PVE 内容能力快照（逗号分隔，如 "images,iso"）；null 表示尚未扫描，空串表示无内容类型声明 */
+            content: string | null;
+            /**
+             * @description 该存储挂载的节点名列表（PVE 集群节点名，与节点登记的
+             *     pve_name/name 对应，扫描快照不可写）；空数组 = 不限制节点、
+             *     所有节点可用。创建虚拟机时只在挂载了所选存储的候选节点中调度。
+             */
+            nodes: string[];
+            capabilities: components["schemas"]["StorageTypeCapabilities"];
             /** Format: date-time */
             created_at: string;
+        };
+        /**
+         * @description 由扫描快照（type/content）派生的能力布尔集合，覆盖 PVE 全部内容
+         *     枚举；can_download_image 仅在存储类型为 dir（本地路径类）时为
+         *     true（只有这类存储可代发云镜像下载）。
+         */
+        StorageTypeCapabilities: {
+            /** @description 可存放磁盘映像（创建虚拟机磁盘的硬性前提） */
+            can_store_images: boolean;
+            /** @description 可存放 ISO 镜像 */
+            can_store_iso: boolean;
+            /** @description 可存放备份 */
+            can_store_backup: boolean;
+            /** @description 可存放容器模板 */
+            can_store_vztmpl: boolean;
+            /** @description 可存放容器根目录 */
+            can_store_rootdir: boolean;
+            /** @description 可存放脚本片段 */
+            can_store_snippets: boolean;
+            /** @description 可代发云镜像下载（dir 类型为 true） */
+            can_download_image: boolean;
+        };
+        /** @description 一次存储扫描（SyncZone）的同步摘要 */
+        StorageScanSummary: {
+            /**
+             * Format: int32
+             * @description PVE 存在而本地缺失、本次新建的存储数
+             */
+            created: number;
+            /**
+             * Format: int32
+             * @description 两边都存在、仅刷新 type/content 快照的存储数
+             */
+            updated: number;
+            /**
+             * Format: int32
+             * @description PVE 已消失、本次删除的存储数
+             */
+            deleted: number;
+            /**
+             * Format: int32
+             * @description PVE 已消失但被本地 VM 引用（或并发已删）而跳过删除的存储数
+             */
+            skipped: number;
         };
         ImageRequest: {
             /** @description 镜像名（唯一），如 debian-12-cloud */
@@ -1334,7 +1445,7 @@ export interface components {
         };
     };
     responses: {
-        /** @description 请求参数非法（bad_request / invalid_vm_id；也用于 no_available_ip_pool / image_not_available_in_zone） */
+        /** @description 请求参数非法（bad_request / invalid_vm_id；也用于 no_available_ip_pool / image_not_available_in_zone / storage_not_available_in_zone） */
         BadRequest: {
             headers: {
                 "x-ms-error-code": components["headers"]["XMSErrorCode"];
@@ -1673,6 +1784,8 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             409: components["responses"]["Conflict"];
         };
     };
@@ -1728,6 +1841,8 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
         };
@@ -1758,6 +1873,8 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
         };
@@ -1908,6 +2025,8 @@ export interface operations {
                 limit?: components["parameters"]["QueryLimit"];
                 /** @description 跳过条数；默认 0，负数/非数字返回 400 */
                 offset?: components["parameters"]["QueryOffset"];
+                /** @description 按区域过滤（正整数；格式非法返回 400） */
+                zone_id?: components["parameters"]["QueryZoneID"];
             };
             header?: never;
             path?: never;
@@ -1926,33 +2045,34 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
         };
     };
-    createStorageType: {
+    scanStorageTypes: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description 要扫描的区域 ID（正整数；缺失或格式非法返回 400） */
+                zone_id: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["StorageTypeRequest"];
-            };
-        };
+        requestBody?: never;
         responses: {
-            /** @description 登记成功 */
-            201: {
+            /** @description 扫描完成，返回同步摘要 */
+            200: {
                 headers: {
-                    Location: components["headers"]["Location"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["StorageType"];
+                    "application/json": components["schemas"]["StorageScanSummary"];
                 };
             };
             400: components["responses"]["BadRequest"];
-            409: components["responses"]["Conflict"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getStorageType: {
@@ -1977,6 +2097,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
         };
     };
@@ -1992,7 +2113,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["StorageTypeRequest"];
+                "application/json": components["schemas"]["StorageTypeUpdateRequest"];
             };
         };
         responses: {
@@ -2006,8 +2127,9 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
         };
     };
     deleteStorageType: {
@@ -2030,6 +2152,8 @@ export interface operations {
                 content?: never;
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
         };

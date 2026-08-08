@@ -23,6 +23,79 @@ type StorageContent struct {
 	Name string `json:"name"`
 }
 
+// PVEStorage 是 GET /storage 返回的单个集群存储（cfs 配置条目）。
+// 集群级接口，任一节点凭据均可调用，各节点看到同一份配置。
+type PVEStorage struct {
+	// Storage 是 PVE 存储名，在集群内唯一（如 local、local-lvm）。
+	Storage string `json:"storage"`
+	// Type 是存储类型（dir/lvm/zfspool/nfs/cifs 等）。
+	Type string `json:"type"`
+	// Content 是内容能力声明，逗号分隔（如 "images,iso"）；空串表示该
+	// 存储未声明任何内容类型。
+	Content string `json:"content"`
+	// Shared 指示该存储是否为集群共享存储。PVE 返回数字 1/0 或布尔
+	// true/false 两种形态，用 PveBool 双格式兼容。
+	Shared PveBool `json:"shared"`
+	// Nodes 是使用该存储的节点名列表。真实 PVE 返回逗号分隔字符串
+	// （如 "pve1,pve2"，已实测），部分场景可能返回数组，两种形式都兼容。
+	Nodes []string `json:"nodes"`
+}
+
+// UnmarshalJSON 兼容 PVE 对 nodes 字段的两种形态：逗号分隔字符串
+// （"pve1,pve2"，真实响应形态）与 JSON 字符串数组（部分场景）。
+// nodes 缺失或为 null 时保持空切片；字符串形态按逗号拆分并去除空白。
+func (s *PVEStorage) UnmarshalJSON(data []byte) error {
+	type rawStorage struct {
+		Storage string          `json:"storage"`
+		Type    string          `json:"type"`
+		Content string          `json:"content"`
+		Shared  PveBool         `json:"shared"`
+		Nodes   json.RawMessage `json:"nodes"`
+	}
+	var raw rawStorage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	s.Storage, s.Type, s.Content, s.Shared = raw.Storage, raw.Type, raw.Content, raw.Shared
+	trimmed := strings.TrimSpace(string(raw.Nodes))
+	switch {
+	case trimmed == "" || trimmed == "null":
+		// nodes 字段缺失或为 null：保持空切片。
+	case strings.HasPrefix(trimmed, "["):
+		if err := json.Unmarshal(raw.Nodes, &s.Nodes); err != nil {
+			return err
+		}
+	default:
+		// 逗号分隔字符串形态（真实 PVE 响应）。
+		var joined string
+		if err := json.Unmarshal(raw.Nodes, &joined); err != nil {
+			return err
+		}
+		for _, n := range strings.Split(joined, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				s.Nodes = append(s.Nodes, n)
+			}
+		}
+	}
+	return nil
+}
+
+// ListStorage 调用集群级的 GET /storage 列出该集群的全部存储。扫描存储
+// （提案 auto-scan-pve-storage）以此为数据源：一次调用即可拿到整份 cfs
+// 配置（集群内各节点一致），无需逐节点聚合。content 为空串表示该存储
+// 未声明内容类型，由调用方按"不支持任何内容"语义处理。
+func (c *Client) ListStorage(ctx context.Context) ([]PVEStorage, error) {
+	raw, err := c.doJSON(ctx, http.MethodGet, "/storage", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	storages, err := decodeData[[]PVEStorage](raw)
+	if err != nil {
+		return nil, fmt.Errorf("pve: list storage: %w", err)
+	}
+	return storages, nil
+}
+
 // ListStorageContent 调用 GET /nodes/{node}/storage/{storage}/content 列出
 // 存储上指定 content 类型的条目（例如 import 目录下的云镜像文件），用于
 // 扫描节点上是否已存在镜像。content 取值由调用方指定（"iso"、"import"、

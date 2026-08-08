@@ -66,6 +66,12 @@ func TestMapVMServiceErrorImportKinds(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 			wantCode:   CodeNoAvailableIPPool,
 		},
+		{
+			name:       "storage not available in zone maps to 400 storage_not_available_in_zone",
+			serr:       &service.Error{Kind: service.KindStorageNotAvailableInZone, Message: `storage type "local-ssd" is not available on any candidate node in zone 1`},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeStorageNotAvailableInZone,
+		},
 	}
 
 	for _, tt := range tests {
@@ -284,8 +290,13 @@ func (stubImageRepo) Get(ctx context.Context, id int64) (*model.Image, error) { 
 
 type stubStorageRepo struct{}
 
+// Get 返回一个合法的存储类型快照：创建 VM 的存储可用性两道闸（设计 D5）
+// 要求所选存储启用且 content 含 images，P1 加固要求存储属于请求 zone
+// （ZoneID=1，与本文件 CreateVM 测试请求的 zone_id=1 一致）——替身返回
+// 合法值让请求流走到被测分支（归属校验等），而非在存储校验处提前返回。
 func (stubStorageRepo) Get(ctx context.Context, id int64) (*model.StorageType, error) {
-	return nil, nil
+	content := "images"
+	return &model.StorageType{ID: id, ZoneID: 1, Enabled: true, Content: &content}, nil
 }
 
 // newVMGetTestService 装配 handler Get 测试的 VMService：stub 替身集合 +
