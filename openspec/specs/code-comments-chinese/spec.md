@@ -2,7 +2,7 @@
 
 约定代码库中全部 go 代码注释与说明必须使用中文，保证注释语言与仓库规则一致，降低中英混用的维护成本。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: 中文注释约定
 

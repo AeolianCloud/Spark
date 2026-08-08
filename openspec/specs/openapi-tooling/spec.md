@@ -2,7 +2,7 @@
 
 让 OpenAPI 契约文档成为可被工具链可靠消费的契约源：通过官方校验器零错误校验、operationId 完整、可被生成器消费，并提供在线浏览入口。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: 契约可通过官方校验器
 
