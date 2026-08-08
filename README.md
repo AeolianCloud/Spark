@@ -28,6 +28,7 @@
 | `server.port` | `SPARK_SERVER_PORT` | 监听端口，默认 8080 |
 | `database.dsn` | `SPARK_DATABASE_DSN` | PostgreSQL 连接串，如 `postgres://spark:xxx@localhost:5432/spark?sslmode=disable` |
 | `crypto.encryption_key` | `SPARK_CRYPTO_ENCRYPTION_KEY` | base64 编码的 32 字节 AES 密钥，用于加密 VM 的 cloud-init 密码 |
+| `auth.jwt_secret` | `SPARK_AUTH_JWT_SECRET` | JWT 签名密钥（HMAC-SHA256），必填且至少 32 字符，用于签发/校验登录令牌 |
 | `log.level` | `SPARK_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 | `images.download_host_allowlist` | `SPARK_IMAGES_DOWNLOAD_HOST_ALLOWLIST` | 镜像下载源域名白名单（逗号分隔），默认内置 5 个云镜像源；空列表拒绝所有下载 |
 
@@ -52,6 +53,26 @@ go run ./cmd/server                      # 直接运行
 启动流程：加载配置 → 连接 PostgreSQL（连接池 + Ping 健康检查）→ 自动执行内嵌迁移（`database.Migrate`，幂等，按版本号记录在 `schema_migrations`）→ 启动 HTTP 服务。
 
 Web 管理界面（`web/`）的生产部署（nginx 静态托管 + `/api` 反代、无鉴权网络隔离提示）见 [docs/web-deployment.md](docs/web-deployment.md)。
+
+### 管理员账号创建
+
+系统不预置任何管理员：首次使用需先通过 CLI 创建种子管理员，再启动服务登录（设计 D7）。
+
+1. **配置就绪**：`auth.jwt_secret` 必填且至少 32 字符，缺失或过短时命令启动即报错，生成方式见上文配置表；
+2. **创建管理员**：
+
+   ```bash
+   go run ./cmd/server admin create --username root --password '<强密码>'
+   ```
+
+3. **启动服务**（`go run ./cmd/server`），随后用 `POST /auth/admin/login` 登录获取管理员 JWT。
+
+说明：
+
+- 密码经 bcrypt 不可逆哈希后存入 `admins.password_hash`，不提供默认密码；明文密码与哈希绝不打印到终端或写入日志；
+- 参数缺省（`--username` / `--password` 为空、密码超过 72 字节）时报错并提示用法，退出码非零；
+- 重复创建同名管理员输出 `admin already exists` 冲突提示并退出非零码；
+- 密码作为命令行参数会出现在 shell 历史与进程列表中，生产环境建议在一次性会话中执行并清理历史。
 
 ## PVE 节点准备
 
@@ -170,7 +191,7 @@ SPARK_E2E_DSN='postgres://spark:spark@127.0.0.1:5432/spark_test' \
 
 ## 已知限制（v1）
 
-- **无认证**：API 完全开放，前端接入时再定鉴权方案。
+- **令牌生命周期简单**：JWT 24h 有效、无刷新/注销机制，过期重新登录；禁用用户即时失效（每次请求查库）。
 - **无任务持久化/重试**：PVE 任务只在供给链内同步轮询，不落库；失败不自动重试。
 - **异步失败仅标记**：供给失败只写 `provision_error`，IP 不自动释放（避免复用脏 IP，由运营手工回收）；PVE 侧残留的半成品 VM 需手工清理。
 - **无计费/配额**：不限制 CPU/内存/磁盘用量。

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -18,11 +19,19 @@ import (
 // 的是输入字节序列。
 const maxPasswordBytes = 72
 
+// maxUsernameLen 是登录账号的最大长度（字符/rune 数）：与 OpenAPI 契约的
+// CreateUserRequest.username maxLength（128 字符）对齐。契约是前端的
+// 唯一事实来源，声明的约束必须在服务端强制，避免超长账号绕过契约校验
+// 落库（users.username 为 TEXT 列，无数据库层上限）。按字符（rune）而非
+// 字节计：JSON Schema 的 maxLength 语义是 Unicode code point 数。
+const maxUsernameLen = 128
+
 // KindUserHasResources 表示删除用户时其名下仍关联虚拟机等资源（设计 D6
 // 的"有资源禁删"）。该值位于 errors.go 中共享 kind 的 iota 范围之外
 // （该范围归其他批次所有），取值风格与 KindNodeUnavailable（100）、
-// KindIPExhausted（101）一致。
-const KindUserHasResources ErrorKind = 102
+// KindIPExhausted（101）一致；vm_service.go 已占用 102-108 段，因此从
+// 109 起取号，保证全仓 ErrorKind 数值唯一。
+const KindUserHasResources ErrorKind = 109
 
 // userHasResourcesf 构造一个 KindUserHasResources 服务错误（映射为 409）。
 func userHasResourcesf(format string, args ...any) *Error {
@@ -62,6 +71,9 @@ func (s *UserService) CreateUser(ctx context.Context, username, password, name s
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return nil, badRequestf("username is required")
+	}
+	if utf8.RuneCountInString(username) > maxUsernameLen {
+		return nil, badRequestf("username must not exceed %d characters", maxUsernameLen)
 	}
 	if password == "" {
 		return nil, badRequestf("password is required")

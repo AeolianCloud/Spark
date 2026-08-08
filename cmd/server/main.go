@@ -21,6 +21,17 @@ import (
 )
 
 func main() {
+	// 子命令分发（设计 D7）：`spark admin create --username <u> --password <p>`
+	// 创建种子管理员；其余参数（包括无参数）一律启动服务，保持
+	// `go run ./cmd/server` 的既有用法不变。
+	if len(os.Args) >= 2 && os.Args[1] == "admin" {
+		if err := runAdminCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "admin command failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		slog.Error("server exited with error", "error", err)
 		os.Exit(1)

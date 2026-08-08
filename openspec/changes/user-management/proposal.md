@@ -27,7 +27,7 @@ Spark 目前没有任何认证与用户概念（`vms` 表无 `user_id`，所有 
 
 ## Impact
 
-- **后端**：`api/`（登录 handler、鉴权中间件、用户 CRUD handler、路由挂载）、`service/`（auth 服务、用户服务、VM 列表分流与归属校验）、`repository/`（user/admin 仓储）、`database/migration/0008`（users/admins 表、`vms.user_id`）、`cmd/`（种子管理员 CLI）
+- **后端**：`api/`（登录 handler、鉴权中间件、用户 CRUD handler、路由挂载）、`service/`（auth 服务、用户服务、VM 列表分流与归属校验）、`repository/`（user/admin 仓储）、`database/migration/0010`（users/admins 表、`vms.user_id`）、`cmd/`（种子管理员 CLI）
 - **依赖**：新增 `golang-jwt/jwt/v5`（JWT）与 `golang.org/x/crypto`（bcrypt 密码哈希）
 - **API**：`/auth/login`、`/auth/admin/login`、`/users` CRUD、`/vms` 响应新增归属字段；契约双副本 + `docs/api-errors.md`
 - **测试**：单测（auth/用户 CRUD/归属校验）+ e2e（fake PVE 配合 token 注入、双身份分流断言）

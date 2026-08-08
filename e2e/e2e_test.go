@@ -38,6 +38,7 @@ import (
 	"spark/crypto"
 	"spark/database"
 	"spark/pve"
+	"spark/service"
 )
 
 // ---------- fake PVE 服务器 ----------
@@ -426,6 +427,11 @@ func e2eDSN() string {
 	return "postgres://spark:spark@127.0.0.1:5432/spark_test"
 }
 
+// e2eJWTSecret 是 e2e 测试注入路由的固定 JWT 密钥（任务 9.1）：与
+// api/router_test.go 的 testJWTSecret 完全一致（≥32 字符满足 config 校验），
+// 保证登录/鉴权链路在测试中签发与校验一致的令牌。
+const e2eJWTSecret = "test-jwt-secret-0123456789abcdefghijklmnopqrstuv"
+
 // e2eCipher 使用确定的 32 字节密钥构造 cipher（与 api/service 单元测试
 // 相同的模式）。
 func e2eCipher(t *testing.T) *crypto.Cipher {
@@ -446,18 +452,54 @@ func e2eCipher(t *testing.T) *crypto.Cipher {
 // truncateBusinessTables 用一条语句清空所有业务表。
 // CASCADE 会顺着外键链（zones -> ip_pools/pve_nodes/vms -> ips/
 // ip_pool_nodes）级联删除，语句中还列出了 vms 所引用的外键根表
-// （storage_types、images）；schema_migrations 和 schema_probe
-// 不会被触碰。
+// （storage_types、images）。用户体系落地后（迁移 0010）新增
+// users/admins：vms.user_id 引用 users(id)，把两者列入同一语句后，
+// CASCADE 会在单条 TRUNCATE 中自动纳入全部外键依赖方（含 vms、
+// vm_operations），无需手工编排清空顺序。schema_migrations 和
+// schema_probe 不会被触碰。
 func truncateBusinessTables(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
-	if _, err := pool.Exec(ctx, "TRUNCATE zones, storage_types, images CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE zones, storage_types, images, users, admins CASCADE"); err != nil {
 		t.Fatalf("truncate business tables: %v", err)
 	}
 }
 
+// seedAdmin 直接向 admins 表插入一个测试管理员：密码经 service.HashPassword
+// 生成 bcrypt 哈希（明文绝不落库，与生产路径一致），返回其 id。须在
+// truncateBusinessTables 之后调用以保证可重跑。
+func seedAdmin(t *testing.T, ctx context.Context, pool *pgxpool.Pool, username, password string) int64 {
+	t.Helper()
+	hash, err := service.HashPassword(password)
+	if err != nil {
+		t.Fatalf("hash admin password: %v", err)
+	}
+	var id int64
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO admins (username, password_hash) VALUES ($1, $2) RETURNING id",
+		username, hash).Scan(&id); err != nil {
+		t.Fatalf("insert admin %s: %v", username, err)
+	}
+	return id
+}
+
+// e2eAdminToken 播种测试管理员并通过 POST /auth/admin/login 换取 admin
+// Bearer token（任务 9.1）：走完整 HTTP 登录链路，登录端点一并被覆盖。
+func e2eAdminToken(t *testing.T, ctx context.Context, pool *pgxpool.Pool, client *http.Client, base, username, password string) string {
+	t.Helper()
+	seedAdmin(t, ctx, pool, username, password)
+	body := e2eObj(t, e2eDo(t, client, "", base, http.MethodPost, "/auth/admin/login",
+		map[string]any{"username": username, "password": password}, http.StatusOK))
+	token, _ := body["token"].(string)
+	if token == "" {
+		t.Fatalf("admin login response has no token: %+v", body)
+	}
+	return token
+}
+
 // e2eDo 对测试服务器执行一次 HTTP 调用并断言
-// 状态码；解码后的 JSON body 以 any 类型返回。
-func e2eDo(t *testing.T, client *http.Client, base, method, path string, body any, want int) any {
+// 状态码；解码后的 JSON body 以 any 类型返回。token 非空时附带
+// Authorization: Bearer 头（空串表示匿名请求，用于 401 断言）。
+func e2eDo(t *testing.T, client *http.Client, token, base, method, path string, body any, want int) any {
 	t.Helper()
 	// 使用 io.Reader（而非 *strings.Reader）：类型化的 nil 对 http.NewRequest
 	// 来说是非 nil 的，它会调用 strings.Reader 的 Len() 从而引发 panic。
@@ -475,6 +517,9 @@ func e2eDo(t *testing.T, client *http.Client, base, method, path string, body an
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -520,9 +565,9 @@ type opExpect struct {
 // ext- 合成标识），断言记录数等于 want 且按时间倒序逐条匹配动作/结果/
 // 节点/VMID，并检查 created_at 非空。返回解析出的记录供调用方补充
 // 断言（如失败操作的 error_message）。
-func e2eOperations(t *testing.T, client *http.Client, base, ref string, want []opExpect) []any {
+func e2eOperations(t *testing.T, client *http.Client, token, base, ref string, want []opExpect) []any {
 	t.Helper()
-	body := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+	body := e2eObj(t, e2eDo(t, client, token, base, http.MethodGet,
 		fmt.Sprintf("/vms/%s/operations", ref), nil, http.StatusOK))
 	ops, ok := body["operations"].([]any)
 	if !ok {
@@ -581,6 +626,10 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	pvePort := pveServer.Listener.Addr().(*net.TCPAddr).Port
 
 	router := api.NewRouter(pool, e2eCipher(t),
+		// 注入固定 JWT 密钥（任务 9.1）：与 api/router_test.go 的
+		// testJWTSecret 相同的 e2eJWTSecret，否则 auth 服务构造会因空
+		// 密钥 panic；后续登录/鉴权全部使用该密钥签发与校验。
+		api.WithJWTSecret(e2eJWTSecret),
 		// 工厂签名携带 host/port（任务 4.3）：host 是节点登记的纯地址，
 		// port 是节点的 API 端口。客户端按默认 https 构造 base URL 后由
 		// WithPort 覆盖端口，请求真实打到 fake PVE 的监听端口（任务 6.3）。
@@ -596,15 +645,29 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	client := app.Client()
 	base := app.URL
 
+	// 认证已生效（任务 9.1）：不带 token 的请求一律 401 unauthorized——
+	// 用户体系落地前 e2e 全部请求均无 Authorization 头，此处显式断言
+	// requireAuth 中间件对业务路由的覆盖。
+	anon := e2eObj(t, e2eDo(t, client, "", base, http.MethodGet, "/zones", nil, http.StatusUnauthorized))
+	anonErr := e2eObj(t, anon["error"])
+	if code, _ := anonErr["code"].(string); code != "unauthorized" {
+		t.Fatalf("anonymous /zones error code = %q, want unauthorized", code)
+	}
+
+	// 种子管理员并走真实登录链路换取 admin Bearer token（任务 9.1）：
+	// 直接操作 pool 向 admins 表 INSERT bcrypt 哈希（明文不落库），再经
+	// POST /auth/admin/login 获取 JWT——登录接口本身也一并被覆盖。
+	adminToken := e2eAdminToken(t, ctx, pool, client, base, "e2e-admin", "e2e-admin-pass")
+
 	// 1. 注册部署环境：zone、node（host 携带 fake PVE 的监听端口）、
 	// IP 池 + 节点白名单、存储类型、镜像（在节点上存在）。
-	zone := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/zones", map[string]any{"name": "e2e-zone"}, http.StatusCreated))
+	zone := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/zones", map[string]any{"name": "e2e-zone"}, http.StatusCreated))
 	zoneID := int64(zone["id"].(float64))
 
 	// 1a. 业务名与 fake 集群真实节点名（只有 pve1）不一致 -> 503 被拒，
 	// 错误消息提示集群真实名；登记走的是生产默认探测实现（真实连接 fake
 	// PVE 的 /nodes），因此同时验证了探测链路。
-	mismatch := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
+	mismatch := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
 		fmt.Sprintf("/zones/%d/nodes", zoneID),
 		map[string]any{"name": "aeolian", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
 		http.StatusServiceUnavailable))
@@ -616,7 +679,7 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 		t.Fatalf("mismatch rejection message = %q, want the cluster node name pve1", msg)
 	}
 
-	node := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
+	node := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
 		fmt.Sprintf("/zones/%d/nodes", zoneID),
 		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
 		http.StatusCreated))
@@ -633,7 +696,7 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 
 	// 节点列表同样回显 port（请求确实打到该端口，由后续 VM 生命周期链路
 	// 经同一客户端工厂隐式验证）。
-	listed := e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/zones/%d/nodes", zoneID), nil, http.StatusOK).([]any)
+	listed := e2eDo(t, client, adminToken, base, http.MethodGet, fmt.Sprintf("/zones/%d/nodes", zoneID), nil, http.StatusOK).([]any)
 	if len(listed) != 1 {
 		t.Fatalf("GET nodes = %+v, want 1 node", listed)
 	}
@@ -642,21 +705,21 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 		t.Fatalf("listed node = %+v, want host=127.0.0.1 port=%d", listedNode, pvePort)
 	}
 
-	poolRes := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/ip-pools", map[string]any{
+	poolRes := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/ip-pools", map[string]any{
 		"zone_id": zoneID, "name": "e2e-pool", "network_cidr": "10.9.0.0/24",
 		"gateway": "10.9.0.1", "dns": "1.1.1.1",
 	}, http.StatusCreated))
 	poolID := int64(poolRes["id"].(float64))
 
-	e2eDo(t, client, base, http.MethodPut, fmt.Sprintf("/ip-pools/%d/nodes", poolID),
+	e2eDo(t, client, adminToken, base, http.MethodPut, fmt.Sprintf("/ip-pools/%d/nodes", poolID),
 		map[string]any{"node_ids": []int64{nodeID}}, http.StatusOK)
 
-	st := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/storage-types", map[string]any{
+	st := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/storage-types", map[string]any{
 		"name": "ssd", "display_name": "SSD", "pve_storage": "local-lvm",
 	}, http.StatusCreated))
 	stID := int64(st["id"].(float64))
 
-	img := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/images", map[string]any{
+	img := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/images", map[string]any{
 		"name":         "debian-12-cloud",
 		"default_user": "debian",
 		// 镜像重构后登记改为 download_url：文件由节点代发下载，创建 VM 的
@@ -677,7 +740,7 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 
 	// 1b. 镜像尚未下载到节点上：创建 VM 被 400 image_not_available_in_zone
 	// 拒绝（selectPoolAndNode 扫描节点 content 无匹配），此时不落库、不占 IP。
-	notAvail := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms", map[string]any{
+	notAvail := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms", map[string]any{
 		"name": vmName, "cpu": vmCPU, "mem_mb": vmMemMB, "disk_gb": vmDisk,
 		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": vmPW,
 	}, http.StatusBadRequest))
@@ -693,7 +756,7 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 
 	// 2. 创建虚拟机：201、已分配 IP、过渡状态 "creating"
 	// （PVE 侧此时还不存在）。
-	created := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms", map[string]any{
+	created := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms", map[string]any{
 		"name": vmName, "cpu": vmCPU, "mem_mb": vmMemMB, "disk_gb": vmDisk,
 		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": vmPW,
 	}, http.StatusCreated))
@@ -711,7 +774,7 @@ func TestE2EVMFullLifecycle(t *testing.T) {
 	var detail map[string]any
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		detail = e2eObj(t, e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
+		detail = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
 		switch detail["status"] {
 		case "failed":
 			t.Fatalf("provisioning failed: %v", detail["provision_error"])
@@ -767,15 +830,15 @@ provisioned:
 
 	// 5. 生命周期：start -> PVE running、stop -> stopped、restart ->
 	// running。
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/start", vmID), nil, http.StatusAccepted)
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/vms/%d/start", vmID), nil, http.StatusAccepted)
 	if s := fakePVE.get(100); s == nil || s.status != "running" {
 		t.Fatalf("fake pve status after start = %+v, want running", s)
 	}
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/stop", vmID), nil, http.StatusAccepted)
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/vms/%d/stop", vmID), nil, http.StatusAccepted)
 	if s := fakePVE.get(100); s == nil || s.status != "stopped" {
 		t.Fatalf("fake pve status after stop = %+v, want stopped", s)
 	}
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/restart", vmID), nil, http.StatusAccepted)
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/vms/%d/restart", vmID), nil, http.StatusAccepted)
 	if s := fakePVE.get(100); s == nil || s.status != "running" {
 		t.Fatalf("fake pve status after restart = %+v, want running", s)
 	}
@@ -783,7 +846,7 @@ provisioned:
 	// 5b. 操作记录（托管 VM）：start/stop/restart 受理后各写入一条
 	// accepted 记录，GET /vms/{id}/operations 按时间倒序返回
 	// 动作/结果/节点/时间。
-	e2eOperations(t, client, base, strconv.FormatInt(vmID, 10), []opExpect{
+	e2eOperations(t, client, adminToken, base, strconv.FormatInt(vmID, 10), []opExpect{
 		{action: "reboot", result: "accepted", nodeID: nodeID, vmid: 100},
 		{action: "stop", result: "accepted", nodeID: nodeID, vmid: 100},
 		{action: "start", result: "accepted", nodeID: nodeID, vmid: 100},
@@ -793,10 +856,10 @@ provisioned:
 	// disk 会成功，并在 PVE 侧生效（config + resize）。
 	// 该操作是对虚拟机资源的 PATCH（JSON Merge Patch 语义：
 	// 未出现的字段保持当前值）。
-	e2eDo(t, client, base, http.MethodPatch, fmt.Sprintf("/vms/%d", vmID),
+	e2eDo(t, client, adminToken, base, http.MethodPatch, fmt.Sprintf("/vms/%d", vmID),
 		map[string]any{"disk_gb": 5}, http.StatusUnprocessableEntity)
 
-	resized := e2eObj(t, e2eDo(t, client, base, http.MethodPatch, fmt.Sprintf("/vms/%d", vmID),
+	resized := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPatch, fmt.Sprintf("/vms/%d", vmID),
 		map[string]any{"cpu": 4, "mem_mb": 4096, "disk_gb": 20}, http.StatusOK))
 	if resized["cpu"] != float64(4) || resized["mem_mb"] != float64(4096) || resized["disk_gb"] != float64(20) {
 		t.Fatalf("resized vm = %+v, want cpu=4 mem=4096 disk=20", resized)
@@ -814,7 +877,7 @@ provisioned:
 
 	// 7. 透传的列表与详情：虚拟机以实时 PVE
 	// 状态出现（restart 后为 running）。
-	list := e2eObj(t, e2eDo(t, client, base, http.MethodGet, "/vms", nil, http.StatusOK))
+	list := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, "/vms", nil, http.StatusOK))
 	found := false
 	for _, raw := range list["vms"].([]any) {
 		item := raw.(map[string]any)
@@ -828,7 +891,7 @@ provisioned:
 	if !found {
 		t.Fatal("GET /vms does not contain the created VM")
 	}
-	detail = e2eObj(t, e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
+	detail = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
 	if detail["status"] != "running" {
 		t.Fatalf("detail status = %v, want running", detail["status"])
 	}
@@ -840,6 +903,7 @@ provisioned:
 	if err != nil {
 		t.Fatalf("build paginated list request: %v", err)
 	}
+	pagedReq.Header.Set("Authorization", "Bearer "+adminToken)
 	pagedResp, err := client.Do(pagedReq)
 	if err != nil {
 		t.Fatalf("GET /vms?limit=1&offset=0: %v", err)
@@ -873,7 +937,7 @@ provisioned:
 
 	// 8. 销毁：DELETE /vms/:id 返回 204 且无响应体；PVE 虚拟机被
 	// 删除，IP 释放回 free，vms 数据行消失。
-	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusNoContent)
+	e2eDo(t, client, adminToken, base, http.MethodDelete, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusNoContent)
 	if got := fakePVE.get(100); got != nil {
 		t.Fatalf("fake pve still has VM 100 after destroy: %+v", got)
 	}
@@ -898,7 +962,7 @@ provisioned:
 	// 8b. destroy 受理后写入 accepted 记录；本地行虽已删除，操作记录是
 	// 审计历史不随 VM 删除——经 ext-{nodeID}-100 合成标识仍可查询到
 	// 全部 4 条（destroy/reboot/stop/start，倒序）。
-	e2eOperations(t, client, base, fmt.Sprintf("ext-%d-100", nodeID), []opExpect{
+	e2eOperations(t, client, adminToken, base, fmt.Sprintf("ext-%d-100", nodeID), []opExpect{
 		{action: "destroy", result: "accepted", nodeID: nodeID, vmid: 100},
 		{action: "reboot", result: "accepted", nodeID: nodeID, vmid: 100},
 		{action: "stop", result: "accepted", nodeID: nodeID, vmid: 100},
@@ -946,7 +1010,7 @@ provisioned:
 	// 请求落入 GET /vms/:id 通配并被 bad_request 拒绝（原"候选列表"
 	// 语义彻底消失，认领入口改为基于列表中的 external 条目，spec：
 	// 未托管虚拟机候选查询已移除）。
-	unmanagedGone := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+	unmanagedGone := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet,
 		fmt.Sprintf("/vms/unmanaged?node_id=%d", nodeID), nil, http.StatusBadRequest))
 	unmanagedGoneErr := e2eObj(t, unmanagedGone["error"])
 	if code, _ := unmanagedGoneErr["code"].(string); code != "bad_request" {
@@ -956,7 +1020,7 @@ provisioned:
 	// 9b. 列表并入 external 条目：vmid 200/202/203 以合成 id
 	// ext-{nodeID}-{vmid} 出现，source=external、uuid/created_at/
 	// updated_at 为空、规格取 PVE 摘要；PVE 模板（vmid=201）不出现。
-	list = e2eObj(t, e2eDo(t, client, base, http.MethodGet, "/vms", nil, http.StatusOK))
+	list = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, "/vms", nil, http.StatusOK))
 	externalByVmid := map[int64]map[string]any{}
 	for _, raw := range list["vms"].([]any) {
 		item := e2eObj(t, raw)
@@ -1002,6 +1066,7 @@ provisioned:
 	if err != nil {
 		t.Fatalf("build paginated external list request: %v", err)
 	}
+	pagedReq2.Header.Set("Authorization", "Bearer "+adminToken)
 	pagedResp2, err := client.Do(pagedReq2)
 	if err != nil {
 		t.Fatalf("GET /vms?limit=1&offset=1: %v", err)
@@ -1028,15 +1093,15 @@ provisioned:
 
 	// 9d. external 直接生命周期：ext- 标识的 start/stop/restart 直调 PVE
 	//（无需本地记录）-> 202，fake 状态随之变化。
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%s/start", extID(202)), nil, http.StatusAccepted)
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/vms/%s/start", extID(202)), nil, http.StatusAccepted)
 	if s := fakePVE.get(202); s == nil || s.status != "running" {
 		t.Fatalf("fake pve status of external vm after start = %+v, want running", s)
 	}
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%s/stop", extID(202)), nil, http.StatusAccepted)
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/vms/%s/stop", extID(202)), nil, http.StatusAccepted)
 	if s := fakePVE.get(202); s == nil || s.status != "stopped" {
 		t.Fatalf("fake pve status of external vm after stop = %+v, want stopped", s)
 	}
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%s/restart", extID(202)), nil, http.StatusAccepted)
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/vms/%s/restart", extID(202)), nil, http.StatusAccepted)
 	if s := fakePVE.get(202); s == nil || s.status != "running" {
 		t.Fatalf("fake pve status of external vm after restart = %+v, want running", s)
 	}
@@ -1047,7 +1112,7 @@ provisioned:
 	// 大小解析仅支持 size= 前缀形态（registerVM 的 scsi0 为
 	// "local-lvm:vm-202-disk-0,size=30G"），因此 disk_gb=0 且
 	// mem/maxdisk/cpu_usage/uptime 以零值省略——断言按 fake 实际输出。
-	extDetail := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+	extDetail := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet,
 		fmt.Sprintf("/vms/%s", extID(202)), nil, http.StatusOK))
 	if extDetail["id"] != extID(202) || extDetail["source"] != "external" {
 		t.Fatalf("external detail id/source = %v / %v, want %s / external", extDetail["id"], extDetail["source"], extID(202))
@@ -1080,14 +1145,14 @@ provisioned:
 	// stop -> 500；随后清除注入，成功路径恢复。失败操作的审计记录断言
 	// 在 9f 中进行。
 	fakePVE.setStatusError(202, "simulated pve failure")
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%s/stop", extID(202)), nil, http.StatusInternalServerError)
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/vms/%s/stop", extID(202)), nil, http.StatusInternalServerError)
 	fakePVE.clearStatusError(202)
 
 	// 9f. 操作记录（external VM）：GET /vms/ext-{nodeID}-202/operations
 	// 按时间倒序返回 4 条——[stop failed, restart accepted, stop accepted,
 	// start accepted]，节点/VMID/时间齐全；失败记录的 error_message 已
 	// 脱敏（保留失败原因、不含内部 host:port）。
-	ops := e2eOperations(t, client, base, extID(202), []opExpect{
+	ops := e2eOperations(t, client, adminToken, base, extID(202), []opExpect{
 		{action: "stop", result: "failed", nodeID: nodeID, vmid: 202},
 		{action: "reboot", result: "accepted", nodeID: nodeID, vmid: 202},
 		{action: "stop", result: "accepted", nodeID: nodeID, vmid: 202},
@@ -1101,11 +1166,11 @@ provisioned:
 	// 9g. external destroy：DELETE -> 204，fake 上的 VM 被删除；之后对
 	// 已销毁的 ext- 标识再次操作 -> 404 vm_not_found_on_node（spec：对
 	// 不存在的虚拟机执行操作返回资源不存在）。
-	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%s", extID(202)), nil, http.StatusNoContent)
+	e2eDo(t, client, adminToken, base, http.MethodDelete, fmt.Sprintf("/vms/%s", extID(202)), nil, http.StatusNoContent)
 	if got := fakePVE.get(202); got != nil {
 		t.Fatalf("fake pve still has VM 202 after external destroy: %+v", got)
 	}
-	gone := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
+	gone := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
 		fmt.Sprintf("/vms/%s/start", extID(202)), nil, http.StatusNotFound))
 	goneErr := e2eObj(t, gone["error"])
 	if code, _ := goneErr["code"].(string); code != "vm_not_found_on_node" {
@@ -1113,7 +1178,7 @@ provisioned:
 	}
 	// 9g2. external 详情对已销毁 VM：GET /vms/ext-{nodeID}-202 -> 404
 	// vm_not_found_on_node（节点可达但 VM 已从 PVE 移除）。
-	goneDetail := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+	goneDetail := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet,
 		fmt.Sprintf("/vms/%s", extID(202)), nil, http.StatusNotFound))
 	goneDetailErr := e2eObj(t, goneDetail["error"])
 	if code, _ := goneDetailErr["code"].(string); code != "vm_not_found_on_node" {
@@ -1121,7 +1186,7 @@ provisioned:
 	}
 	// 操作记录是审计历史，不随 VM 销毁而删除：destroy 受理后共 5 条，
 	// 最新一条为 destroy/accepted（ext- 查询不校验 VM 当前是否存在）。
-	e2eOperations(t, client, base, extID(202), []opExpect{
+	e2eOperations(t, client, adminToken, base, extID(202), []opExpect{
 		{action: "destroy", result: "accepted", nodeID: nodeID, vmid: 202},
 		{action: "stop", result: "failed", nodeID: nodeID, vmid: 202},
 		{action: "reboot", result: "accepted", nodeID: nodeID, vmid: 202},
@@ -1138,6 +1203,7 @@ provisioned:
 		t.Fatalf("build import request: %v", err)
 	}
 	importReq.Header.Set("Content-Type", "application/json")
+	importReq.Header.Set("Authorization", "Bearer "+adminToken)
 	importResp, err := client.Do(importReq)
 	if err != nil {
 		t.Fatalf("POST /vms/import: %v", err)
@@ -1192,7 +1258,7 @@ provisioned:
 
 	// 10b. 幂等：同一节点上的同一 pve_vmid 重复认领 -> 409
 	// vm_already_managed。
-	idem := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms/import",
+	idem := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms/import",
 		map[string]any{"zone_id": zoneID, "node_id": nodeID, "pve_vmid": 200},
 		http.StatusConflict))
 	idemErr := e2eObj(t, idem["error"])
@@ -1202,7 +1268,7 @@ provisioned:
 
 	// 10c. 认领（携带 ip）：10.9.0.11 落在 e2e-pool（10.9.0.0/24）网段
 	// 内，从池按地址占用并记录到本地元数据；source=claimed。
-	withIP := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms/import",
+	withIP := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms/import",
 		map[string]any{"zone_id": zoneID, "node_id": nodeID, "pve_vmid": 203, "ip": "10.9.0.11"},
 		http.StatusCreated))
 	withIPID := int64(withIP["id"].(float64))
@@ -1221,7 +1287,7 @@ provisioned:
 
 	// 11. 列表与详情：GET /vms 中 200/203 以 source=claimed 出现（不再
 	// 以 external 呈现）；GET /vms/:id 的 image_id/storage_type_id 可空。
-	list = e2eObj(t, e2eDo(t, client, base, http.MethodGet, "/vms", nil, http.StatusOK))
+	list = e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, "/vms", nil, http.StatusOK))
 	claimedSources := map[int64]string{}
 	for _, raw := range list["vms"].([]any) {
 		item := e2eObj(t, raw)
@@ -1236,7 +1302,7 @@ provisioned:
 			t.Fatalf("claimed vm %d missing from list or source = %q, want claimed (sources: %+v)", id, src, claimedSources)
 		}
 	}
-	importedDetail := e2eObj(t, e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/vms/%d", importedID), nil, http.StatusOK))
+	importedDetail := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, fmt.Sprintf("/vms/%d", importedID), nil, http.StatusOK))
 	if importedDetail["status"] != "stopped" {
 		t.Fatalf("detail status of imported vm = %v, want stopped", importedDetail["status"])
 	}
@@ -1253,7 +1319,7 @@ provisioned:
 	// vmid 200 经 GET /vms/ext-{nodeID}-200 得到数字行 id（含 uuid、
 	// source=claimed），而非 external 形态（合成 id、空 uuid）——与列表
 	// 差集、生命周期 resolveVMTarget 的路由语义一致。
-	claimedViaExt := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+	claimedViaExt := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet,
 		fmt.Sprintf("/vms/%s", extID(200)), nil, http.StatusOK))
 	if claimedViaExt["id"] != float64(importedID) {
 		t.Fatalf("claimed vm via ext- id = %v, want local numeric id %d", claimedViaExt["id"], importedID)
@@ -1270,22 +1336,22 @@ provisioned:
 	// 12. 认领即托管：start/resize 直接生效——start -> PVE running；
 	// PATCH cpu=2 -> PVE config cores=2。start 受理后经数字 id 查询到
 	// 1 条 accepted 记录。
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/vms/%d/start", importedID), nil, http.StatusAccepted)
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/vms/%d/start", importedID), nil, http.StatusAccepted)
 	if s := fakePVE.get(200); s == nil || s.status != "running" {
 		t.Fatalf("fake pve status of imported vm after start = %+v, want running", s)
 	}
-	e2eDo(t, client, base, http.MethodPatch, fmt.Sprintf("/vms/%d", importedID),
+	e2eDo(t, client, adminToken, base, http.MethodPatch, fmt.Sprintf("/vms/%d", importedID),
 		map[string]any{"cpu": 2}, http.StatusOK)
 	if cfg := fakePVE.get(200).config; cfg["cores"] != "2" {
 		t.Fatalf("pve config after import resize = %+v, want cores=2", cfg)
 	}
-	e2eOperations(t, client, base, strconv.FormatInt(importedID, 10), []opExpect{
+	e2eOperations(t, client, adminToken, base, strconv.FormatInt(importedID, 10), []opExpect{
 		{action: "start", result: "accepted", nodeID: nodeID, vmid: 200},
 	})
 
 	// 13. 销毁带 IP 的认领 VM：DELETE -> 204；PVE 虚拟机被删除，占用的
 	// IP 10.9.0.11 释放回 free（vm_id 置空），vms 数据行消失。
-	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%d", withIPID), nil, http.StatusNoContent)
+	e2eDo(t, client, adminToken, base, http.MethodDelete, fmt.Sprintf("/vms/%d", withIPID), nil, http.StatusNoContent)
 	if got := fakePVE.get(203); got != nil {
 		t.Fatalf("fake pve still has VM 203 after destroy: %+v", got)
 	}
@@ -1305,7 +1371,7 @@ provisioned:
 	// 14. 销毁无 IP 的认领 VM：DELETE -> 204；PVE 虚拟机被删除、本地行
 	// 消失（无 IP 可释放）。destroy 受理后经 ext-{nodeID}-200 仍可查询到
 	// 操作记录：[destroy accepted, start accepted]（审计不随 VM 删除）。
-	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%d", importedID), nil, http.StatusNoContent)
+	e2eDo(t, client, adminToken, base, http.MethodDelete, fmt.Sprintf("/vms/%d", importedID), nil, http.StatusNoContent)
 	if got := fakePVE.get(200); got != nil {
 		t.Fatalf("fake pve still has VM 200 after destroy: %+v", got)
 	}
@@ -1315,14 +1381,14 @@ provisioned:
 	if vmCount != 0 {
 		t.Fatalf("vms row count = %d after import destroy, want 0", vmCount)
 	}
-	e2eOperations(t, client, base, extID(200), []opExpect{
+	e2eOperations(t, client, adminToken, base, extID(200), []opExpect{
 		{action: "destroy", result: "accepted", nodeID: nodeID, vmid: 200},
 		{action: "start", result: "accepted", nodeID: nodeID, vmid: 200},
 	})
 
 	// 15. 查询本地不存在的 VM 的操作记录 -> 404 not_found（spec：查询
 	// 不存在虚拟机的记录返回资源不存在）。
-	noOpsVM := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+	noOpsVM := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet,
 		"/vms/999999/operations", nil, http.StatusNotFound))
 	noOpsErr := e2eObj(t, noOpsVM["error"])
 	if code, _ := noOpsErr["code"].(string); code != "not_found" {
@@ -1333,23 +1399,305 @@ provisioned:
 	// 证书，探测与调用使用同一客户端工厂均能信任）注册节点后关闭其
 	// 监听——节点行仍在但 PVE 不可达，GET /vms/ext-{nodeID}-100 ->
 	// 503 node_unavailable，绝不伪造状态。
-	zone2 := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/zones",
+	zone2 := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/zones",
 		map[string]any{"name": "e2e-zone2"}, http.StatusCreated))
 	zone2ID := int64(zone2["id"].(float64))
 	pve2Srv := httptest.NewUnstartedServer(newFakePVE(t))
 	pve2Srv.TLS = pveServer.TLS // 共享同一证书：探测与后续调用都走 pveServer.Client()
 	pve2Srv.StartTLS()
-	node2 := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
+	node2 := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
 		fmt.Sprintf("/zones/%d/nodes", zone2ID),
 		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pve2Srv.Listener.Addr().(*net.TCPAddr).Port), "api_user": "root@pam", "api_token": "spark=uuid"},
 		http.StatusCreated))
 	node2ID := int64(node2["id"].(float64))
 	pve2Srv.Close()
-	unavail := e2eObj(t, e2eDo(t, client, base, http.MethodGet,
+	unavail := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet,
 		fmt.Sprintf("/vms/ext-%d-100", node2ID), nil, http.StatusServiceUnavailable))
 	unavailErr := e2eObj(t, unavail["error"])
 	if code, _ := unavailErr["code"].(string); code != "node_unavailable" {
 		t.Fatalf("detail of external vm on unreachable node: error code = %q, want node_unavailable", code)
+	}
+
+	// ---------- 用户体系端到端（feat/user-management-config） ----------
+
+	// 17. 用户视角（任务 9.2）：admin 创建用户 u1/u2 -> 各自登录 -> u1 创建
+	// 归属自己的 VM（不传 user_id 默认归属自身）-> 列表/详情仅见自己 ->
+	// 操作他人 VM 403 -> external VM 对用户不可见且操作 403 -> 用户令牌
+	// 访问管理员接口 403 -> 用户销毁自己的 VM 放行。环境复用本节已有
+	// zone/node/IP 池/存储/镜像（镜像文件仍登记在 fake 节点上），置于
+	// 全部既有断言之后以免影响其分页总数等口径。
+	u1 := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/users", map[string]any{
+		"username": "e2e-user-1", "password": "u1-pass-1", "name": "User One",
+	}, http.StatusCreated))
+	u1ID := int64(u1["id"].(float64))
+	u2 := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/users", map[string]any{
+		"username": "e2e-user-2", "password": "u2-pass-2", "name": "User Two",
+	}, http.StatusCreated))
+	u2ID := int64(u2["id"].(float64))
+
+	// u1 登录（POST /auth/login）：user JWT + user_id 与创建响应一致。
+	u1Login := e2eObj(t, e2eDo(t, client, "", base, http.MethodPost, "/auth/login",
+		map[string]any{"username": "e2e-user-1", "password": "u1-pass-1"}, http.StatusOK))
+	u1Token, _ := u1Login["token"].(string)
+	if u1Token == "" {
+		t.Fatalf("u1 login response has no token: %+v", u1Login)
+	}
+	if u1Login["user_id"] != float64(u1ID) {
+		t.Fatalf("u1 login user_id = %v, want %d", u1Login["user_id"], u1ID)
+	}
+	// u2 登录仅作第二个用户凭证可用的冒烟断言（403 断言使用 u1 令牌）。
+	u2Login := e2eObj(t, e2eDo(t, client, "", base, http.MethodPost, "/auth/login",
+		map[string]any{"username": "e2e-user-2", "password": "u2-pass-2"}, http.StatusOK))
+	if u2Login["user_id"] != float64(u2ID) {
+		t.Fatalf("u2 login user_id = %v, want %d", u2Login["user_id"], u2ID)
+	}
+
+	// 等待供给完成的本地轮询（与步骤 3 同模式）：token 区分请求身份。
+	waitProvisioned := func(token string, id int64) {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			d := e2eObj(t, e2eDo(t, client, token, base, http.MethodGet,
+				fmt.Sprintf("/vms/%d", id), nil, http.StatusOK))
+			switch d["status"] {
+			case "failed":
+				t.Fatalf("provisioning failed: %v", d["provision_error"])
+			case "creating":
+				if time.Now().After(deadline) {
+					t.Fatalf("provisioning did not finish within 15s (last status %q)", d["status"])
+				}
+				time.Sleep(200 * time.Millisecond)
+			default:
+				return
+			}
+		}
+	}
+
+	// u1 创建 VM：不传 user_id，默认归属自身（fake PVE 供给链真实跑，
+	// vmid 取下一号 101——100 已被既有创建消耗，registerVM 不推进 nextID）。
+	u1VM := e2eObj(t, e2eDo(t, client, u1Token, base, http.MethodPost, "/vms", map[string]any{
+		"name": "e2e-user-vm-1", "cpu": 1, "mem_mb": 1024, "disk_gb": 10,
+		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": "u1-vm-pw",
+	}, http.StatusCreated))
+	u1VMID := int64(u1VM["id"].(float64))
+	waitProvisioned(u1Token, u1VMID)
+	u1Detail := e2eObj(t, e2eDo(t, client, u1Token, base, http.MethodGet,
+		fmt.Sprintf("/vms/%d", u1VMID), nil, http.StatusOK))
+	if u1Detail["status"] != "stopped" || u1Detail["pve_vmid"] != float64(101) {
+		t.Fatalf("u1 vm detail = %+v, want stopped with pve_vmid 101", u1Detail)
+	}
+	// 归属落库断言：vms.user_id 指向 u1（响应负载不含 user_id 字段，
+	// 直接查库验证，与既有 ips/vms 直查风格一致）。
+	var u1UserID *int64
+	if err := pool.QueryRow(ctx, "SELECT user_id FROM vms WHERE id=$1", u1VMID).Scan(&u1UserID); err != nil {
+		t.Fatalf("query user_id of u1 vm: %v", err)
+	}
+	if u1UserID == nil || *u1UserID != u1ID {
+		t.Fatalf("u1 vm %d user_id = %v, want u1 (%d)", u1VMID, u1UserID, u1ID)
+	}
+
+	// admin 为 u2 创建 VM（admin 可指定任意归属用户）。
+	u2VM := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms", map[string]any{
+		"name": "e2e-user-vm-2", "cpu": 1, "mem_mb": 1024, "disk_gb": 10,
+		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID,
+		"password": "u2-vm-pw", "user_id": u2ID,
+	}, http.StatusCreated))
+	u2VMID := int64(u2VM["id"].(float64))
+	waitProvisioned(adminToken, u2VMID)
+
+	// u1 列表分流：仅含归属自己的 VM（u1VM 在列、u2VM 不在列），
+	// external 条目对用户一律剔除。
+	assertUserListOnlyOwn := func() {
+		t.Helper()
+		userList := e2eObj(t, e2eDo(t, client, u1Token, base, http.MethodGet, "/vms", nil, http.StatusOK))
+		var numeric []int64
+		for _, raw := range userList["vms"].([]any) {
+			item := e2eObj(t, raw)
+			switch id := item["id"].(type) {
+			case float64:
+				numeric = append(numeric, int64(id))
+			case string:
+				t.Fatalf("user list must not contain external entry %s (vms: %+v)", id, userList["vms"])
+			}
+		}
+		if len(numeric) != 1 || numeric[0] != u1VMID {
+			t.Fatalf("user list vms = %v, want only own vm %d", numeric, u1VMID)
+		}
+	}
+	assertUserListOnlyOwn()
+
+	// u1 操作他人 VM -> 403 forbidden（归属校验在触碰 PVE 之前拦截）；
+	// 详情同理 403。
+	forb := e2eObj(t, e2eDo(t, client, u1Token, base, http.MethodPost,
+		fmt.Sprintf("/vms/%d/start", u2VMID), nil, http.StatusForbidden))
+	forbErr := e2eObj(t, forb["error"])
+	if code, _ := forbErr["code"].(string); code != "forbidden" {
+		t.Fatalf("u1 start u2's vm: error code = %q, want forbidden", code)
+	}
+	e2eDo(t, client, u1Token, base, http.MethodGet,
+		fmt.Sprintf("/vms/%d", u2VMID), nil, http.StatusForbidden)
+	// 归属校验拦截在 PVE 调用之前：u2 的 VM 不应被 u1 触碰（fake 状态不变）。
+	if s := fakePVE.get(102); s == nil || s.status != "stopped" {
+		t.Fatalf("fake pve state of u2 vm after forbidden start = %+v, want untouched stopped", s)
+	}
+
+	// external 对用户不可见：fake 登记一台未导入 VM（vmid=204 避开已用
+	// 编号），用户列表不出现、详情与操作一律 403。
+	fakePVE.registerVM(204, "user-invisible-external", map[string]string{
+		"name":   "user-invisible-external",
+		"cores":  "2",
+		"memory": "2048",
+		"scsi0":  "local-lvm:vm-204-disk-0,size=30G",
+	})
+	assertUserListOnlyOwn()
+	e2eDo(t, client, u1Token, base, http.MethodGet,
+		fmt.Sprintf("/vms/%s", extID(204)), nil, http.StatusForbidden)
+	e2eDo(t, client, u1Token, base, http.MethodPost,
+		fmt.Sprintf("/vms/%s/start", extID(204)), nil, http.StatusForbidden)
+
+	// u1 访问管理员接口（/users）-> 403 forbidden。
+	e2eDo(t, client, u1Token, base, http.MethodGet, "/users", nil, http.StatusForbidden)
+
+	// u1 销毁自己的 VM -> 204（归属校验放行），PVE 实体被删除。
+	e2eDo(t, client, u1Token, base, http.MethodDelete,
+		fmt.Sprintf("/vms/%d", u1VMID), nil, http.StatusNoContent)
+	if got := fakePVE.get(101); got != nil {
+		t.Fatalf("fake pve still has VM 101 after user destroy: %+v", got)
+	}
+
+	// 18. 禁用用户（任务 9.3 部分）：admin 创建 u3 -> 登录拿 token ->
+	// 禁用 -> 重新登录 401、已签发 token 请求 401（requireAuth 每次请求
+	// 查库校验启用状态）。
+	u3 := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/users", map[string]any{
+		"username": "e2e-user-3", "password": "u3-pass-3", "name": "User Three",
+	}, http.StatusCreated))
+	u3ID := int64(u3["id"].(float64))
+	u3Login := e2eObj(t, e2eDo(t, client, "", base, http.MethodPost, "/auth/login",
+		map[string]any{"username": "e2e-user-3", "password": "u3-pass-3"}, http.StatusOK))
+	u3Token, _ := u3Login["token"].(string)
+	if u3Token == "" {
+		t.Fatalf("u3 login response has no token: %+v", u3Login)
+	}
+	disabled := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPut,
+		fmt.Sprintf("/users/%d/status", u3ID), map[string]any{"status": "disabled"}, http.StatusOK))
+	if disabled["status"] != "disabled" {
+		t.Fatalf("disable u3: status = %v, want disabled", disabled["status"])
+	}
+	e2eDo(t, client, "", base, http.MethodPost, "/auth/login",
+		map[string]any{"username": "e2e-user-3", "password": "u3-pass-3"}, http.StatusUnauthorized)
+	e2eDo(t, client, u3Token, base, http.MethodGet, "/vms", nil, http.StatusUnauthorized)
+	// 恢复启用，供后续删除流程收尾（非语义必需）。
+	e2eDo(t, client, adminToken, base, http.MethodPut,
+		fmt.Sprintf("/users/%d/status", u3ID), map[string]any{"status": "enabled"}, http.StatusOK)
+
+	// 19. 用户 CRUD 全路径（任务 9.3）：创建 201 + Location、
+	// 列表 X-Total-Count、详情 200、修改 200、重复创建 409。
+	u4Req, err := http.NewRequest(http.MethodPost, base+"/users", strings.NewReader(
+		`{"username":"e2e-user-4","password":"u4-pass-4","name":"User Four"}`))
+	if err != nil {
+		t.Fatalf("build create user request: %v", err)
+	}
+	u4Req.Header.Set("Content-Type", "application/json")
+	u4Req.Header.Set("Authorization", "Bearer "+adminToken)
+	u4Resp, err := client.Do(u4Req)
+	if err != nil {
+		t.Fatalf("POST /users (u4): %v", err)
+	}
+	if u4Resp.StatusCode != http.StatusCreated {
+		raw := make([]byte, 4096)
+		n, _ := u4Resp.Body.Read(raw)
+		t.Fatalf("POST /users (u4): status %d, want 201 (body: %s)", u4Resp.StatusCode, strings.TrimSpace(string(raw[:n])))
+	}
+	var u4Body any
+	if err := json.NewDecoder(u4Resp.Body).Decode(&u4Body); err != nil {
+		t.Fatalf("POST /users (u4): decode body: %v", err)
+	}
+	u4Resp.Body.Close()
+	u4Obj := e2eObj(t, u4Body)
+	u4ID := int64(u4Obj["id"].(float64))
+	if loc := u4Resp.Header.Get("Location"); loc != fmt.Sprintf("/users/%d", u4ID) {
+		t.Fatalf("create user Location = %q, want /users/%d", loc, u4ID)
+	}
+	// 列表：X-Total-Count 为当前全部用户数（u1-u4 共 4 个，无外部数据）。
+	uListReq, err := http.NewRequest(http.MethodGet, base+"/users", nil)
+	if err != nil {
+		t.Fatalf("build list users request: %v", err)
+	}
+	uListReq.Header.Set("Authorization", "Bearer "+adminToken)
+	uListResp, err := client.Do(uListReq)
+	if err != nil {
+		t.Fatalf("GET /users: %v", err)
+	}
+	if uListResp.StatusCode != http.StatusOK {
+		raw := make([]byte, 4096)
+		n, _ := uListResp.Body.Read(raw)
+		t.Fatalf("GET /users: status %d, want 200 (body: %s)", uListResp.StatusCode, strings.TrimSpace(string(raw[:n])))
+	}
+	listTotal, err := strconv.Atoi(uListResp.Header.Get("X-Total-Count"))
+	if err != nil || listTotal < 4 {
+		t.Fatalf("GET /users X-Total-Count = %q, want an integer >= 4", uListResp.Header.Get("X-Total-Count"))
+	}
+	var uListBody []any
+	if err := json.NewDecoder(uListResp.Body).Decode(&uListBody); err != nil {
+		t.Fatalf("GET /users: decode body: %v", err)
+	}
+	uListResp.Body.Close()
+	foundU4 := false
+	for _, raw := range uListBody {
+		if u := e2eObj(t, raw); int64(u["id"].(float64)) == u4ID {
+			foundU4 = true
+		}
+	}
+	if !foundU4 {
+		t.Fatalf("GET /users does not contain u4 (%d): %+v", u4ID, uListBody)
+	}
+	u4Detail := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet,
+		fmt.Sprintf("/users/%d", u4ID), nil, http.StatusOK))
+	if u4Detail["username"] != "e2e-user-4" || u4Detail["name"] != "User Four" || u4Detail["status"] != "enabled" {
+		t.Fatalf("u4 detail = %+v, want e2e-user-4 / User Four / enabled", u4Detail)
+	}
+	updated := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPut,
+		fmt.Sprintf("/users/%d", u4ID), map[string]any{"name": "User Four Renamed"}, http.StatusOK))
+	if updated["name"] != "User Four Renamed" {
+		t.Fatalf("updated u4 name = %v, want User Four Renamed", updated["name"])
+	}
+	dupe := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/users",
+		map[string]any{"username": "e2e-user-4", "password": "u4-pass-4"}, http.StatusConflict))
+	dupeErr := e2eObj(t, dupe["error"])
+	if code, _ := dupeErr["code"].(string); code != "conflict" {
+		t.Fatalf("duplicate create user code = %q, want conflict", code)
+	}
+
+	// 20. 有资源禁删（任务 9.3）：u2 名下仍有 VM（u2VM）-> DELETE 409
+	// user_has_resources；销毁 VM 后删除 -> 204；其余无资源用户（u1 已
+	// 自毁 VM、u3/u4 无资源）删除 -> 204；全部删除后列表为空。
+	blocked := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodDelete,
+		fmt.Sprintf("/users/%d", u2ID), nil, http.StatusConflict))
+	blockedErr := e2eObj(t, blocked["error"])
+	if code, _ := blockedErr["code"].(string); code != "user_has_resources" {
+		t.Fatalf("delete u2 with vm: error code = %q, want user_has_resources", code)
+	}
+	e2eDo(t, client, adminToken, base, http.MethodDelete,
+		fmt.Sprintf("/vms/%d", u2VMID), nil, http.StatusNoContent)
+	for _, id := range []int64{u2ID, u1ID, u3ID, u4ID} {
+		e2eDo(t, client, adminToken, base, http.MethodDelete,
+			fmt.Sprintf("/users/%d", id), nil, http.StatusNoContent)
+	}
+	emptyReq, err := http.NewRequest(http.MethodGet, base+"/users", nil)
+	if err != nil {
+		t.Fatalf("build empty users list request: %v", err)
+	}
+	emptyReq.Header.Set("Authorization", "Bearer "+adminToken)
+	emptyResp, err := client.Do(emptyReq)
+	if err != nil {
+		t.Fatalf("GET /users (empty): %v", err)
+	}
+	defer emptyResp.Body.Close()
+	if emptyResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /users (empty): status %d, want 200", emptyResp.StatusCode)
+	}
+	if totalRaw := emptyResp.Header.Get("X-Total-Count"); totalRaw != "0" {
+		t.Fatalf("GET /users X-Total-Count after deletes = %q, want 0", totalRaw)
 	}
 }
 
@@ -1391,6 +1739,10 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 			pve.WithTimeout(5*time.Second))
 	}
 	router := api.NewRouter(pool, e2eCipher(t),
+		// 注入固定 JWT 密钥（任务 9.1）：与 api/router_test.go 的
+		// testJWTSecret 相同的 e2eJWTSecret，否则 auth 服务构造会因空
+		// 密钥 panic；登录/鉴权链路使用该密钥签发与校验测试令牌。
+		api.WithJWTSecret(e2eJWTSecret),
 		api.WithVMClientFactory(newFakeClient),
 		api.WithImageClientFactory(newFakeClient))
 	app := httptest.NewServer(router)
@@ -1399,35 +1751,45 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 	client := app.Client()
 	base := app.URL
 
+	// 认证已生效（任务 9.1）：不带 token 的请求一律 401 unauthorized。
+	anon := e2eObj(t, e2eDo(t, client, "", base, http.MethodGet, "/zones", nil, http.StatusUnauthorized))
+	anonErr := e2eObj(t, anon["error"])
+	if code, _ := anonErr["code"].(string); code != "unauthorized" {
+		t.Fatalf("anonymous /zones error code = %q, want unauthorized", code)
+	}
+
+	// 种子管理员并走真实登录链路换取 admin Bearer token（任务 9.1）。
+	adminToken := e2eAdminToken(t, ctx, pool, client, base, "e2e-img-admin", "e2e-img-admin-pass")
+
 	// 注册部署环境：zone、node、IP 池 + 节点白名单、存储类型。
-	zone := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/zones", map[string]any{"name": "e2e-img-zone"}, http.StatusCreated))
+	zone := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/zones", map[string]any{"name": "e2e-img-zone"}, http.StatusCreated))
 	zoneID := int64(zone["id"].(float64))
-	node := e2eObj(t, e2eDo(t, client, base, http.MethodPost,
+	node := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost,
 		fmt.Sprintf("/zones/%d/nodes", zoneID),
 		map[string]any{"name": "pve1", "host": fmt.Sprintf("127.0.0.1:%d", pvePort), "api_user": "root@pam", "api_token": "spark=uuid"},
 		http.StatusCreated))
 	nodeID := int64(node["id"].(float64))
-	poolRes := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/ip-pools", map[string]any{
+	poolRes := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/ip-pools", map[string]any{
 		"zone_id": zoneID, "name": "e2e-img-pool", "network_cidr": "10.8.0.0/24",
 		"gateway": "10.8.0.1", "dns": "1.1.1.1",
 	}, http.StatusCreated))
 	poolID := int64(poolRes["id"].(float64))
-	e2eDo(t, client, base, http.MethodPut, fmt.Sprintf("/ip-pools/%d/nodes", poolID),
+	e2eDo(t, client, adminToken, base, http.MethodPut, fmt.Sprintf("/ip-pools/%d/nodes", poolID),
 		map[string]any{"node_ids": []int64{nodeID}}, http.StatusOK)
-	st := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/storage-types", map[string]any{
+	st := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/storage-types", map[string]any{
 		"name": "ssd", "display_name": "SSD", "pve_storage": "local-lvm",
 	}, http.StatusCreated))
 	stID := int64(st["id"].(float64))
 
 	// 1. 登记镜像（download_url）：登记本身不产生任何节点上的文件。
 	const imgURL = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
-	img := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/images", map[string]any{
+	img := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/images", map[string]any{
 		"name": "e2e-image-download", "default_user": "debian", "download_url": imgURL,
 	}, http.StatusCreated))
 	imgID := int64(img["id"].(float64))
 
 	// 2. 登记后节点状态：pve1 上 downloaded=false（PVE 实时扫描 import 目录）。
-	statuses := e2eDo(t, client, base, http.MethodGet,
+	statuses := e2eDo(t, client, adminToken, base, http.MethodGet,
 		fmt.Sprintf("/images/%d/nodes-status?zone_id=%d", imgID, zoneID), nil, http.StatusOK).([]any)
 	if len(statuses) != 1 {
 		t.Fatalf("nodes-status = %+v, want 1 status", statuses)
@@ -1438,7 +1800,7 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 	}
 
 	// 3. 区域可用镜像列表为空（没有任何节点持有该镜像）。
-	if zoneImgs := e2eDo(t, client, base, http.MethodGet,
+	if zoneImgs := e2eDo(t, client, adminToken, base, http.MethodGet,
 		fmt.Sprintf("/images?zone_id=%d", zoneID), nil, http.StatusOK).([]any); len(zoneImgs) != 0 {
 		t.Fatalf("GET /images?zone_id=%d = %+v, want empty (image not downloaded yet)", zoneID, zoneImgs)
 	}
@@ -1451,6 +1813,7 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 		t.Fatalf("build image download request: %v", err)
 	}
 	dlReq.Header.Set("Content-Type", "application/json")
+	dlReq.Header.Set("Authorization", "Bearer "+adminToken)
 	dlResp, err := client.Do(dlReq)
 	if err != nil {
 		t.Fatalf("POST /images/%d/download: %v", imgID, err)
@@ -1480,7 +1843,7 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 	// 受理再 WaitTask，fake 任务立即 done）。
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		raw := e2eDo(t, client, base, http.MethodGet,
+		raw := e2eDo(t, client, adminToken, base, http.MethodGet,
 			fmt.Sprintf("/images/%d/operations", imgID), nil, http.StatusOK)
 		ops := raw.([]any)
 		if len(ops) > 0 {
@@ -1503,7 +1866,7 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 
 	// 6. 节点状态翻转：downloaded=true 且 volid 为 local:import/... 卷 ID
 	//（fake 的 download-url 端点把文件写入了 importFiles）。
-	statuses = e2eDo(t, client, base, http.MethodGet,
+	statuses = e2eDo(t, client, adminToken, base, http.MethodGet,
 		fmt.Sprintf("/images/%d/nodes-status?zone_id=%d", imgID, zoneID), nil, http.StatusOK).([]any)
 	if len(statuses) != 1 {
 		t.Fatalf("nodes-status after download = %+v, want 1 status", statuses)
@@ -1515,14 +1878,14 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 
 	// 7. 创建 VM：调度到持有镜像的节点（pve1），scsi0 import-from 使用
 	// volid 而非文件路径（与旧版 node_images 路径语义不同）。
-	created := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/vms", map[string]any{
+	created := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/vms", map[string]any{
 		"name": "e2e-img-vm", "cpu": 1, "mem_mb": 1024, "disk_gb": 10,
 		"image_id": imgID, "storage_type_id": stID, "zone_id": zoneID, "password": "s3cret-pw",
 	}, http.StatusCreated))
 	vmID := int64(created["id"].(float64))
 	deadline = time.Now().Add(15 * time.Second)
 	for {
-		detail := e2eObj(t, e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
+		detail := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
 		if detail["status"] == "failed" {
 			t.Fatalf("provisioning failed: %v", detail["provision_error"])
 		}
@@ -1542,28 +1905,28 @@ func TestE2EImageDownloadLifecycle(t *testing.T) {
 			t.Fatalf("scsi0 = %q, want import-from volid of the downloaded image", scsi0)
 		}
 	}
-	detail := e2eObj(t, e2eDo(t, client, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
+	detail := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodGet, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusOK))
 	if detail["node_id"] != float64(nodeID) || detail["pve_vmid"] != float64(100) {
 		t.Fatalf("scheduled vm = node_id=%v pve_vmid=%v, want node %d vmid 100",
 			detail["node_id"], detail["pve_vmid"], nodeID)
 	}
 	// 销毁，保持数据干净。
-	e2eDo(t, client, base, http.MethodDelete, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusNoContent)
+	e2eDo(t, client, adminToken, base, http.MethodDelete, fmt.Sprintf("/vms/%d", vmID), nil, http.StatusNoContent)
 
 	// 8. 下载失败路径：fake 对 e2e-fail- 前缀的文件名拒绝受理
 	//（HTTP 500 + errors），操作落 failed 且 upid 为空、错误消息脱敏
 	//（不含内部 host:port）。
-	failImg := e2eObj(t, e2eDo(t, client, base, http.MethodPost, "/images", map[string]any{
+	failImg := e2eObj(t, e2eDo(t, client, adminToken, base, http.MethodPost, "/images", map[string]any{
 		"name": "e2e-image-fail", "default_user": "debian",
 		"download_url": "https://cloud.debian.org/images/cloud/bookworm/latest/e2e-fail-image.qcow2",
 	}, http.StatusCreated))
 	failImgID := int64(failImg["id"].(float64))
-	e2eDo(t, client, base, http.MethodPost, fmt.Sprintf("/images/%d/download", failImgID),
+	e2eDo(t, client, adminToken, base, http.MethodPost, fmt.Sprintf("/images/%d/download", failImgID),
 		map[string]any{"node_ids": []int64{nodeID}}, http.StatusAccepted)
 	deadline = time.Now().Add(10 * time.Second)
 	var failedOp map[string]any
 	for {
-		raw := e2eDo(t, client, base, http.MethodGet,
+		raw := e2eDo(t, client, adminToken, base, http.MethodGet,
 			fmt.Sprintf("/images/%d/operations", failImgID), nil, http.StatusOK)
 		ops := raw.([]any)
 		if len(ops) > 0 {
