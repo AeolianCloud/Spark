@@ -178,6 +178,26 @@ func TestCreateUserEmptyUsername(t *testing.T) {
 	}
 }
 
+func TestCreateUserUsernameTooLong(t *testing.T) {
+	// username 超过契约 maxLength（128 字符）被拒绝（400）。
+	svc := newTestUserService(&fakeUserRepo{})
+	_, err := svc.CreateUser(context.Background(), strings.Repeat("名", maxUsernameLen+1), "pw-123", "")
+	assertServiceErrorKind(t, err, KindBadRequest)
+}
+
+func TestCreateUserUsernameAtLimit(t *testing.T) {
+	// 恰好 128 个多字节字符（UTF-8 按 rune 计数而非字节）可以通过。
+	f := &fakeUserRepo{nextID: 1}
+	svc := newTestUserService(f)
+	user, err := svc.CreateUser(context.Background(), strings.Repeat("名", maxUsernameLen), "pw-123", "")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if user.Username != strings.Repeat("名", maxUsernameLen) {
+		t.Fatalf("username = %q, want the 128-rune name", user.Username)
+	}
+}
+
 func TestCreateUserEmptyPassword(t *testing.T) {
 	// password 必填：缺失被拒绝（400）。
 	svc := newTestUserService(&fakeUserRepo{})

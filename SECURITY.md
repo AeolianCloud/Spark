@@ -40,12 +40,13 @@
 
 ## 已知安全现状与部署要求
 
-当前 v1 版本**无认证鉴权**（见 README「已知限制」），以下措施为部署前提：
+当前版本已启用 **JWT 双身份认证**（用户/管理员双登录、bcrypt 密码哈希、HS256 令牌，详见 README 与 OpenAPI 契约），以下措施仍为部署前提：
 
 - **网络隔离**：API 与 Web 管理界面不得直接暴露公网，需部署在受控内网，或经反向代理（nginx 等）+ 网关鉴权（如 HTTP Basic / OAuth2 Proxy）后才可对外；
-- **HTTPS**：经反向代理对外时启用 TLS；
+- **HTTPS**：经反向代理对外时启用 TLS（令牌经网络传输，明文 HTTP 下可被截获）；
 - **密钥管理**：
   - `SPARK_CRYPTO_ENCRYPTION_KEY` 必须替换 `config/config.yaml` 中的示例值（启动时检测到示例值会打印警告），建议 `openssl rand -base64 32` 生成；
+  - `SPARK_AUTH_JWT_SECRET` 必须配置且不少于 32 字符（缺失或过短拒绝启动），建议 `openssl rand -base64 32` 生成；
   - 本地敏感配置放入 `.env.local`（已 gitignore，不入库）；
   - 节点 API 令牌目前仍明文落库（见 docs/adr/0004，加密待实现），务必保证数据库访问控制严格；
 - **最小权限**：PVE 节点 API token 使用 `PVEVMAdmin` 等限定角色，并在 PVE 侧限定资源池 / 节点范围（ACL 指派）；
