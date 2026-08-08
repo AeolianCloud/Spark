@@ -218,9 +218,13 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 		imageSvc.SetDownloadHostAllowlist(options.imageDownloadHostAllowlist)
 	}
 
-	// 管理员专用挂载点（设计 D6）：任务 5.x 的用户 CRUD 路由将挂在这里，
-	// 如 protected.Group("", middleware.RequireAdmin()).Group("/users")
-	// ——user 令牌访问返回 403 forbidden，仅管理员令牌放行。
+	// 管理员专用挂载点（设计 D6）：用户 CRUD 路由挂 requireAdmin——
+	// user 令牌访问返回 403 forbidden，仅管理员令牌放行。
+	// NewUserService 只依赖 User 仓储（密码哈希复用 service.HashPassword
+	// 包级函数，无需引入 auth 服务，最小化依赖）。
+	userRepo := repository.NewUserRepository(pool)
+	userSvc := service.NewUserService(userRepo)
+	handlers.RegisterUsersRoutes(protected.Group("/users", middleware.RequireAdmin()), userSvc)
 
 	// ===== zones 处理器（task 4.1）+ pve nodes 处理器（task 4.2） =====
 	// RegisterZonesRoutes 接收 /zones 和 /nodes 两个分组：node 路由大多
@@ -248,7 +252,9 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, cipher *crypto.Cipher, op
 	// 位于 service 层（migration 0002 约定）。
 	vmRepo := repository.NewVMRepository(pool)
 	opRepo := repository.NewVMOperationRepository(pool)
-	vmSvc := service.NewVMService(pool, vmRepo, opRepo, ipPoolRepo, zoneRepo, nodeRepo, imageRepo, storageTypeRepo, cipher)
+	// userRepo 复用 authRepo：VM 创建/认领的可选归属用户校验（vms.user_id，
+	// 设计 D3）只需按 ID 查 users 表，AuthRepository 的只读查询已覆盖。
+	vmSvc := service.NewVMService(pool, vmRepo, opRepo, ipPoolRepo, zoneRepo, nodeRepo, imageRepo, storageTypeRepo, authRepo, cipher)
 	if options.vmClientFactory != nil {
 		vmSvc.SetClientFactory(options.vmClientFactory)
 	}

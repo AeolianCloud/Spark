@@ -98,7 +98,7 @@ func TestImportVMHappyPath(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	vm, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	vm, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if err != nil {
 		t.Fatalf("ImportVM: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestImportVMRequestedIP(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	vm, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.0.0.5"})
+	vm, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.0.0.5"})
 	if err != nil {
 		t.Fatalf("ImportVM: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestImportVMInvalidIP(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "not-an-ip"})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "not-an-ip"})
 	if !isKind(err, KindBadRequest) {
 		t.Fatalf("err = %v, want KindBadRequest", err)
 	}
@@ -194,7 +194,7 @@ func TestImportVMRequestedIPNotInAnyPool(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.9.0.5"})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.9.0.5"})
 	if !isKind(err, KindIPExhausted) {
 		t.Fatalf("err = %v, want KindIPExhausted", err)
 	}
@@ -211,7 +211,7 @@ func TestImportVMRequestedIPClaimRace(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.0.0.5"})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.0.0.5"})
 	if !isKind(err, KindIPExhausted) {
 		t.Fatalf("err = %v, want KindIPExhausted", err)
 	}
@@ -238,7 +238,7 @@ func TestImportVMRequestedIPContinuesNextPool(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	vm, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.0.0.5"})
+	vm, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.0.0.5"})
 	if err != nil {
 		t.Fatalf("ImportVM: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestImportVMRequestedIPPoolDoesNotAllowNode(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.0.0.5"})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, IP: "10.0.0.5"})
 	if !isKind(err, KindIPExhausted) {
 		t.Fatalf("err = %v, want KindIPExhausted", err)
 	}
@@ -278,7 +278,7 @@ func TestImportVMRequestNameWins(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	vm, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, Name: "renamed"})
+	vm, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, Name: "renamed"})
 	if err != nil {
 		t.Fatalf("ImportVM: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestImportVMAlreadyManaged(t *testing.T) {
 	defer ts.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, ts)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if !isKind(err, KindVMAlreadyManaged) {
 		t.Fatalf("err = %v, want KindVMAlreadyManaged", err)
 	}
@@ -317,7 +317,7 @@ func TestImportVMNotFoundOnNode(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if !isKind(err, KindVMNotFoundOnNode) {
 		t.Fatalf("err = %v, want KindVMNotFoundOnNode", err)
 	}
@@ -335,7 +335,7 @@ func TestImportVMTemplateRejected(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if !isKind(err, KindBadRequest) {
 		t.Fatalf("err = %v, want KindBadRequest", err)
 	}
@@ -353,7 +353,7 @@ func TestImportVMInvalidName(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, Name: "bad name!"})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, Name: "bad name!"})
 	if !isKind(err, KindBadRequest) {
 		t.Fatalf("err = %v, want KindBadRequest", err)
 	}
@@ -371,7 +371,7 @@ func TestImportVMRequestNameTooLong(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, Name: strings.Repeat("n", maxImportedNameLen+1)})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100, Name: strings.Repeat("n", maxImportedNameLen+1)})
 	if !isKind(err, KindBadRequest) {
 		t.Fatalf("err = %v, want KindBadRequest", err)
 	}
@@ -391,7 +391,7 @@ func TestImportVMLongPVENameTruncated(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	vm, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	vm, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if err != nil {
 		t.Fatalf("ImportVM: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestImportVMLongChinesePVENameTruncatedByRune(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	vm, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	vm, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if err != nil {
 		t.Fatalf("ImportVM: %v", err)
 	}
@@ -436,7 +436,7 @@ func TestImportVMNodeUnavailable(t *testing.T) {
 	defer srv.Close()
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, srv)
 
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
@@ -455,20 +455,20 @@ func TestImportVMNodeValidation(t *testing.T) {
 	svc := newImportSvc(t, vmRepo, ipRepo, zoneRepo, nodeRepo, ts)
 
 	// 未知节点 -> not_found。
-	_, err := svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 99, PVEVmid: 100})
+	_, err := svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 99, PVEVmid: 100})
 	if !isKind(err, KindNotFound) {
 		t.Fatalf("unknown node err = %v, want KindNotFound", err)
 	}
 	// 节点不属于该区域 -> bad_request。
 	nodeRepo.nodes[0].ZoneID = 2
-	_, err = svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	_, err = svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if !isKind(err, KindBadRequest) {
 		t.Fatalf("wrong-zone node err = %v, want KindBadRequest", err)
 	}
 	// 节点禁用 -> node_unavailable。
 	nodeRepo.nodes[0].ZoneID = 1
 	nodeRepo.nodes[0].Enabled = false
-	_, err = svc.ImportVM(context.Background(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
+	_, err = svc.ImportVM(context.Background(), adminIdentity(), ImportVMRequest{ZoneID: 1, NodeID: 1, PVEVmid: 100})
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("disabled node err = %v, want KindNodeUnavailable", err)
 	}

@@ -73,6 +73,12 @@ func TestRouterRegistersAllRoutes(t *testing.T) {
 		"GET /openapi.yaml",
 		"POST /auth/login",
 		"POST /auth/admin/login",
+		"POST /users",
+		"GET /users",
+		"GET /users/:id",
+		"PUT /users/:id",
+		"DELETE /users/:id",
+		"PUT /users/:id/status",
 		"POST /zones",
 		"GET /zones",
 		"POST /zones/:zone_id/nodes",
@@ -290,7 +296,7 @@ func TestAuthConstantsLocked(t *testing.T) {
 func TestRouterAuthProtection(t *testing.T) {
 	r := newTestRouter(t)
 
-	paths := []string{"/zones", "/zones/1/nodes", "/ip-pools", "/storage-types", "/images", "/vms"}
+	paths := []string{"/zones", "/zones/1/nodes", "/ip-pools", "/storage-types", "/images", "/vms", "/users"}
 	for _, path := range paths {
 		t.Run("protected "+path, func(t *testing.T) {
 			w := httptest.NewRecorder()

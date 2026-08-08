@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 
+	"spark/api/middleware"
 	"spark/model"
 	"spark/pve"
 	"spark/repository"
@@ -175,6 +177,8 @@ type handlerVMStubs struct {
 	vmRepoGetErr error
 	nodes        []model.PVENode
 	nodeErr      error
+	vmOps        []model.VMOperation // ListOperations 的脚本化返回
+	userByID     *model.User         // GetUserByID 的脚本化返回（可空）
 }
 
 func (s *handlerVMStubs) Begin(ctx context.Context) (pgx.Tx, error) { return nil, nil }
@@ -197,6 +201,9 @@ func (s *handlerVMStubs) GetVM(ctx context.Context, id int64) (*repository.VMWit
 	return s.vmRepoGet, nil
 }
 func (s *handlerVMStubs) ListVMs(ctx context.Context) ([]repository.VMWithIP, error) { return nil, nil }
+func (s *handlerVMStubs) ListVMsByUser(ctx context.Context, userID int64) ([]repository.VMWithIP, error) {
+	return nil, nil
+}
 func (s *handlerVMStubs) SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error {
 	return nil
 }
@@ -214,7 +221,7 @@ func (s *handlerVMStubs) CreateOperation(ctx context.Context, op model.VMOperati
 	return nil, nil
 }
 func (s *handlerVMStubs) ListOperations(ctx context.Context, nodeID, vmid int64, limit, offset int) ([]model.VMOperation, int, error) {
-	return nil, 0, nil
+	return s.vmOps, len(s.vmOps), nil
 }
 func (s *handlerVMStubs) GetPool(ctx context.Context, id int64) (*model.IPPool, error) {
 	return nil, nil
@@ -255,6 +262,14 @@ func (s *handlerVMStubs) ListNodesByIDs(ctx context.Context, ids []int64) ([]mod
 	return nil, nil
 }
 
+func (s *handlerVMStubs) GetUserByID(ctx context.Context, id int64) (*model.User, error) {
+	if s.userByID != nil && s.userByID.ID == id {
+		u := *s.userByID
+		return &u, nil
+	}
+	return nil, pgx.ErrNoRows
+}
+
 // stubImageRepo 与 stubStorageRepo 是 VMImageRepository/VMStorageTypeRepository
 // 的最小替身（Get 路径不使用，返回零值）。
 type stubImageRepo struct{}
@@ -271,7 +286,7 @@ func (stubStorageRepo) Get(ctx context.Context, id int64) (*model.StorageType, e
 // 指向假 PVE 服务器的客户端工厂（cipher 传 nil——Get 路径不触碰密码器）。
 func newVMGetTestService(t *testing.T, stubs *handlerVMStubs, pveSrv *httptest.Server) *service.VMService {
 	t.Helper()
-	svc := service.NewVMService(stubs, stubs, stubs, stubs, stubs, stubs, stubImageRepo{}, stubStorageRepo{}, nil)
+	svc := service.NewVMService(stubs, stubs, stubs, stubs, stubs, stubs, stubImageRepo{}, stubStorageRepo{}, stubs, nil)
 	if pveSrv != nil {
 		svc.SetClientFactory(func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
 			return pve.NewClient(host, apiUser, apiTokenSecret,
@@ -289,6 +304,222 @@ func newVMGetEngine(svc *service.VMService) *gin.Engine {
 	return r
 }
 
+// withIdentity 是 handler 测试中模拟 requireAuth 注入身份的中间件（设计
+// D4：身份经 middleware.IdentityKey 注入 gin.Context，供 handler 分流）。
+func withIdentity(ident middleware.Identity) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set(middleware.IdentityKey, ident)
+		c.Next()
+	}
+}
+
+// newVMEngineWithIdentity 构建带身份注入中间件的 gin 引擎，验证 handler
+// 从 gin.Context 读取身份并传递给 service 的完整链路（任务 6.7）。
+func newVMEngineWithIdentity(svc *service.VMService, ident middleware.Identity) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(withIdentity(ident))
+	RegisterVMsRoutes(r.Group("/vms"), svc)
+	return r
+}
+
+// TestVMHandlerIdentityInjection 覆盖身份注入传递的正确性（任务 6.7）：
+// 用户令牌访问他人 VM 详情 -> 403 forbidden；访问归属自己的 VM -> 200；
+// ext- 标识对用户 -> 403；管理员令牌对无主 VM -> 200。
+func TestVMHandlerIdentityInjection(t *testing.T) {
+	uid2, uid3 := int64(2), int64(3)
+	stubsOwned := &handlerVMStubs{vmRepoGet: &repository.VMWithIP{
+		VM: model.VM{ID: 7, UUID: "u-7", Name: "vm7", NodeID: 1, PVEVmid: 0, UserID: &uid2,
+			CPU: 2, MemMB: 2048, DiskGB: 10, Source: model.VMSourceSparkCreated},
+		IP: "10.0.0.5",
+	}}
+	svcOwned := newVMGetTestService(t, stubsOwned, nil)
+	rOwned := newVMEngineWithIdentity(svcOwned, middleware.Identity{Role: middleware.RoleUser, ID: uid2})
+
+	// 归属自己的 VM：200。
+	w := httptest.NewRecorder()
+	rOwned.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/7", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /vms/7 (own) status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+
+	// 他人 VM：403 forbidden。
+	stubsOther := &handlerVMStubs{vmRepoGet: &repository.VMWithIP{
+		VM: model.VM{ID: 7, UUID: "u-7", Name: "vm7", NodeID: 1, PVEVmid: 0, UserID: &uid3,
+			CPU: 2, MemMB: 2048, DiskGB: 10, Source: model.VMSourceSparkCreated},
+		IP: "10.0.0.5",
+	}}
+	svcOther := newVMGetTestService(t, stubsOther, nil)
+	rOther := newVMEngineWithIdentity(svcOther, middleware.Identity{Role: middleware.RoleUser, ID: uid2})
+	w = httptest.NewRecorder()
+	rOther.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/7", nil))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("GET /vms/7 (other's) status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+	var errBody map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	apiErr, ok := errBody["error"].(map[string]any)
+	if !ok || apiErr["code"] != CodeForbidden {
+		t.Fatalf("error = %+v, want code %s", errBody, CodeForbidden)
+	}
+
+	// ext- 标识对用户：403（纯 external，无本地托管行，不触碰 PVE）。
+	stubsExt := &handlerVMStubs{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 3, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	svcExt := newVMGetTestService(t, stubsExt, nil)
+	rExt := newVMEngineWithIdentity(svcExt, middleware.Identity{Role: middleware.RoleUser, ID: uid2})
+	w = httptest.NewRecorder()
+	rExt.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/ext-1-200", nil))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("GET /vms/ext-1-200 (user) status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+
+	// 管理员令牌：无主 VM 放行（现状不回归）。
+	stubsAdmin := &handlerVMStubs{vmRepoGet: &repository.VMWithIP{
+		VM: model.VM{ID: 7, UUID: "u-7", Name: "vm7", NodeID: 1, PVEVmid: 0,
+			CPU: 2, MemMB: 2048, DiskGB: 10, Source: model.VMSourceSparkCreated},
+		IP: "10.0.0.5",
+	}}
+	svcAdmin := newVMGetTestService(t, stubsAdmin, nil)
+	rAdmin := newVMEngineWithIdentity(svcAdmin, middleware.Identity{Role: middleware.RoleAdmin, ID: 1})
+	w = httptest.NewRecorder()
+	rAdmin.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/7", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /vms/7 (admin) status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestVMHandlerLifecycleIdentityForbidden 覆盖生命周期操作的 handler 层
+// 归属校验：用户令牌对他人 VM 发起 start -> 403 forbidden（不触碰 PVE）。
+func TestVMHandlerLifecycleIdentityForbidden(t *testing.T) {
+	uid2, uid3 := int64(2), int64(3)
+	stubs := &handlerVMStubs{vmRepoGet: &repository.VMWithIP{
+		VM: model.VM{ID: 7, NodeID: 1, PVEVmid: 100, UserID: &uid3,
+			CPU: 2, MemMB: 2048, DiskGB: 10, Source: model.VMSourceSparkCreated},
+	}}
+	svc := newVMGetTestService(t, stubs, nil)
+	r := newVMEngineWithIdentity(svc, middleware.Identity{Role: middleware.RoleUser, ID: uid2})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/vms/7/start", nil))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("POST /vms/7/start (other's) status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestVMHandlerCreateImportIdentityConstraint 覆盖创建/认领 handler 层的身
+// 份归属约束（H1）：user 令牌指定他人/未知用户的 user_id -> 403 forbidden
+// （不触碰 PVE/不落库，且不区分未知用户，杜绝枚举 S2）；"user 不指定默认
+// 归属自身"的归属解析在 service 层测试覆盖（vm_auth_test.go）。
+func TestVMHandlerCreateImportIdentityConstraint(t *testing.T) {
+	uid2 := int64(2)
+	stubs := &handlerVMStubs{userByID: &model.User{ID: 2, Username: "u2", Status: model.UserStatusEnabled}}
+	svc := newVMGetTestService(t, stubs, nil)
+	r := newVMEngineWithIdentity(svc, middleware.Identity{Role: middleware.RoleUser, ID: uid2})
+
+	// user 令牌创建 VM 时指定他人 user_id -> 403。
+	w := httptest.NewRecorder()
+	body := `{"name":"vm1","cpu":1,"mem_mb":1024,"disk_gb":10,"image_id":1,"storage_type_id":1,"zone_id":1,"password":"pw","user_id":3}`
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/vms", strings.NewReader(body)))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("POST /vms (user_id of another) status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+
+	// user 令牌认领 VM 时指定他人 user_id -> 403（节点存在时在归属门禁拒绝）。
+	stubsImp := &handlerVMStubs{nodes: []model.PVENode{
+		{ID: 1, ZoneID: 1, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
+	}}
+	svcImp := newVMGetTestService(t, stubsImp, nil)
+	rImp := newVMEngineWithIdentity(svcImp, middleware.Identity{Role: middleware.RoleUser, ID: uid2})
+	w = httptest.NewRecorder()
+	rImp.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/vms/import", strings.NewReader(
+		`{"zone_id":1,"node_id":1,"pve_vmid":100,"user_id":3}`)))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("POST /vms/import (user_id of another) status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+
+	// 未知用户的 user_id（user 99 不存在）：user 令牌只能指定自身，指定他人
+	// 一律 403，绝不区分 404/400（杜绝枚举，S2）。
+	stubsNoUser := &handlerVMStubs{}
+	svcNoUser := newVMGetTestService(t, stubsNoUser, nil)
+	rNoUser := newVMEngineWithIdentity(svcNoUser, middleware.Identity{Role: middleware.RoleUser, ID: uid2})
+	w = httptest.NewRecorder()
+	rNoUser.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/vms", strings.NewReader(
+		`{"name":"vm1","cpu":1,"mem_mb":1024,"disk_gb":10,"image_id":1,"storage_type_id":1,"zone_id":1,"password":"pw","user_id":99}`)))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("POST /vms (unknown user_id) status = %d, want 403, not a user enumeration signal (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestVMHandlerOperationsOperatorMasking 覆盖操作记录响应的操作者脱敏
+// （L2）：user 令牌查看操作记录时 operator_id 置空省略、仅保留
+// operator_type；admin 可见完整操作者信息。
+func TestVMHandlerOperationsOperatorMasking(t *testing.T) {
+	uid2, uid3 := int64(2), int64(3)
+	opAdminID := int64(1)
+	stubs := &handlerVMStubs{
+		vmRepoGet: &repository.VMWithIP{VM: model.VM{ID: 7, NodeID: 1, PVEVmid: 100, UserID: &uid2}},
+		vmOps: []model.VMOperation{
+			{ID: 1, NodeID: 1, PVEVmid: 100, Action: "start", Result: "accepted",
+				OperatorType: service.RoleAdmin, OperatorID: &opAdminID, CreatedAt: time.Unix(100, 0)},
+			{ID: 2, NodeID: 1, PVEVmid: 100, Action: "stop", Result: "accepted",
+				OperatorType: service.RoleUser, OperatorID: &uid3, CreatedAt: time.Unix(101, 0)},
+		},
+	}
+	svc := newVMGetTestService(t, stubs, nil)
+
+	// user 令牌：200，operator_type 保留，operator_id 一律省略。
+	rUser := newVMEngineWithIdentity(svc, middleware.Identity{Role: middleware.RoleUser, ID: uid2})
+	w := httptest.NewRecorder()
+	rUser.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/7/operations", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /vms/7/operations (user) status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode operations (user): %v", err)
+	}
+	ops, ok := body["operations"].([]any)
+	if !ok || len(ops) != 2 {
+		t.Fatalf("operations = %+v, want 2 records", body["operations"])
+	}
+	for i, raw := range ops {
+		op := raw.(map[string]any)
+		if op["operator_id"] != nil {
+			t.Fatalf("user ops[%d] operator_id = %v, want masked (nil)", i, op["operator_id"])
+		}
+		if op["operator_type"] == nil || op["operator_type"] == "" {
+			t.Fatalf("user ops[%d] operator_type = %v, want kept", i, op["operator_type"])
+		}
+	}
+
+	// admin 令牌：200，operator_id 完整可见。
+	rAdmin := newVMEngineWithIdentity(svc, middleware.Identity{Role: middleware.RoleAdmin, ID: 1})
+	w = httptest.NewRecorder()
+	rAdmin.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/7/operations", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /vms/7/operations (admin) status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode operations (admin): %v", err)
+	}
+	ops, ok = body["operations"].([]any)
+	if !ok || len(ops) != 2 {
+		t.Fatalf("operations = %+v, want 2 records", body["operations"])
+	}
+	op0 := ops[0].(map[string]any)
+	op1 := ops[1].(map[string]any)
+	if op0["operator_type"] != service.RoleAdmin || op0["operator_id"] != float64(1) {
+		t.Fatalf("admin ops[0] operator = %v / %v, want admin / 1", op0["operator_type"], op0["operator_id"])
+	}
+	if op1["operator_type"] != service.RoleUser || op1["operator_id"] != float64(3) {
+		t.Fatalf("admin ops[1] operator = %v / %v, want user / 3", op1["operator_type"], op1["operator_id"])
+	}
+}
+
 // TestVMGetExternal 覆盖 GET /vms/ext-{nodeID}-{vmid}：200 + external 条目
 // 形态（合成 id、uuid/created_at 为空、source=external、规格取 PVE 摘要、
 // 实时指标透传）。
@@ -303,7 +534,9 @@ func TestVMGetExternal(t *testing.T) {
 		{ID: 1, ZoneID: 3, Name: "pve1", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true},
 	}}
 	svc := newVMGetTestService(t, stubs, pveSrv)
-	r := newVMGetEngine(svc)
+	// 未挂身份中间件的引擎在 M1 fail-closed 下会拒绝所有请求；该测试意图
+	// 覆盖管理员视角的 external 形态，显式注入管理员身份。
+	r := newVMEngineWithIdentity(svc, middleware.Identity{Role: middleware.RoleAdmin, ID: 1})
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/ext-1-200", nil))
@@ -343,7 +576,9 @@ func TestVMGetNumericNoRegression(t *testing.T) {
 		IP: "10.0.0.5",
 	}}
 	svc := newVMGetTestService(t, stubs, nil)
-	r := newVMGetEngine(svc)
+	// 未挂身份中间件的引擎在 M1 fail-closed 下会拒绝所有请求；该测试意图
+	// 覆盖管理员视角的数字 id 形态，显式注入管理员身份。
+	r := newVMEngineWithIdentity(svc, middleware.Identity{Role: middleware.RoleAdmin, ID: 1})
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/vms/7", nil))
