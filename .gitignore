@@ -7,7 +7,7 @@
 config.local.yaml
 /config/config.local.yaml
 
-# local secrets (loaded via `set -a; source .env.local; set +a`)
+# local secrets (auto-loaded by config.Load at startup)
 .env.local
 
 # editor/OS
