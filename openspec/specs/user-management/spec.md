@@ -2,7 +2,7 @@
 
 提供管理员侧的平台用户（自助服务登录账号）生命周期管理：创建、查询、修改、删除与状态切换，用户是虚拟机等资源的归属主体。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: 创建用户
 
