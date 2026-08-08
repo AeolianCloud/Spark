@@ -8,6 +8,8 @@
 
 queue_rules:
   - name: default
+    merge_method: squash
+    update_method: rebase
     conditions:
       # 队列合并前再次确认 CI 通过（strict 模式下会先更新 base 再合并）
       - check-success=frontend / build
@@ -21,7 +23,6 @@ pull_request_rules:
       - -draft
     actions:
       approve:
-        message: "CI 已通过，mergify[bot] 自动批准"
 
   # 规则 2：CI 通过且有批准后自动入队合并（squash + 删分支）
   - name: auto-merge-when-approved
@@ -34,5 +35,3 @@ pull_request_rules:
     actions:
       queue:
         name: default
-        method: squash
-        update_method: rebase
