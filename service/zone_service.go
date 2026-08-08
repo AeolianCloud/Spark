@@ -41,6 +41,11 @@ type ZoneService struct {
 	// 用于测试，生产默认使用 probeClusterNodeNames（与 selectReachableNode
 	// 相同的客户端构建模式，探测受 nodeProbeTimeout 限制）。
 	probeNodes func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error)
+	// storageSync 在节点注册成功后对所属 zone 触发一次存储扫描（设计 D6）；
+	// 可注入用于测试。默认为空（未挂接），由装配方（api/router）注入实际的
+	// StorageTypeService.SyncZone 包装。扫描是注册主流程的副作用：失败只记
+	// 日志，绝不阻断节点注册返回。
+	storageSync func(ctx context.Context, zoneID int64) error
 }
 
 // NewZoneService 使用给定的仓库创建一个 ZoneService。
@@ -50,6 +55,24 @@ func NewZoneService(zoneRepo ZoneRepository, nodeRepo NodeRepository) *ZoneServi
 	// 可整体替换该字段以将探测指向假服务器。
 	s.probeNodes = probeClusterNodeNames
 	return s
+}
+
+// SetStorageSync 挂接节点注册成功后的存储扫描回调（设计 D6）：注册成功
+// 分支会以所属 zone 调用该回调；失败只记日志不阻断注册。测试可注入替身
+// 断言触发行为。
+func (s *ZoneService) SetStorageSync(fn func(ctx context.Context, zoneID int64) error) {
+	if fn != nil {
+		s.storageSync = fn
+	}
+}
+
+// SetProbeNodes 覆盖 PVE 集群节点名探测函数（仅测试注入用，生产默认
+// probeClusterNodeNames）：handler/service 测试将探测指向脚本化替身，避免
+// 网络依赖。
+func (s *ZoneService) SetProbeNodes(fn func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error)) {
+	if fn != nil {
+		s.probeNodes = fn
+	}
 }
 
 // KindNodeUnavailable 表示"没有可达的候选节点"。该值位于 errors.go 中共享
@@ -279,6 +302,16 @@ func (s *ZoneService) CreateNode(ctx context.Context, zoneID int64, name, host, 
 	created, err := s.nodeRepo.CreateNode(ctx, node)
 	if err != nil {
 		return nil, fmt.Errorf("create node: %w", err)
+	}
+
+	// 注册成功后触发一次该 zone 的存储扫描（设计 D6）：扫描是副作用，失败
+	// 仅记录日志（含 zone 与错误），绝不阻断节点注册返回；手动刷新路径与
+	// 日志兜底见 SyncZone。
+	if s.storageSync != nil {
+		if err := s.storageSync(ctx, zoneID); err != nil {
+			slog.Warn("storage scan after node registration failed",
+				"zone_id", zoneID, "node", created.Name, "error", err)
+		}
 	}
 	return created, nil
 }

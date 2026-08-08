@@ -46,16 +46,27 @@ func NewZoneHandler(svc *service.ZoneService) *ZoneHandler {
 	return &ZoneHandler{svc: svc}
 }
 
-// RegisterZonesRoutes 挂载 zone 和 node 路由。zonesGroup 是 /zones 分组；
-// nodesGroup 是 /nodes 分组（PUT /nodes/:id 位于 /zones 之外）。
-// 由 router 同时传入两个分组调用。
-func RegisterZonesRoutes(zonesGroup, nodesGroup *gin.RouterGroup, svc *service.ZoneService) {
+// RegisterZonesRoutes 挂载 zone 和 node 路由。zonesGroup 是 /zones 读分组
+//（GET 列表/节点），adminZonesGroup 是 /zones 写分组（POST 创建），
+// adminNodesGroup 是 /nodes 写分组（PUT /nodes/:id 位于 /zones 之外）。
+// 由 router 传入分组调用。权限粒度（H1 安全修复）：读操作仅挂 requireAuth；
+// 写操作挂 requireAdmin——节点注册成功会自动触发所属 zone 的存储扫描
+//（SyncZone），user 放行会形成"注册伪造节点 → 从攻击者控制的服务器拉取
+// 伪造存储清单注入快照"的攻击链，zone 创建（资源容器）一并收紧，user
+// 令牌访问写操作返回 403 forbidden：
+//
+//   - GET /zones：区域列表 [zonesGroup]
+//   - POST /zones：创建区域 [adminZonesGroup]
+//   - GET /zones/:zone_id/nodes：区域节点列表 [zonesGroup]
+//   - POST /zones/:zone_id/nodes：登记 PVE 节点 [adminZonesGroup]
+//   - PUT /nodes/:id：更新节点 [adminNodesGroup]
+func RegisterZonesRoutes(zonesGroup, adminZonesGroup, adminNodesGroup *gin.RouterGroup, svc *service.ZoneService) {
 	h := NewZoneHandler(svc)
-	zonesGroup.POST("", Handler(h.CreateZone))
 	zonesGroup.GET("", Handler(h.ListZones))
-	zonesGroup.POST("/:zone_id/nodes", Handler(h.CreateNode))
 	zonesGroup.GET("/:zone_id/nodes", Handler(h.ListNodesByZone))
-	nodesGroup.PUT("/:id", Handler(h.UpdateNode))
+	adminZonesGroup.POST("", Handler(h.CreateZone))
+	adminZonesGroup.POST("/:zone_id/nodes", Handler(h.CreateNode))
+	adminNodesGroup.PUT("/:id", Handler(h.UpdateNode))
 }
 
 // zoneResponse 是公开的 zone 负载；nodes 永不省略，使 create 与 list 之间的结构保持稳定。

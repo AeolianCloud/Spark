@@ -65,7 +65,7 @@ func TestEmbeddedMigrationsDiscovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrationFiles(MigrationFS): %v", err)
 	}
-	want := []string{"0001_init.sql", "0002_create_tables.sql", "0003_indexes_and_unique.sql", "0004_add_provision_error.sql", "0005_add_node_port.sql", "0006_add_pve_name.sql", "0007_import_vm.sql", "0008_vm_source_and_operations.sql", "0009_image_download.sql", "0010_user_auth.sql"}
+	want := []string{"0001_init.sql", "0002_create_tables.sql", "0003_indexes_and_unique.sql", "0004_add_provision_error.sql", "0005_add_node_port.sql", "0006_add_pve_name.sql", "0007_import_vm.sql", "0008_vm_source_and_operations.sql", "0009_image_download.sql", "0010_user_auth.sql", "0011_storage_zone_and_scan.sql", "0012_storage_nodes.sql"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("embedded migrations = %v, want %v", names, want)
 	}
@@ -138,6 +138,61 @@ func TestImageDownloadMigrationContent(t *testing.T) {
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("migration 0009 缺少语句: %q", want)
+		}
+	}
+}
+
+// TestStorageZoneAndScanMigrationContent 对 0011_storage_zone_and_scan.sql
+// 的内容做回归校验（与 0009 相同的风格）：迁移按文件名发现、以
+// schema_migrations 记账，错误的内容不会被发现机制捕获，因此这里断言
+// 破坏性变更（DROP INDEX storage_types_name_key、DROP COLUMN
+// display_name、name DROP NOT NULL）与新增对象（zone_id/enabled/type/
+// content 列、(zone_id, pve_storage) 唯一索引）的关键语句确实存在。
+// 注意：迁移只在未被应用时执行一次，下述语句必须在测试环境之外的数据库
+// 上验证实际可执行性（PL/pgSQL 归置块的单 zone/多 zone/空库三路径），
+// 本测试仅保证文件内容不被误删改；真实执行由 migrate_pg_test.go
+// （-tags=pg，SPARK_TEST_DSN）覆盖。
+func TestStorageZoneAndScanMigrationContent(t *testing.T) {
+	raw, err := fs.ReadFile(MigrationFS, "migration/0011_storage_zone_and_scan.sql")
+	if err != nil {
+		t.Fatalf("read migration/0011_storage_zone_and_scan.sql: %v", err)
+	}
+	content := string(raw)
+	for _, want := range []string{
+		"ADD COLUMN zone_id BIGINT REFERENCES zones(id)",
+		"ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT true",
+		"ADD COLUMN type TEXT",
+		"ADD COLUMN content TEXT",
+		"ALTER COLUMN zone_id SET NOT NULL",
+		"DROP INDEX storage_types_name_key",
+		"CREATE UNIQUE INDEX storage_types_zone_pve_storage_key",
+		"ON storage_types(zone_id, pve_storage)",
+		"ALTER COLUMN name DROP NOT NULL",
+		"DROP COLUMN display_name",
+		"RAISE EXCEPTION",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("migration 0011 缺少语句: %q", want)
+		}
+	}
+}
+
+// TestStorageNodesMigrationContent 对 0012_storage_nodes.sql 的内容做回归
+// 校验（与 0011 相同的风格）：断言 storage_types 新增 nodes 列（TEXT、
+// NOT NULL、默认空串 = 不限制节点）的关键语句存在。迁移只在未被应用时
+// 执行一次，错误的内容不会被发现机制捕获，本测试仅保证文件内容不被
+// 误删改；真实执行由 migrate_pg_test.go（-tags=pg，SPARK_TEST_DSN）覆盖。
+func TestStorageNodesMigrationContent(t *testing.T) {
+	raw, err := fs.ReadFile(MigrationFS, "migration/0012_storage_nodes.sql")
+	if err != nil {
+		t.Fatalf("read migration/0012_storage_nodes.sql: %v", err)
+	}
+	content := string(raw)
+	for _, want := range []string{
+		"ALTER TABLE storage_types ADD COLUMN nodes TEXT NOT NULL DEFAULT '';",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("migration 0012 缺少语句: %q", want)
 		}
 	}
 }

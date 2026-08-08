@@ -46,6 +46,11 @@ const (
 	// 白名单∩启用节点候选集合为空（400 —— 区域池配置缺失，属于请求针对的
 	// 资源状态错误，区别于 node_unavailable 的节点可达性故障）。
 	CodeNoAvailableIPPool = "no_available_ip_pool"
+	// CodeStorageNotAvailableInZone：所选存储的节点挂载快照（nodes）非空，
+	// 但区域存在池候选节点且没有任何候选挂载该存储——磁盘无处可放
+	// （400 —— 请求的 storage_type/zone 组合无法被满足，与
+	// image_not_available_in_zone 同构）。
+	CodeStorageNotAvailableInZone = "storage_not_available_in_zone"
 )
 
 // mapVMServiceError 将 service 层错误映射为统一的 API 错误契约。
@@ -73,6 +78,8 @@ func mapVMServiceError(err error) error {
 		return NewError(http.StatusInternalServerError, CodeOperationLogFailed, serr.Message)
 	case service.KindNoAvailableIPPool:
 		return NewError(http.StatusBadRequest, CodeNoAvailableIPPool, serr.Message)
+	case service.KindStorageNotAvailableInZone:
+		return NewError(http.StatusBadRequest, CodeStorageNotAvailableInZone, serr.Message)
 	default:
 		return mapServiceErrorExtended(err)
 	}

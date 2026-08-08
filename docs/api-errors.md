@@ -39,9 +39,9 @@ x-ms-error-code: not_found
 
 | 错误码 | HTTP 状态 | 含义 | 触发场景 |
 | --- | --- | --- | --- |
-| `bad_request` | 400 | 请求参数非法 | 请求体无法解析、必填参数缺失、路径/查询参数格式错误；镜像下载请求 `node_ids` 与 `zone_id` 同时提供或都不提供、`node_ids` 超过 64 个、`download_url` 非 http(s) 或 host 不在下载源白名单（`images.download_host_allowlist`，空列表拒绝一切下载）、`download_url` 文件名非法（非空、非 `.`/`..`、不含路径分隔符） |
+| `bad_request` | 400 | 请求参数非法 | 请求体无法解析、必填参数缺失、路径/查询参数格式错误（含存储扫描 POST /storage-types/scan 缺失或非法 zone_id）；更新存储类型时 name 超过 255 字符（trim 后，`storage type name must be at most 255 characters`）；镜像下载请求 `node_ids` 与 `zone_id` 同时提供或都不提供、`node_ids` 超过 64 个、`download_url` 非 http(s) 或 host 不在下载源白名单（`images.download_host_allowlist`，空列表拒绝一切下载）、`download_url` 文件名非法（非空、非 `.`/`..`、不含路径分隔符）；创建 VM 所选存储类型被禁用（`storage type is disabled`）或不支持磁盘映像（`storage type cannot store VM disks`） |
 | `unauthorized` | 401 | 凭证无效或身份不可信 | 登录失败（账号不存在/密码错误/账号被禁用，消息统一不泄露原因）、令牌缺失/非法/过期/篡改（Bearer JWT 解析与声明校验失败，含无 exp、sub 非正整数、签名算法非 HS256）、身份查库失效（账号被删除或用户被禁用） |
-| `forbidden` | 403 | 身份有效但无权访问目标资源 | 用户令牌访问管理员接口（requireAdmin 拒绝）；用户令牌查看/操作他人或无主虚拟机（归属校验、ext- 合成标识一律拒绝） |
+| `forbidden` | 403 | 身份有效但无权访问目标资源 | 用户令牌访问管理员接口（requireAdmin 拒绝：/users、/zones 与 /zones/{zone_id}/nodes 与 /nodes/{id} 写操作（创建区域/登记节点/更新节点）、/storage-types 写操作（扫描/更新/删除）等）；用户令牌查看/操作他人或无主虚拟机（归属校验、ext- 合成标识一律拒绝） |
 | `not_found` | 404 | 资源不存在 | 引用不存在的 zone / node / ip-pool / storage-type / image / VM，或路径未匹配任何路由 |
 | `method_not_allowed` | 405 | 请求方法不允许 | 路径存在但请求方法未注册（响应携带 Allow 头列出允许的方法） |
 | `conflict` | 409 | 与现有状态冲突 | 重名（zone / storage-type / image 等唯一约束）、IP 池网段重叠、删除仍被引用的资源、镜像下载幂等拒绝（目标节点已有该镜像 running 下载） |
@@ -49,12 +49,13 @@ x-ms-error-code: not_found
 | `internal_error` | 500 | 服务器内部错误 | 未归类异常的统一兜底，不暴露内部细节 |
 | `service_unavailable` | 503 | 服务不可用 | `/healthz` 数据库探活失败时的 degraded 状态（业务 API 暂无触发） |
 | `dependency_failed` | — | 依赖子系统失败 | 未使用（预留），已定义、暂未接线 |
-| `node_unavailable` | 503 | 无可用的 PVE 节点 | 创建 VM 时存在带镜像的池候选节点但全部不可达或被禁用；节点实时状态查询（GET /nodes/:id/status）时 PVE 不可达/API 令牌无效/超时 |
+| `node_unavailable` | 503 | 无可用的 PVE 节点 | 创建 VM 时存在带镜像的池候选节点但全部不可达或被禁用；节点实时状态查询（GET /nodes/:id/status）时 PVE 不可达/API 令牌无效/超时；存储扫描（POST /storage-types/scan）时 zone 内没有任何可达的启用节点（此时不产生部分同步） |
 | `ip_exhausted` | 409 | IP 池无空闲地址 | 所有候选 IP 池的地址均已分配完毕 |
 | `vm_not_ready` | 409 | VM 尚不可操作 | 供给未完成或 PVE 侧 VM 已不存在时执行生命周期操作 |
 | `disk_shrink_not_allowed` | 422 | 磁盘不支持缩小 | resize 请求中 `disk_gb` 小于当前磁盘大小 |
 | `no_available_ip_pool` | 400 | 区域无可用 IP 池 | 创建 VM 时区域没有任何 IP 池，或全部 IP 池的白名单节点与启用节点交集为空（消息区分"无池"与"池无候选节点"）；该错误优先于镜像不可用与节点不可用 |
 | `image_not_available_in_zone` | 400 | 镜像在该区域不可用 | 区域内存在可用 IP 池候选但没有任何启用节点存在该镜像（可用性语义：至少一个启用节点存在即可用） |
+| `storage_not_available_in_zone` | 400 | 所选存储未挂载任何可调度的候选节点 | 创建 VM 时区域存在 IP 池候选节点，但所选存储的节点挂载快照（nodes）非空且与全部池候选节点无交集——磁盘无处可放（该错误优先于镜像不可用，`nodes` 为空即不限制节点时不会触发） |
 | `vm_not_found_on_node` | 404 | 节点 PVE 可达但 VM 不在该节点上 | 认领（import）不存在的 pve_vmid，或对 ext- 标识指向的已移除/不存在的 VM 执行生命周期操作（区别于 zone/node 自身不存在的 `not_found`） |
 | `vm_already_managed` | 409 | 该节点上的 pve_vmid 已被托管 | 重复认领同一 PVE VMID（区别于一般资源冲突的 `conflict`） |
 | `invalid_vm_id` | 400 | VM id 无法解析 | 生命周期操作/操作记录查询的 `:id` 既非正整数也非 `ext-{nodeID}-{vmid}` 合成标识 |

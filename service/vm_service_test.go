@@ -605,7 +605,7 @@ func createEnv() (*fakeVMZoneRepository, *fakeVMImageRepository, *fakeVMStorageT
 		images: []model.Image{{ID: 1, Name: "debian-12-cloud", DefaultUser: "debian",
 			DownloadURL: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"}},
 	}
-	stRepo := &fakeVMStorageTypeRepository{types: []model.StorageType{{ID: 1, Name: "ssd", PVEStorage: "local-ssd"}}}
+	stRepo := &fakeVMStorageTypeRepository{types: []model.StorageType{{ID: 1, ZoneID: 1, Name: strPtr("ssd"), PVEStorage: "local-ssd", Enabled: true, Content: strPtr("images,iso")}}}
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{node}}
 	ipRepo := &fakeVMIPPoolRepository{
 		pools:     []model.IPPool{{ID: 1, ZoneID: 1, Name: "p1", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1", DNS: "1.1.1.1"}},
@@ -613,6 +613,9 @@ func createEnv() (*fakeVMZoneRepository, *fakeVMImageRepository, *fakeVMStorageT
 	}
 	return zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo
 }
+
+// strPtr 返回指向 s 的指针，供构造可空字段（如 StorageType.Name/Content）用。
+func strPtr(s string) *string { return &s }
 
 func validCreateRequest() CreateVMRequest {
 	return CreateVMRequest{Name: "vm1", CPU: 2, MemMB: 2048, DiskGB: 10, ImageID: 1, StorageTypeID: 1, ZoneID: 1, Password: "s3cret"}
@@ -946,7 +949,7 @@ func TestCreateVMSchedulesToNodeWithImage(t *testing.T) {
 	nodeB := model.PVENode{ID: 2, ZoneID: 1, Name: "pve2", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
 	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
 	imageRepo := &fakeVMImageRepository{images: []model.Image{*testDebianImage()}}
-	stRepo := &fakeVMStorageTypeRepository{types: []model.StorageType{{ID: 1, Name: "ssd", PVEStorage: "local-ssd"}}}
+	stRepo := &fakeVMStorageTypeRepository{types: []model.StorageType{{ID: 1, ZoneID: 1, Name: strPtr("ssd"), PVEStorage: "local-ssd", Enabled: true, Content: strPtr("images,iso")}}}
 	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{nodeA, nodeB}}
 	ipRepo := &fakeVMIPPoolRepository{
 		pools:     []model.IPPool{{ID: 1, ZoneID: 1, Name: "p1", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1", DNS: "1.1.1.1"}},
@@ -966,6 +969,72 @@ func TestCreateVMSchedulesToNodeWithImage(t *testing.T) {
 		t.Fatalf("vm node = %d, want 1 (pve1, the only node with the image)", vm.VM.NodeID)
 	}
 	waitForProvision(t, vmRepo)
+}
+
+// TestCreateVMRejectsDisabledStorage 覆盖设计 D5 的第一道闸：所选存储
+// 已被管理员禁用时，创建在存储校验阶段即被拒绝（bad_request），不触发
+// 节点选择与落库。
+func TestCreateVMRejectsDisabledStorage(t *testing.T) {
+	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+	stRepo.types[0].Enabled = false
+	vmRepo := &fakeVMRepository{}
+	svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	_, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
+	if !isKind(err, KindBadRequest) {
+		t.Fatalf("err = %v, want KindBadRequest", err)
+	}
+	if !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("err = %q, want disabled storage message", err.Error())
+	}
+	if vmRepo.created != nil {
+		t.Fatalf("disabled storage: vm persisted %+v, want none", vmRepo.created)
+	}
+}
+
+// TestCreateVMRejectsNonImageStorage 覆盖设计 D5 的第二道闸：存储启用但
+// 内容快照不含 images（仅 iso 或 NULL/空）时创建被拒绝（bad_request），
+// 不产生任何落库。
+func TestCreateVMRejectsNonImageStorage(t *testing.T) {
+	for _, content := range []*string{strPtr("iso,backup"), nil, strPtr("")} {
+		zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+		stRepo.types[0].Content = content
+		vmRepo := &fakeVMRepository{}
+		svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+		_, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
+		if !isKind(err, KindBadRequest) {
+			t.Fatalf("content %v: err = %v, want KindBadRequest", content, err)
+		}
+		if !strings.Contains(err.Error(), "cannot store VM disks") {
+			t.Fatalf("content %v: err = %q, want disk-capability message", content, err.Error())
+		}
+		if vmRepo.created != nil {
+			t.Fatalf("content %v: vm persisted %+v, want none", content, vmRepo.created)
+		}
+	}
+}
+
+// TestCreateVMRejectsCrossZoneStorage 覆盖 P1 加固：存储类型属于其他 zone
+// 时创建被拒绝（not_found，与 ip pool 的 zone 归属语义一致——一个 zone
+// 对应一个 PVE 集群，跨 zone 存储按资源不存在处理），不产生任何落库。
+func TestCreateVMRejectsCrossZoneStorage(t *testing.T) {
+	zoneRepo, imageRepo, stRepo, nodeRepo, ipRepo := createEnv()
+	// 存储类型属于 zone 2，而请求落在 zone 1。
+	stRepo.types[0].ZoneID = 2
+	vmRepo := &fakeVMRepository{}
+	svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	_, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
+	if !isKind(err, KindNotFound) {
+		t.Fatalf("err = %v, want KindNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "not found in zone") {
+		t.Fatalf("err = %q, want cross-zone message", err.Error())
+	}
+	if vmRepo.created != nil {
+		t.Fatalf("cross-zone storage: vm persisted %+v, want none", vmRepo.created)
+	}
 }
 
 // TestCreateVMImageNotAvailableOnAnyNode 验证镜像在任何启用节点上都不存在
@@ -1041,6 +1110,13 @@ func testDebianImage() *model.Image {
 		DownloadURL: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"}
 }
 
+// unlimitedStorageType 是"不限制节点"的存储类型（Nodes 为空 = 所有节点
+// 可用，设计 D8），供不关心存储挂载过滤的既有调度测试使用：挂载过滤对
+// 其放行全部候选。
+func unlimitedStorageType() *model.StorageType {
+	return &model.StorageType{PVEStorage: "local-ssd", Nodes: nil}
+}
+
 // TestSelectPoolAndNodeSkipsUnreachablePools 验证 D4 + 镜像感知调度（5.6）：
 // 没有带镜像候选的池会被跳过转而使用下一个，没有"带镜像且可达"池的区域
 // 会产生 node_unavailable；区域内任何启用节点都没有镜像时产生
@@ -1077,7 +1153,7 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 	// 池 1 的唯一节点没有镜像（且不可达），池 2 的节点有镜像且可达 -> 池 2
 	// 胜出，返回该节点上的镜像卷 ID。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve-dead": true})
-	pool, node, volid, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	pool, node, volid, err := svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), nil)
 	if err != nil {
 		t.Fatalf("selectPoolAndNode: %v", err)
 	}
@@ -1090,7 +1166,7 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 
 	// 两个池的节点都有镜像但都不可达 -> node_unavailable。
 	svc.selectNode = scriptedSelectNode(map[string]bool{"pve-dead": true, "pve-alive": true})
-	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), nil)
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
@@ -1098,7 +1174,7 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 	// 完全没有池 -> no_available_ip_pool（区域无池，优先级高于镜像检查：
 	// 区域仍有节点带镜像但没有任何池可用）。
 	ipRepo.pools = nil
-	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), nil)
 	if !isKind(err, KindNoAvailableIPPool) {
 		t.Fatalf("no pools err = %v, want KindNoAvailableIPPool", err)
 	}
@@ -1114,7 +1190,7 @@ func TestSelectPoolAndNodeSkipsUnreachablePools(t *testing.T) {
 		{ID: 1, ZoneID: 1, Name: "dead-pool", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"},
 		{ID: 2, ZoneID: 1, Name: "alive-pool", NetworkCIDR: "10.0.1.0/24", Gateway: "10.0.1.1"},
 	}
-	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), nil)
 	if !isKind(err, KindImageNotAvailable) {
 		t.Fatalf("no image err = %v, want KindImageNotAvailable", err)
 	}
@@ -1148,7 +1224,7 @@ func TestSelectPoolAndNodeScanFailureNoImageNodeUnavailable(t *testing.T) {
 			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), nil)
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable (scan failure wins over image_not_available)", err)
 	}
@@ -1179,7 +1255,7 @@ func TestSelectPoolAndNodeNoPools(t *testing.T) {
 			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), nil)
 	if !isKind(err, KindNoAvailableIPPool) {
 		t.Fatalf("err = %v, want KindNoAvailableIPPool", err)
 	}
@@ -1208,7 +1284,7 @@ func TestSelectPoolAndNodeNoPoolsNoImage(t *testing.T) {
 			pve.WithBaseURL(emptySrv.URL), pve.WithHTTPClient(emptySrv.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), nil)
 	if !isKind(err, KindNoAvailableIPPool) {
 		t.Fatalf("err = %v, want KindNoAvailableIPPool (no pool wins over no image)", err)
 	}
@@ -1240,7 +1316,7 @@ func TestSelectPoolAndNodePoolWhiteListEmpty(t *testing.T) {
 	}
 
 	// 未指定池：全池遍历全部因候选为空跳过 -> 消息含区域。
-	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, nil)
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), nil)
 	if !isKind(err, KindNoAvailableIPPool) {
 		t.Fatalf("err = %v, want KindNoAvailableIPPool", err)
 	}
@@ -1251,12 +1327,276 @@ func TestSelectPoolAndNodePoolWhiteListEmpty(t *testing.T) {
 
 	// 指定该池：消息含池 id 与区域。
 	poolID := int64(1)
-	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, &poolID)
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, unlimitedStorageType(), &poolID)
 	if !isKind(err, KindNoAvailableIPPool) {
 		t.Fatalf("specified pool err = %v, want KindNoAvailableIPPool", err)
 	}
 	if !errors.As(err, &serr) || !strings.Contains(serr.Message, "ip pool 1") || !strings.Contains(serr.Message, "zone 1") {
 		t.Fatalf("specified pool err = %v, want message mentioning pool 1 and zone 1", err)
+	}
+}
+
+// TestSelectPoolAndNodeStorageMountFilter 覆盖存储挂载过滤（设计 D8）的
+// selectPoolAndNode 语义：nodes 快照非空时只在挂载了所选存储的候选节点中
+// 调度（镜像扫描同步剔除未挂载节点）；nodes 为空（不限制节点）时放行全部
+// 候选；挂载过滤后无候选返回 KindStorageNotAvailableInZone（池候选非空、
+// 存储过滤后为空的专属分支，先于镜像检查）。
+func TestSelectPoolAndNodeStorageMountFilter(t *testing.T) {
+	image := testDebianImage()
+	nodeA := model.PVENode{ID: 1, ZoneID: 1, Name: "pve1", Host: "h1", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
+	nodeB := model.PVENode{ID: 2, ZoneID: 1, Name: "pve2", Host: "h2", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{nodeA, nodeB}}
+	ipRepo := &fakeVMIPPoolRepository{
+		pools:     []model.IPPool{{ID: 1, ZoneID: 1, Name: "p1", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1", DNS: "1.1.1.1"}},
+		poolNodes: map[int64][]model.PVENode{1: {nodeA, nodeB}},
+	}
+	// 两个节点都带镜像：调度结果只由存储挂载过滤决定。
+	contentSrv := newStorageContentServer(map[string][]pve.StorageContent{
+		"pve1": {{VolID: "local:import/debian-12-genericcloud-amd64.qcow2", Name: "debian-12-genericcloud-amd64.qcow2"}},
+		"pve2": {{VolID: "local:import/debian-12-genericcloud-amd64.qcow2", Name: "debian-12-genericcloud-amd64.qcow2"}},
+	})
+	defer contentSrv.Close()
+	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, &fakeVMUserRepository{}, testCipher(t))
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+	svc.selectNode = firstReachableCandidate
+
+	// 只挂 pve2：仅挂载节点参与调度，镜像扫描也不会触碰 pve1。
+	_, node, _, err := svc.selectPoolAndNode(context.Background(), 1, image, &model.StorageType{PVEStorage: "local-ssd", Nodes: []string{"pve2"}}, nil)
+	if err != nil {
+		t.Fatalf("selectPoolAndNode: %v", err)
+	}
+	if node.ID != 2 {
+		t.Fatalf("node = %+v, want pve2 (the only mounted candidate)", node)
+	}
+
+	// 挂载集合不含任何候选（pve3 未挂载到 pve1/pve2）-> storage_not_available。
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, &model.StorageType{PVEStorage: "local-ssd", Nodes: []string{"pve3"}}, nil)
+	if !isKind(err, KindStorageNotAvailableInZone) {
+		t.Fatalf("unmounted storage err = %v, want KindStorageNotAvailableInZone", err)
+	}
+	var serr *Error
+	if !errors.As(err, &serr) || !strings.Contains(serr.Message, `"local-ssd"`) || !strings.Contains(serr.Message, "zone 1") {
+		t.Fatalf("unmounted storage err = %v, want message mentioning storage and zone", err)
+	}
+
+	// nodes 为空（nil，不限制节点）：放行全部候选，落在第一个（pve1）。
+	_, node, _, err = svc.selectPoolAndNode(context.Background(), 1, image, &model.StorageType{PVEStorage: "local-ssd", Nodes: nil}, nil)
+	if err != nil {
+		t.Fatalf("unlimited selectPoolAndNode: %v", err)
+	}
+	if node.ID != 1 {
+		t.Fatalf("unlimited node = %+v, want pve1 (first candidate)", node)
+	}
+}
+
+// TestSelectPoolAndNodeStorageMountUsesPveName 覆盖挂载过滤对 PVE 节点名
+// 的解析语义：节点 PveName 非空时以 PveName 匹配挂载快照（业务名 Name
+// 不参与匹配，与 nodeName 的回退语义一致）。
+func TestSelectPoolAndNodeStorageMountUsesPveName(t *testing.T) {
+	image := testDebianImage()
+	// 业务名 pve-biz，PveName aeoliancloud：调度链路一律用 aeoliancloud。
+	node := model.PVENode{ID: 1, ZoneID: 1, Name: "pve-biz", PveName: "aeoliancloud", Host: "h1",
+		APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{node}}
+	ipRepo := &fakeVMIPPoolRepository{
+		pools:     []model.IPPool{{ID: 1, ZoneID: 1, Name: "p1", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1", DNS: "1.1.1.1"}},
+		poolNodes: map[int64][]model.PVENode{1: {node}},
+	}
+	contentSrv := newStorageContentServer(map[string][]pve.StorageContent{
+		"aeoliancloud": {{VolID: "local:import/debian-12-genericcloud-amd64.qcow2", Name: "debian-12-genericcloud-amd64.qcow2"}},
+	})
+	defer contentSrv.Close()
+	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, &fakeVMUserRepository{}, testCipher(t))
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+	svc.selectNode = firstReachableCandidate
+
+	// 挂载快照以 PVE 节点名（aeoliancloud）匹配 -> 放行。
+	_, node2, _, err := svc.selectPoolAndNode(context.Background(), 1, image, &model.StorageType{PVEStorage: "local-ssd", Nodes: []string{"aeoliancloud"}}, nil)
+	if err != nil {
+		t.Fatalf("selectPoolAndNode with pve name: %v", err)
+	}
+	if node2.ID != 1 {
+		t.Fatalf("node = %+v, want pve-biz (PveName matched)", node2)
+	}
+
+	// 快照写的是业务名（pve-biz）而非 PVE 节点名 -> 剔除，报存储不可用。
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, &model.StorageType{PVEStorage: "local-ssd", Nodes: []string{"pve-biz"}}, nil)
+	if !isKind(err, KindStorageNotAvailableInZone) {
+		t.Fatalf("business-name mount err = %v, want KindStorageNotAvailableInZone", err)
+	}
+}
+
+// TestStorageSnapshotUnmatched 覆盖 storageSnapshotUnmatched 的匹配语义
+// （11.5 可观测性）：快照节点名按 nodeName（PveName fallback Name）与 zone
+// 启用节点匹配，未匹配的名单排序稳定返回；全部匹配时为空。
+func TestStorageSnapshotUnmatched(t *testing.T) {
+	enabled := []model.PVENode{
+		{ID: 1, Name: "pve1", PveName: "cluster-pve1", Enabled: true},
+		{ID: 2, Name: "pve2", PveName: "", Enabled: true},
+	}
+	cases := []struct {
+		name    string
+		mounted map[string]struct{}
+		want    []string
+	}{
+		{
+			name:    "all matched",
+			mounted: map[string]struct{}{"cluster-pve1": {}, "pve2": {}},
+			want:    nil,
+		},
+		{
+			name:    "business name not matched (pve_name missing)",
+			mounted: map[string]struct{}{"pve1": {}},
+			want:    []string{"pve1"},
+		},
+		{
+			name:    "disabled or stale node",
+			mounted: map[string]struct{}{"cluster-pve1": {}, "pve9": {}, "pve2": {}},
+			want:    []string{"pve9"},
+		},
+		{
+			name:    "sorted output",
+			mounted: map[string]struct{}{"zzz": {}, "aaa": {}, "mmm": {}},
+			want:    []string{"aaa", "mmm", "zzz"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := storageSnapshotUnmatched(tc.mounted, enabled)
+			if len(got) != len(tc.want) {
+				t.Fatalf("unmatched = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("unmatched = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestCreateVMStorageMountFilter 覆盖创建 VM 全链路的存储挂载过滤（设计
+// D8）：所选存储只挂载 pve2 时，VM 被调度到 pve2（池候选与镜像存在性都
+// 满足的节点中仅挂载节点胜出），且供给链在 pve2 上完成。
+func TestCreateVMStorageMountFilter(t *testing.T) {
+	nodeA := testPVENode(1) // pve1
+	nodeB := model.PVENode{ID: 2, ZoneID: 1, Name: "pve2", Host: "h", APIUser: "root@pam", APITokenSecret: "spark=uuid", Enabled: true}
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	imageRepo := &fakeVMImageRepository{images: []model.Image{*testDebianImage()}}
+	stRepo := &fakeVMStorageTypeRepository{types: []model.StorageType{{ID: 1, ZoneID: 1, Name: strPtr("ssd"), PVEStorage: "local-ssd", Enabled: true, Content: strPtr("images,iso"), Nodes: []string{"pve2"}}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{nodeA, nodeB}}
+	ipRepo := &fakeVMIPPoolRepository{
+		pools:     []model.IPPool{{ID: 1, ZoneID: 1, Name: "p1", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1", DNS: "1.1.1.1"}},
+		poolNodes: map[int64][]model.PVENode{1: {nodeA, nodeB}},
+	}
+	ipRepo.claimResults = []claimResult{{ip: model.IP{ID: 7, PoolID: 1, IP: "10.0.0.5", Status: model.IPStatusUsed}}}
+	vmRepo := &fakeVMRepository{}
+	svc := NewVMService(&fakeBeginner{}, vmRepo, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
+		imageRepo, stRepo, &fakeVMUserRepository{}, testCipher(t))
+	svc.selectNode = firstReachableCandidate
+	// 两个节点都带镜像（contentNodes 预置），且供给链对任意节点名可用：
+	// 调度结果只由存储挂载过滤决定，VM 必须落在 pve2 并完成供给。
+	srv := newScriptedProvisionServer(t, "15G")
+	srv.contentNodes = map[string]bool{"pve1": true, "pve2": true}
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
+	}
+
+	vm, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if vm.VM.NodeID != 2 {
+		t.Fatalf("vm node = %d, want 2 (pve2, the only mounted node)", vm.VM.NodeID)
+	}
+	waitForProvision(t, vmRepo)
+}
+
+// TestCreateVMStorageMountExcludesAll 覆盖存储挂载过滤全排除的创建路径：
+// 所选存储的 nodes 快照非空且不与任何池候选重合时，创建被
+// storage_not_available_in_zone 拒绝（bad_request），不产生任何落库。
+func TestCreateVMStorageMountExcludesAll(t *testing.T) {
+	node := testPVENode(1)
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	imageRepo := &fakeVMImageRepository{images: []model.Image{*testDebianImage()}}
+	stRepo := &fakeVMStorageTypeRepository{types: []model.StorageType{{ID: 1, ZoneID: 1, Name: strPtr("ssd"), PVEStorage: "local-ssd", Enabled: true, Content: strPtr("images,iso"), Nodes: []string{"ghost-node"}}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{node}}
+	ipRepo := &fakeVMIPPoolRepository{
+		pools:     []model.IPPool{{ID: 1, ZoneID: 1, Name: "p1", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1", DNS: "1.1.1.1"}},
+		poolNodes: map[int64][]model.PVENode{1: {node}},
+	}
+	vmRepo := &fakeVMRepository{}
+	svc := newVMService(t, vmRepo, ipRepo, zoneRepo, nodeRepo, imageRepo, stRepo)
+
+	_, err := svc.CreateVM(context.Background(), adminIdentity(), validCreateRequest())
+	if !isKind(err, KindStorageNotAvailableInZone) {
+		t.Fatalf("err = %v, want KindStorageNotAvailableInZone", err)
+	}
+	if !strings.Contains(err.Error(), `"local-ssd"`) || !strings.Contains(err.Error(), "zone 1") {
+		t.Fatalf("err = %q, want message mentioning storage and zone", err.Error())
+	}
+	if vmRepo.created != nil {
+		t.Fatalf("unmounted storage: vm persisted %+v, want none", vmRepo.created)
+	}
+}
+
+// TestCreateVMStorageMountFilterPrecedence 覆盖存储挂载过滤与其他失败分支
+// 的优先级组合（设计 3 + D8）：池候选为空仍报 no_available_ip_pool（不受
+// 存储挂载影响）；存储过滤后仍有候选但镜像全无报 image_not_available_in_zone。
+func TestCreateVMStorageMountFilterPrecedence(t *testing.T) {
+	image := testDebianImage()
+	node := testPVENode(1)
+	zoneRepo := &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
+	nodeRepo := &fakeVMNodeRepository{nodes: []model.PVENode{node}}
+	stMounted := &model.StorageType{PVEStorage: "local-ssd", Nodes: []string{"pve1"}}
+
+	// 场景一：池候选为空（白名单无节点）-> no_available_ip_pool，存储挂载
+	// 状态无关紧要（池配置缺失优先）。
+	ipRepo := &fakeVMIPPoolRepository{
+		pools:     []model.IPPool{{ID: 1, ZoneID: 1, Name: "empty-pool", NetworkCIDR: "10.0.0.0/24", Gateway: "10.0.0.1"}},
+		poolNodes: map[int64][]model.PVENode{}, // 白名单为空
+	}
+	contentSrv := newStorageContentServer(map[string][]pve.StorageContent{
+		"pve1": {{VolID: "local:import/debian-12-genericcloud-amd64.qcow2", Name: "debian-12-genericcloud-amd64.qcow2"}},
+	})
+	defer contentSrv.Close()
+	svc := NewVMService(&fakeBeginner{}, &fakeVMRepository{}, &fakeVMOperationRepository{}, ipRepo, zoneRepo, nodeRepo,
+		&fakeVMImageRepository{}, &fakeVMStorageTypeRepository{}, &fakeVMUserRepository{}, testCipher(t))
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(contentSrv.URL), pve.WithHTTPClient(contentSrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+	svc.selectNode = firstReachableCandidate
+	_, _, _, err := svc.selectPoolAndNode(context.Background(), 1, image, stMounted, nil)
+	if !isKind(err, KindNoAvailableIPPool) {
+		t.Fatalf("empty pool + mounted storage err = %v, want KindNoAvailableIPPool", err)
+	}
+
+	// 场景二：存储过滤后仍有候选（pve1 挂载），但节点上镜像全无 ->
+	// image_not_available_in_zone（存储放行后才轮到镜像检查）。
+	ipRepo.poolNodes = map[int64][]model.PVENode{1: {node}}
+	emptySrv := newStorageContentServer(nil)
+	defer emptySrv.Close()
+	svc.newClient = func(host string, port int, apiUser, apiTokenSecret string) *pve.Client {
+		return pve.NewClient("pve1", apiUser, apiTokenSecret,
+			pve.WithBaseURL(emptySrv.URL), pve.WithHTTPClient(emptySrv.Client()), pve.WithTimeout(5*time.Second))
+	}
+	_, _, _, err = svc.selectPoolAndNode(context.Background(), 1, image, stMounted, nil)
+	if !isKind(err, KindImageNotAvailable) {
+		t.Fatalf("mounted storage without image err = %v, want KindImageNotAvailable", err)
 	}
 }
 
@@ -1273,6 +1613,10 @@ type scriptedProvisionServer struct {
 	resizes    int
 	destroyed  bool
 	requests   map[string]int
+	// contentNodes 标记哪些节点（PVE 节点名）的 local/import 内容扫描能
+	// 命中镜像；nil 时仅 pve1 命中（既有行为）。供存储挂载过滤测试
+	// （设计 D8）把镜像预置到多个节点，让非 pve1 节点也能被选中。
+	contentNodes map[string]bool
 }
 
 func newScriptedProvisionServer(t *testing.T, configSize string) *scriptedProvisionServer {
@@ -1282,30 +1626,48 @@ func newScriptedProvisionServer(t *testing.T, configSize string) *scriptedProvis
 
 func (s *scriptedProvisionServer) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		// 提取 /nodes/{node}/ 段的节点名：供给链与镜像扫描的节点随调度
+		// 结果变化（存储挂载过滤测试可能选中非 pve1 节点），处理逻辑
+		// 按节点名一致化，不再硬编码 pve1。
+		node := ""
+		if rest, ok := strings.CutPrefix(path, "/nodes/"); ok {
+			if i := strings.Index(rest, "/"); i >= 0 {
+				node = rest[:i]
+			}
+		}
 		switch {
-		case r.URL.Path == "/cluster/nextid":
+		case path == "/cluster/nextid":
 			fmt.Fprint(w, `{"data": "100"}`)
-		case r.URL.Path == "/nodes/pve1/qemu" && r.Method == http.MethodPost:
+		case strings.HasSuffix(path, "/qemu") && r.Method == http.MethodPost:
 			s.creates++
 			s.createBody = map[string]any{}
 			if err := json.NewDecoder(r.Body).Decode(&s.createBody); err != nil {
 				s.t.Errorf("decode create body: %v", err)
 			}
+			// UPID 固定 pve1 段：任务状态轮询仍命中下方 /tasks/ 分支。
 			fmt.Fprint(w, `{"data": "UPID:pve1:00000E5B:01C9EC9E:5FAB1EC4:qmcreate:100:root@pam:"}`)
-		case strings.HasPrefix(r.URL.Path, "/nodes/pve1/tasks/") && strings.HasSuffix(r.URL.Path, "/status"):
+		case strings.Contains(path, "/tasks/") && strings.HasSuffix(path, "/status"):
 			fmt.Fprint(w, `{"data": {"upid": "UPID:pve1:0:0:0:qmcreate:100:root@pam:", "node": "pve1", "type": "qmcreate", "id": "100", "user": "root@pam", "status": "stopped", "exitstatus": "OK"}}`)
-		case r.URL.Path == "/nodes/pve1/qemu/100/config" && r.Method == http.MethodGet:
+		case strings.HasSuffix(path, "/qemu/100/config") && r.Method == http.MethodGet:
 			fmt.Fprintf(w, `{"data": {"bootdisk": "scsi0", "scsi0": "local-ssd:vm-100-disk-0,size=%s", "cores": "2", "memory": "2048"}}`, s.configSize)
-		case r.URL.Path == "/nodes/pve1/qemu/100/resize":
+		case strings.HasSuffix(path, "/qemu/100/resize"):
 			s.resizes++
 			fmt.Fprint(w, `{"data": "UPID:pve1:00000E5B:01C9EC9E:5FAB1EC4:resize:100:root@pam:"}`)
-		case r.URL.Path == "/nodes/pve1/qemu/100" && r.Method == http.MethodDelete:
+		case strings.HasSuffix(path, "/qemu/100") && r.Method == http.MethodDelete:
 			s.destroyed = true
 			fmt.Fprint(w, `{"data": "UPID:pve1:00000E5B:01C9EC9E:5FAB1EC4:qmdestroy:100:root@pam:"}`)
-		case strings.HasSuffix(r.URL.Path, "/storage/local/content"):
-			// 镜像存在性扫描（任务 5.6）：pve1 上预置与 createEnv 镜像
-			// DownloadURL basename 匹配的 import 条目，其余节点为空清单。
-			if strings.HasPrefix(r.URL.Path, "/nodes/pve1/") {
+		case strings.HasSuffix(path, "/storage/local/content"):
+			// 镜像存在性扫描（任务 5.6）：contentNodes 非 nil 时按节点名
+			// 决定是否命中；nil（默认）时仅 pve1 预置镜像，其余节点为空
+			// 清单（既有行为）。
+			has := false
+			if s.contentNodes != nil {
+				has = s.contentNodes[node]
+			} else {
+				has = strings.HasPrefix(path, "/nodes/pve1/")
+			}
+			if has {
 				fmt.Fprint(w, `{"data": [{"volid": "local:import/debian-12-genericcloud-amd64.qcow2", "name": "debian-12-genericcloud-amd64.qcow2"}]}`)
 			} else {
 				fmt.Fprint(w, `{"data": []}`)

@@ -52,6 +52,11 @@ const (
 	// （有池有候选但可达性探测失败）。池配置是创建 VM 的前置条件，即使镜像
 	// 也未下载，也优先暴露该错误。
 	KindNoAvailableIPPool ErrorKind = 110
+	// KindStorageNotAvailableInZone：区域存在池候选节点，但所选存储的节点
+	// 挂载快照（nodes）非空且与全部池候选节点无交集——所选存储没有挂载在
+	// 任何可调度的节点上（bad_request 类，与 KindImageNotAvailable 同构；
+	// 区分于 KindNoAvailableIPPool 的池配置缺失）。
+	KindStorageNotAvailableInZone ErrorKind = 111
 )
 
 func vmNotReadyf(format string, args ...any) *Error {
@@ -91,6 +96,13 @@ func operationLogFailedf(format string, args ...any) *Error {
 // 白名单∩启用节点为空」（"ip pool %d has no candidate nodes in zone %d"）。
 func noAvailableIPPoolf(format string, args ...any) *Error {
 	return &Error{Kind: KindNoAvailableIPPool, Message: fmt.Sprintf(format, args...)}
+}
+
+// storageNotAvailablef 构造一个 KindStorageNotAvailableInZone 服务错误：
+// 所选存储的节点挂载快照非空，但没有任何池候选节点挂载了它——磁盘发往
+// 未挂载该存储的节点必然失败，创建被拒绝（bad_request 类）。
+func storageNotAvailablef(format string, args ...any) *Error {
+	return &Error{Kind: KindStorageNotAvailableInZone, Message: fmt.Sprintf(format, args...)}
 }
 
 const (
@@ -366,6 +378,23 @@ func (s *VMService) CreateVM(ctx context.Context, identity *Identity, req Create
 		}
 		return nil, fmt.Errorf("create vm: get storage type: %w", err)
 	}
+	// 3b. 跨 zone 归属校验（与 ip pool 的 zone 归属语义一致）：存储类型
+	// 必须属于请求区域，否则按资源不存在 404 处理——一个 zone 对应一个
+	// PVE 集群，防止把其他集群的存储塞进本区域的 VM。归属校验先于可用性
+	// 两道闸执行（与 ip pool 的"存在→归属"惯例一致）：跨 zone 时优先
+	// 404 而非 400。
+	if storageType.ZoneID != req.ZoneID {
+		return nil, notFoundf("storage type %d not found in zone %d", req.StorageTypeID, req.ZoneID)
+	}
+	// 3c. 存储可用性两道闸（设计 D5）：所选存储必须处于启用状态且支持
+	// images 内容类型（content 快照为 NULL/空时视为不支持）；校验发生在
+	// 异步供给链之前，错误直接返回调用方。
+	if !storageType.Enabled {
+		return nil, badRequestf("storage type is disabled")
+	}
+	if !storageTypeSupportsImages(storageType.Content) {
+		return nil, badRequestf("storage type cannot store VM disks")
+	}
 	// 4. 校验密码与规格。
 	if err := validateCreateVMRequest(req); err != nil {
 		return nil, err
@@ -400,11 +429,13 @@ func (s *VMService) CreateVM(ctx context.Context, identity *Identity, req Create
 		}
 	}
 
-	// 节点与池的选择（D4，镜像感知调度 5.6）：按 id 顺序遍历区域的池；对每个
-	// 池，其白名单节点与区域启用节点求交集后，先按镜像存在性过滤（仅保留
-	// local/import 存储上存在该镜像的节点），再从过滤结果中挑选第一个可达
-	// 节点；没有可用候选的池会被跳过，继续尝试下一个池。
-	pool, node, volid, err := s.selectPoolAndNode(ctx, req.ZoneID, image, req.PoolID)
+	// 节点与池的选择（D4，镜像感知调度 5.6 + 存储挂载过滤 D8）：按 id 顺序
+	// 遍历区域的池；对每个池，其白名单节点与区域启用节点求交集后，先按所选
+	// 存储的节点挂载快照过滤（nodes 非空时仅保留挂载了该存储的节点），再按
+	// 镜像存在性过滤（仅保留 local/import 存储上存在该镜像的节点），最后从
+	// 过滤结果中挑选第一个可达节点；没有可用候选的池会被跳过，继续尝试下一
+	// 个池。
+	pool, node, volid, err := s.selectPoolAndNode(ctx, req.ZoneID, image, storageType, req.PoolID)
 	if err != nil {
 		return nil, err
 	}
@@ -478,6 +509,21 @@ func (s *VMService) CreateVM(ctx context.Context, identity *Identity, req Create
 	go s.provisionVM(vm, node, image, volid, storageType, pool, req.Password, claimed.IP)
 
 	return &repository.VMWithIP{VM: vm, IP: claimed.IP}, nil
+}
+
+// storageTypeSupportsImages 判断存储类型的内容快照是否包含 images 内容
+// 类型：content 按逗号拆分后逐项匹配（容忍空白）；content 为 NULL（nil，
+// 尚未扫描的存量行）或空串时视为不支持——不能确定能放磁盘映像就不放行。
+func storageTypeSupportsImages(content *string) bool {
+	if content == nil {
+		return false
+	}
+	for _, c := range strings.Split(*content, ",") {
+		if strings.TrimSpace(c) == "images" {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveVMCreationUser 解析创建/认领 VM 的归属用户（vms.user_id，设计
@@ -583,12 +629,19 @@ func applyOperator(op *model.VMOperation, identity *Identity) {
 	op.OperatorID = &id
 }
 
-// selectPoolAndNode 按 id 顺序遍历区域的 IP 池（D4，镜像感知调度 5.6）。
-// 对每个池，将白名单节点（ip_pool_nodes，按节点 id）与区域启用节点求交集，
-// 并先按镜像存在性过滤：仅保留 local 存储 import 目录中存在该镜像（以
-// DownloadURL 的 basename 匹配）的节点及其卷 ID，过滤结果再走 selectNode
-// 可达性探测，第一个可达节点胜出；没有带镜像候选的池会被跳过，继续尝试
-// 下一个池。
+// selectPoolAndNode 按 id 顺序遍历区域的 IP 池（D4，镜像感知调度 5.6 +
+// 存储挂载过滤 D8）。对每个池，将白名单节点（ip_pool_nodes，按节点 id）与
+// 区域启用节点求交集，先按所选存储的节点挂载快照过滤（storageType.Nodes
+// 非空时仅保留 PVE 节点名在其中、即挂载了该存储的候选；nodes 为空 = 不
+// 限制节点，不过滤），再按镜像存在性过滤：仅保留 local 存储 import 目录中
+// 存在该镜像（以 DownloadURL 的 basename 匹配）的节点及其卷 ID，过滤结果
+// 再走 selectNode 可达性探测，第一个可达节点胜出；没有带镜像候选的池会被
+// 跳过，继续尝试下一个池。
+//
+// storageType 必须是 CreateVM 已校验（zone 归属/enabled/images 内容能力）
+// 的所选存储类型；nil 视为"不过滤节点"（防御性处理，正常路径不会发生）。
+// 挂载过滤同时作用于镜像存在性扫描（scanNodeImageVolIDs 的输入节点）：
+// 未挂载该存储的节点永远不可能被选中，提前剔除可减少无效的镜像扫描调用。
 //
 // poolID 非空时（调用方已校验池存在且属于该区域）只遍历该池，不再列举
 // 区域全部池；poolID 为空时保持缺省的全池自动遍历。两种形态下镜像扫描
@@ -597,23 +650,42 @@ func applyOperator(op *model.VMOperation, identity *Identity) {
 // 返回的 volid 是所选节点上该镜像的卷 ID（如 "local:import/xxx.qcow2"），
 // 由供给链用于 scsi0 的 import-from（任务 5.7），保证非空。
 //
-// 失败分支按优先级区分三种语义（设计 3）：
+// 失败分支按优先级区分四种语义（设计 3 + D8）：
 // a. 池候选集合整体为空（区域无池、指定池的白名单∩启用节点为空、或全部
 //
-//	池的候选均为空）-> KindNoAvailableIPPool；该分支优先于镜像检查——
-//	池配置是创建 VM 的前置条件，即使镜像也未下载也先暴露池缺失。消息区分
-//	「区域无池」与「池无候选节点」两种子因（不再新增子错误码）。
+//	池的候选均为空）-> KindNoAvailableIPPool；该分支优先于存储挂载与镜像
+//	检查——池配置是创建 VM 的前置条件，即使镜像也未下载也先暴露池缺失。
+//	消息区分「区域无池」与「池无候选节点」两种子因（不再新增子错误码）。
 //
-// b. 池有候选但区域内没有任何启用节点确认存在该镜像 -> 扫描失败（节点
+// b. 池有候选但存储挂载过滤后全为空（所选存储 nodes 快照非空，且没有任一
 //
-//	不可达）时 KindNodeUnavailable，全部扫描成功却无镜像时
+//	候选节点挂载它）-> KindStorageNotAvailableInZone（设计 D8）：磁盘发往
+//	未挂载该存储的节点必然失败，先于镜像检查暴露。
+//
+// c. 存储过滤后仍有候选但区域内没有任何启用节点确认存在该镜像 -> 扫描
+//
+//	失败（节点不可达）时 KindNodeUnavailable，全部扫描成功却无镜像时
 //	KindImageNotAvailable。
 //
-// c. 池有候选且镜像存在，但可达性探测全部失败 -> KindNodeUnavailable。
-func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *model.Image, poolID *int64) (model.IPPool, model.PVENode, string, error) {
+// d. 存储过滤后候选带镜像，但可达性探测全部失败 -> KindNodeUnavailable。
+func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *model.Image, storageType *model.StorageType, poolID *int64) (model.IPPool, model.PVENode, string, error) {
 	enabledNodes, err := s.nodeRepo.ListEnabledNodesByZone(ctx, zoneID)
 	if err != nil {
 		return model.IPPool{}, model.PVENode{}, "", fmt.Errorf("select node: list enabled nodes: %w", err)
+	}
+	// 存储挂载集合（设计 D8）：nodes 快照非空时，只有挂载了所选存储的节点
+	// 参与镜像存在性扫描与调度；快照为空（不限制节点）返回 nil = 不过滤。
+	mounted := storageMountedNodes(storageType)
+	// 可观测性（11.5）：快照节点名在 zone 启用节点中无匹配时记 warning——
+	// 可能原因：节点 PveName 未回填（PveName 空时以业务名 Name 匹配）、
+	// 快照过期或节点被禁用。调度以快照为准，无匹配的挂载节点永远不可能被
+	// 选中，warning 携带快照节点名与 zone 便于管理员定位配置问题。
+	if mounted != nil {
+		if unmatched := storageSnapshotUnmatched(mounted, enabledNodes); len(unmatched) > 0 {
+			slog.Warn("storage mount snapshot has node names not among enabled nodes of zone",
+				"zone_id", zoneID, "storage", storageType.PVEStorage,
+				"snapshot_nodes", strings.Join(unmatched, ","))
+		}
 	}
 	var pools []model.IPPool
 	if poolID != nil {
@@ -641,22 +713,34 @@ func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *
 		}
 	}
 
-	// 镜像存在性过滤：并行扫描每个启用节点的 local/import 存储，建立
-	// 节点 -> 镜像卷 ID 映射。扫描失败的节点（不可达）视为"未知"，不记录
-	// 存在性，也不参与后续选择——它们只会影响错误区分（见下方）。
+	// 镜像存在性过滤：并行扫描挂载了所选存储的启用节点（存储挂载过滤先行，
+	// 未挂载节点的镜像存在性无关紧要——它们不可能被选中）的 local/import
+	// 存储，建立节点 -> 镜像卷 ID 映射。扫描失败的节点（不可达）视为"未
+	// 知"，不记录存在性，也不参与后续选择——它们只会影响错误区分（见下方）。
 	// 镜像名复用 image_service 的 imageFileName（同包共享 helper，与
 	// image_service 的匹配语义同源）：url.Parse 后取 Path 的 basename，
 	// URL 带查询串时不会把查询串带进文件名，保证与扫描匹配（D2）一致。
+	scanNodes := enabledNodes
+	if mounted != nil {
+		scanNodes = make([]model.PVENode, 0, len(enabledNodes))
+		for _, n := range enabledNodes {
+			if _, ok := mounted[nodeName(n)]; ok {
+				scanNodes = append(scanNodes, n)
+			}
+		}
+	}
 	imageName := imageFileName(image.DownloadURL)
-	volIDs, scanFailures, err := s.scanNodeImageVolIDs(ctx, enabledNodes, imageName)
+	volIDs, scanFailures, err := s.scanNodeImageVolIDs(ctx, scanNodes, imageName)
 	if err != nil {
 		return model.IPPool{}, model.PVENode{}, "", err
 	}
 
-	// hasCandidatePool 记录是否出现过候选非空的池；poolTriedWithImage 记录
-	// 是否出现过候选带镜像的池。两者在失败分支用于区分「无可用池」（a）与
-	// 「有池但镜像/可达性失败」（b/c）。
+	// hasCandidatePool 记录是否出现过候选非空的池；hasStorageCandidatePool
+	// 记录存储挂载过滤后仍非空的池；poolTriedWithImage 记录是否出现过候选带
+	// 镜像的池。三者按失败分支的优先级区分「无可用池」（a）、「存储未挂载」
+	// （b）与「有池但镜像/可达性失败」（c/d）。
 	hasCandidatePool := false
+	hasStorageCandidatePool := false
 	poolTriedWithImage := false
 	for _, pool := range pools {
 		poolNodes, err := s.ipPoolRepo.GetPoolNodes(ctx, pool.ID)
@@ -668,8 +752,24 @@ func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *
 			continue
 		}
 		hasCandidatePool = true
-		withImage := make([]model.PVENode, 0, len(candidates))
-		for _, n := range candidates {
+		// 存储挂载过滤（设计 D8）：剔除 PVE 节点名（nodeName，PveName
+		// fallback Name）不在存储 nodes 快照中的候选；快照为空（不限制）
+		// 时不过滤。
+		withStorage := candidates
+		if mounted != nil {
+			withStorage = make([]model.PVENode, 0, len(candidates))
+			for _, n := range candidates {
+				if _, ok := mounted[nodeName(n)]; ok {
+					withStorage = append(withStorage, n)
+				}
+			}
+		}
+		if len(withStorage) == 0 {
+			continue // 该池的候选均未挂载所选存储：跳过该池，继续下一个
+		}
+		hasStorageCandidatePool = true
+		withImage := make([]model.PVENode, 0, len(withStorage))
+		for _, n := range withStorage {
 			if _, ok := volIDs[n.ID]; ok {
 				withImage = append(withImage, n)
 			}
@@ -692,17 +792,57 @@ func (s *VMService) selectPoolAndNode(ctx context.Context, zoneID int64, image *
 		}
 		return model.IPPool{}, model.PVENode{}, "", noAvailableIPPoolf("no available ip pool in zone %d", zoneID)
 	}
-	// b. 池有候选但没有任何启用节点确认存在该镜像。若存在扫描失败的节点
-	// （不可达，无法确认镜像是否存在），优先呈现节点不可达；全部扫描成功却
-	// 无镜像才是镜像不可用。
+	// b. 池有候选但存储挂载过滤后为空（设计 D8）：所选存储（nodes 快照非空）
+	// 没有挂载在任何候选节点上，磁盘无处可放——先于镜像检查暴露。
+	if !hasStorageCandidatePool {
+		return model.IPPool{}, model.PVENode{}, "", storageNotAvailablef("storage type %q is not available on any candidate node in zone %d", storageType.PVEStorage, zoneID)
+	}
+	// c. 存储过滤后仍有候选但没有任何启用节点确认存在该镜像。若存在扫描失败
+	// 的节点（不可达，无法确认镜像是否存在），优先呈现节点不可达；全部扫描
+	// 成功却无镜像才是镜像不可用。
 	if !poolTriedWithImage && len(volIDs) == 0 {
 		if len(scanFailures) > 0 {
 			return model.IPPool{}, model.PVENode{}, "", nodeUnavailablef("no reachable node with image %q in zone %d", image.Name, zoneID)
 		}
 		return model.IPPool{}, model.PVENode{}, "", imageNotAvailablef("image %q is not available on any enabled node of zone %d", image.Name, zoneID)
 	}
-	// c. 池有候选且镜像存在，但可达性探测全部失败（真实的依赖故障）。
+	// d. 池有候选且镜像存在，但可达性探测全部失败（真实的依赖故障）。
 	return model.IPPool{}, model.PVENode{}, "", nodeUnavailablef("no reachable node with image %q in zone %d", image.Name, zoneID)
+}
+
+// storageMountedNodes 返回所选存储挂载的 PVE 节点名集合（与 nodeName 的
+// 语义一致：PveName fallback Name），供调度按挂载过滤候选节点（设计 D8）。
+// storageType 为 nil 或 Nodes 为空（快照语义：不限制节点、所有节点可用）
+// 时返回 nil，调用方视为"不过滤任何节点"。
+func storageMountedNodes(st *model.StorageType) map[string]struct{} {
+	if st == nil || len(st.Nodes) == 0 {
+		return nil
+	}
+	mounted := make(map[string]struct{}, len(st.Nodes))
+	for _, n := range st.Nodes {
+		if n = strings.TrimSpace(n); n != "" {
+			mounted[n] = struct{}{}
+		}
+	}
+	return mounted
+}
+
+// storageSnapshotUnmatched 返回挂载快照节点名（mounted）中未出现在 zone
+// 启用节点（enabledNodes，按 nodeName 即 PveName fallback Name）中的名单，
+// 供调度侧可观测性日志定位 PveName 未回填等配置问题（11.5）。
+func storageSnapshotUnmatched(mounted map[string]struct{}, enabledNodes []model.PVENode) []string {
+	enabled := make(map[string]struct{}, len(enabledNodes))
+	for _, n := range enabledNodes {
+		enabled[nodeName(n)] = struct{}{}
+	}
+	var unmatched []string
+	for name := range mounted {
+		if _, ok := enabled[name]; !ok {
+			unmatched = append(unmatched, name)
+		}
+	}
+	sort.Strings(unmatched)
+	return unmatched
 }
 
 // scanNodeImageVolIDs 并行扫描启用节点的 local 存储 import 目录，返回

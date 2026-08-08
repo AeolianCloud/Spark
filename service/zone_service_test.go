@@ -529,3 +529,67 @@ func TestCreateNodeRejectsClusterNameMismatch(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestCreateNodeTriggersStorageSync 覆盖设计 D6 的触发语义：节点注册成功
+// 分支以其所属 zone 调用存储扫描回调；扫描失败（回调返回错误）不影响注册
+// 结果（节点照常创建并返回，失败仅记日志）。
+func TestCreateNodeTriggersStorageSync(t *testing.T) {
+	zoneRepo := &fakeZoneRepository{zones: []model.Zone{{ID: 1, Name: "cn-east-1"}}}
+	nodeRepo := &fakeNodeRepository{}
+	svc := NewZoneService(zoneRepo, nodeRepo)
+	svc.probeNodes = func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error) {
+		return []string{"pve-sync", "pve-fail"}, nil
+	}
+
+	// 成功路径：回调被调用一次且收到正确的 zone id。
+	scannedZones := make([]int64, 0)
+	svc.SetStorageSync(func(ctx context.Context, zoneID int64) error {
+		scannedZones = append(scannedZones, zoneID)
+		return nil
+	})
+	n, err := svc.CreateNode(context.Background(), 1, "pve-sync", "10.0.0.9", "root@pam!spark", "tok", nil)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	if n.Name != "pve-sync" {
+		t.Fatalf("node = %+v", n)
+	}
+	if len(scannedZones) != 1 || scannedZones[0] != 1 {
+		t.Fatalf("storage sync zones = %v, want [1]", scannedZones)
+	}
+
+	// 扫描失败路径：回调返回错误，注册照常成功（节点落库、返回无错误）。
+	failing := func(ctx context.Context, zoneID int64) error {
+		return errors.New("pve unreachable")
+	}
+	svc.SetStorageSync(failing)
+	n, err = svc.CreateNode(context.Background(), 1, "pve-fail", "10.0.0.10", "root@pam!spark", "tok", nil)
+	if err != nil {
+		t.Fatalf("create node with failing sync: %v", err)
+	}
+	if n.Name != "pve-fail" {
+		t.Fatalf("node = %+v", n)
+	}
+	if len(nodeRepo.nodes) != 2 {
+		t.Fatalf("persisted nodes = %d, want 2 (failing sync must not block registration)", len(nodeRepo.nodes))
+	}
+}
+
+// TestCreateNodeWithoutStorageSync 覆盖未挂接回调（默认形态）时注册成功
+// 且不产生副作用。
+func TestCreateNodeWithoutStorageSync(t *testing.T) {
+	zoneRepo := &fakeZoneRepository{zones: []model.Zone{{ID: 1, Name: "cn-east-1"}}}
+	nodeRepo := &fakeNodeRepository{}
+	svc := NewZoneService(zoneRepo, nodeRepo)
+	svc.probeNodes = func(ctx context.Context, host string, port int, apiUser, apiTokenSecret string) ([]string, error) {
+		return []string{"pve-nosync"}, nil
+	}
+
+	n, err := svc.CreateNode(context.Background(), 1, "pve-nosync", "10.0.0.11", "root@pam!spark", "tok", nil)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	if n.Name != "pve-nosync" || len(nodeRepo.nodes) != 1 {
+		t.Fatalf("node = %+v, nodes = %d", n, len(nodeRepo.nodes))
+	}
+}

@@ -278,6 +278,7 @@ const pools = ref<Pool[]>([])
 const poolsLoading = ref(false)
 const zonesLoadError = ref<ApiError | null>(null)
 const storageTypesLoadError = ref<ApiError | null>(null)
+const storageTypesLoading = ref(false)
 const imagesLoadError = ref<ApiError | null>(null)
 const poolsLoadError = ref<ApiError | null>(null)
 
@@ -285,7 +286,26 @@ const poolsLoadError = ref<ApiError | null>(null)
 const MEM_PRESETS = [1024, 2048, 4096, 8192]
 
 const zoneOptions = computed(() => zones.value.map(z => ({ label: z.name, value: z.id })))
-const storageTypeOptions = computed(() => storageTypes.value.map(s => ({ label: `${s.display_name}（${s.name}）`, value: s.id })))
+// 存储类型列表由 zone_id 联动加载，仅包含所选 Zone 的存储（后端 CreateVM 校验存储必须属于 Zone）
+// 下拉项 description 展示挂载节点提示：nodes 为空 = 不限制节点（所有节点可用）；
+// 单节点 "仅挂载于 X"；多节点列出前 3 个（超出省略为 "等 N 个节点"）
+const MOUNT_HINT_MAX_NODES = 3
+
+/** 挂载节点提示文案（与后端调度语义一致：仅挂载节点可调度） */
+function mountHintOf(s: StorageType): string {
+  if (s.nodes.length === 0) return '所有节点可用'
+  if (s.nodes.length === 1) return `仅挂载于 ${s.nodes[0]}`
+  const shown = s.nodes.slice(0, MOUNT_HINT_MAX_NODES).join('、')
+  return s.nodes.length > MOUNT_HINT_MAX_NODES
+    ? `挂载于 ${shown} 等 ${s.nodes.length} 个节点`
+    : `挂载于 ${shown}`
+}
+
+const storageTypeOptions = computed(() => storageTypes.value.map(s => ({
+  label: s.name ?? s.pve_storage,
+  value: s.id,
+  description: mountHintOf(s)
+})))
 const imageOptions = computed(() => images.value.map(i => ({ label: `${i.name}（默认用户 ${i.default_user}）`, value: i.id })))
 const poolOptions = computed(() => pools.value.map(p => ({ label: p.name, value: p.id })))
 
@@ -293,6 +313,8 @@ const poolOptions = computed(() => pools.value.map(p => ({ label: p.name, value:
 let imagesSeq = 0
 // IP 池列表请求序号守卫：与镜像同模式，防止旧 Zone 的池列表覆盖新 Zone
 let poolsSeq = 0
+// 存储类型列表请求序号守卫：与镜像同模式，防止旧 Zone 的存储列表覆盖新 Zone
+let storageTypesSeq = 0
 
 // 按 Zone 并行加载镜像列表：独立 async 请求，序号守卫/错误处理/loading 恢复互不影响（镜像接口慢不阻塞池列表）
 async function loadImagesForZone(zoneId: number, seq: number): Promise<void> {
@@ -327,21 +349,43 @@ async function loadPoolsForZone(zoneId: number, poolSeq: number): Promise<void> 
   }
 }
 
-// 可用区切换 → 镜像按该 Zone 过滤（契约 listImagesByZone 支持 zone_id；镜像可用性依赖 Zone）；
-// IP 池按该 Zone 过滤（契约 listPools 支持 zone_id 过滤），两者共用同一 watch 同步重置并并行加载
+// 按 Zone 并行加载存储类型列表：与镜像/池同模式，独立 async 请求，序号守卫/错误处理/loading 恢复互不影响
+async function loadStorageTypesForZone(zoneId: number, seq: number): Promise<void> {
+  storageTypesLoading.value = true
+  try {
+    // 契约 listStorageTypes 支持 zone_id 过滤：存储必须属于所选 Zone（后端 CreateVM 校验，否则 404）
+    const res = await listStorageTypes({ zone_id: zoneId, limit: 100 })
+    // 过期响应丢弃：期间 Zone 已再次切换
+    if (seq !== storageTypesSeq || zoneId !== createForm.zone_id) return
+    storageTypes.value = res.data
+  } catch (err) {
+    if (seq !== storageTypesSeq || zoneId !== createForm.zone_id) return
+    storageTypesLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
+  } finally {
+    if (seq === storageTypesSeq) storageTypesLoading.value = false
+  }
+}
+
+// 可用区切换 → 存储类型/镜像/IP 池均按该 Zone 过滤（契约 listStorageTypes/listImagesByZone/listPools
+// 均支持 zone_id；存储与镜像、池的可用性均依赖 Zone），三者共用同一 watch 同步重置并并行加载
 watch(() => createForm.zone_id, (zoneId) => {
   createForm.image_id = undefined // 切换 Zone 后原镜像可能不可用，强制重新选择
   createForm.pool_id = undefined // 切换 Zone 后原池可能不属于新 Zone，强制重新选择（防提交撞 404）
+  createForm.storage_type_id = undefined // 切换 Zone 后原存储可能不属于新 Zone，强制重新选择（防提交撞 404）
   images.value = []
   pools.value = []
+  storageTypes.value = []
   imagesLoadError.value = null
   poolsLoadError.value = null
+  storageTypesLoadError.value = null
   if (zoneId === undefined) return
-  // 两个请求相互独立，并行发起互不等待（Promise 各自 resolve/reject）
+  // 三个请求相互独立，并行发起互不等待（Promise 各自 resolve/reject）
   const seq = ++imagesSeq
   const poolSeq = ++poolsSeq
+  const storageSeq = ++storageTypesSeq
   void loadImagesForZone(zoneId, seq)
   void loadPoolsForZone(zoneId, poolSeq)
+  void loadStorageTypesForZone(zoneId, storageSeq)
 })
 
 // 可用区列表懒加载（创建/导入两个弹窗共用；加载失败记录错误 ref，弹窗内给出轻量提示，重新打开会重试）
@@ -356,20 +400,17 @@ async function loadZones(): Promise<void> {
   }
 }
 
-// 打开创建弹窗：选项懒加载（Zone/存储类型全局一次；镜像随后续 Zone 选择联动加载）
+// 打开创建弹窗：选项懒加载（Zone 全局一次；存储类型/镜像/IP 池随后续 Zone 选择联动加载）
 // 加载失败不吞掉：记录错误 ref，弹窗内给出轻量提示（重新打开弹窗会重试）
 async function openCreateModal(): Promise<void> {
   createError.value = null
   createOpen.value = true
   await loadZones()
-  if (storageTypes.value.length === 0) {
+  // 弹窗重开时若 Zone 仍选中但存储列表为空（含上次加载失败被清空），按该 Zone 重试加载；
+  // 其余场景由 zone_id 的 watch 联动加载
+  if (createForm.zone_id !== undefined && storageTypes.value.length === 0) {
     storageTypesLoadError.value = null
-    try {
-      storageTypes.value = (await listStorageTypes({ limit: 100 })).data
-    } catch (err) {
-      storageTypesLoadError.value = err instanceof ApiError ? err : new ApiError(0, 'unknown', err instanceof Error ? err.message : '未知错误')
-      storageTypes.value = []
-    }
+    void loadStorageTypesForZone(createForm.zone_id, ++storageTypesSeq)
   }
 }
 
@@ -791,11 +832,15 @@ const sizeOptions: { label: string, value: number }[] = PAGE_SIZES.map(s => ({ l
                 name="storage_type_id"
                 label="存储类型"
                 required
-                :description="storageTypesLoadError ? `存储类型加载失败（${storageTypesLoadError.code}），请关闭弹窗后重新打开重试` : undefined"
+                :description="storageTypesLoadError
+                  ? `存储类型加载失败（${storageTypesLoadError.code}），请重新选择可用区重试`
+                  : (createForm.zone_id === undefined ? '请先选择可用区以加载存储类型' : '已按所选可用区过滤')"
               >
                 <USelect
                   :model-value="createForm.storage_type_id"
                   :items="storageTypeOptions"
+                  :loading="storageTypesLoading"
+                  :disabled="createForm.zone_id === undefined"
                   placeholder="选择存储类型"
                   class="w-full"
                   @update:model-value="(v: number | undefined) => { createForm.storage_type_id = v }"

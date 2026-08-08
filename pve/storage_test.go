@@ -11,6 +11,90 @@ import (
 	"testing"
 )
 
+// TestListStorage 验证集群级 GET /storage 的请求形态（无 path 参数、
+// 无查询参数）以及响应条目的字段映射；真实 PVE 的 nodes 为逗号分隔
+// 字符串（如 "pve1,pve2"），content 可能为空串。
+func TestListStorage(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/storage" {
+			t.Errorf("path = %s, want /storage", r.URL.Path)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("query = %q, want none", r.URL.RawQuery)
+		}
+		fmt.Fprint(w, `{"data": [
+			{"storage": "local", "type": "dir", "content": "images,iso,backup", "shared": 0, "nodes": "pve1,pve2"},
+			{"storage": "local-lvm", "type": "lvm", "content": "images,rootdir", "shared": 1, "nodes": "pve1"},
+			{"storage": "nfs-iso", "type": "nfs", "content": "", "shared": 1, "nodes": "pve1,pve2,pve3"}
+		]}`)
+	})
+	storages, err := c.ListStorage(context.Background())
+	if err != nil {
+		t.Fatalf("ListStorage: %v", err)
+	}
+	if len(storages) != 3 {
+		t.Fatalf("len = %d, want 3", len(storages))
+	}
+	if a := storages[0]; a.Storage != "local" || a.Type != "dir" || a.Content != "images,iso,backup" ||
+		bool(a.Shared) || len(a.Nodes) != 2 || a.Nodes[0] != "pve1" || a.Nodes[1] != "pve2" {
+		t.Fatalf("storages[0] = %+v", a)
+	}
+	if b := storages[1]; b.Storage != "local-lvm" || b.Type != "lvm" || !bool(b.Shared) {
+		t.Fatalf("storages[1] = %+v", b)
+	}
+	// content 空串（PVE 真实形态）原样保留，不推导。
+	if d := storages[2]; d.Content != "" || len(d.Nodes) != 3 {
+		t.Fatalf("storages[2] = %+v, want empty content and 3 nodes", d)
+	}
+}
+
+// TestListStorageNodesArray 覆盖 nodes 字段的数组形态（部分 PVE 场景），
+// 以及 nodes 缺失/为 null 时保持空切片、不报错。
+func TestListStorageNodesArray(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data": [
+			{"storage": "local", "type": "dir", "content": "images", "shared": 0, "nodes": ["pve1", "pve2"]},
+			{"storage": "snippets", "type": "dir", "content": "snippets", "shared": 0}
+		]}`)
+	})
+	storages, err := c.ListStorage(context.Background())
+	if err != nil {
+		t.Fatalf("ListStorage: %v", err)
+	}
+	if len(storages) != 2 {
+		t.Fatalf("len = %d, want 2", len(storages))
+	}
+	if a := storages[0]; len(a.Nodes) != 2 || a.Nodes[0] != "pve1" || a.Nodes[1] != "pve2" {
+		t.Fatalf("storages[0] nodes = %+v, want [pve1 pve2] from array form", a.Nodes)
+	}
+	if b := storages[1]; len(b.Nodes) != 0 {
+		t.Fatalf("storages[1] nodes = %+v, want empty when the field is absent", b.Nodes)
+	}
+}
+
+// TestListStorageUpstreamError 覆盖 PVE 拒绝（如 token 无权限）时以
+// *UpstreamError 呈现的场景。
+func TestListStorageUpstreamError(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"errors": {"root@pam": "permission denied"}}`)
+	})
+	_, err := c.ListStorage(context.Background())
+	var upErr *UpstreamError
+	if !errors.As(err, &upErr) {
+		t.Fatalf("err = %v (%T), want *UpstreamError", err, err)
+	}
+	if upErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want 401", upErr.StatusCode)
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("error %q does not carry the PVE error", err.Error())
+	}
+}
+
 // TestListStorageContent 验证 GET /nodes/{node}/storage/{storage}/content
 // 的请求形态（路径与 content 查询参数）以及响应条目的字段映射。
 func TestListStorageContent(t *testing.T) {
