@@ -41,6 +41,8 @@ servers:
   - url: /
 
 tags:
+  - name: auth
+    description: 认证（双身份登录与 JWT 签发）
   - name: zones
     description: 区域（zone）与 PVE 节点管理
   - name: ip-pools
@@ -54,12 +56,71 @@ tags:
   - name: system
     description: 健康检查
 
-# 当前 API 未接入认证：空 security 数组声明所有操作无安全要求
-#（OpenAPI 3.0 语义，根级空数组 = 无需任何认证/授权）；
-# 未来引入认证后在此声明 securitySchemes 并替换为具体方案。
-security: []
+# 认证：除登录端点（/auth/login、/auth/admin/login）与探活端点
+# （/healthz）外，全部业务路径要求 Bearer JWT（securitySchemes 见
+# components.securitySchemes.bearerAuth）。登录/探活端点在路径级以
+# security: [] 覆盖（OpenAPI 3.0 语义：操作级声明覆盖根级）。
+security:
+  - bearerAuth: []
 
 paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: 用户登录
+      operationId: loginUser
+      description: |
+        校验用户凭证与启用状态，成功签发 user JWT（Bearer，HS256，24h
+        有效，过期需重新登录）并返回身份信息。凭证无效（账号不存在、
+        密码错误、账号被禁用）统一返回 401 unauthorized，消息一致，
+        不泄露账号存在性（对外错误契约见 docs/api-errors.md）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserLoginResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/admin/login:
+    post:
+      tags: [auth]
+      summary: 管理员登录
+      operationId: loginAdmin
+      description: |
+        校验管理员凭证，成功签发 admin JWT（Bearer，HS256，24h 有效）
+        并返回身份信息。凭证无效统一返回 401 unauthorized，消息一致，
+        不泄露账号存在性。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminLoginResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /healthz:
     get:
       tags: [system]
@@ -68,6 +129,9 @@ paths:
       description: |
         探活端点，不属于业务 API：200 正常响应不携带 x-ms-error-code 头；
         503 degraded 响应携带 x-ms-error-code: service_unavailable。
+        /healthz 不受鉴权保护（探活器/负载均衡需要匿名可达），以
+        security: [] 覆盖根级 security。
+      security: []
       # 探活端点按设计无 4XX 响应（仅 200 正常 / 503 degraded，与
       # api/handlers/health.go 一致），operation-4xx-response 豁免记录于
       # .redocly.lint-ignore.yaml。
@@ -1037,6 +1101,17 @@ components:
         pattern: ^([1-9][0-9]*|ext-[1-9][0-9]*-[1-9][0-9]*)$
         example: ext-3-100
 
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        登录端点（POST /auth/login、POST /auth/admin/login）签发的 JWT
+        （HS256 签名，24h 有效）；请求携带 Authorization: Bearer <token>。
+        令牌缺失/非法/过期/账号被禁用返回 401 unauthorized；用户令牌
+        访问管理员接口返回 403 forbidden。
+
   headers:
     XTotalCount:
       description: 过滤后（分页前）的总条数
@@ -1071,6 +1146,19 @@ components:
             error:
               code: bad_request
               message: invalid limit query parameter
+    Unauthorized:
+      description: 凭证无效或身份不可信（unauthorized：登录失败、令牌缺失/非法/过期、账号被禁用）
+      headers:
+        x-ms-error-code:
+          $ref: "#/components/headers/XMSErrorCode"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+          example:
+            error:
+              code: unauthorized
+              message: invalid credentials
     NotFound:
       description: 资源不存在（not_found / vm_not_found_on_node），或路径未匹配任何路由的全局 404 兜底（not_found）
       headers:
@@ -1166,6 +1254,8 @@ components:
           description: 稳定的机器可读错误码（客户端只可依赖 code）
           enum:
             - bad_request
+            - unauthorized
+            - forbidden
             - not_found
             - method_not_allowed
             - conflict
@@ -1204,6 +1294,50 @@ components:
           type: string
           description: up 或 down
           enum: [up, down]
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          description: 登录账号（user 身份域对应 users.username，admin 身份域对应 admins.username）
+          example: alice
+        password:
+          type: string
+          description: 明文密码（仅请求体传输；服务端以 bcrypt 哈希比对，密码本身不落库、不进日志）
+          example: s3cret
+
+    UserLoginResponse:
+      type: object
+      required: [token, user_id, username]
+      properties:
+        token:
+          type: string
+          description: user JWT（Bearer，HS256 签名，24h 有效）
+        user_id:
+          type: integer
+          format: int64
+          description: users 表 ID
+        username:
+          type: string
+        name:
+          type: string
+          description: 用户显示名
+
+    AdminLoginResponse:
+      type: object
+      required: [token, admin_id, username]
+      properties:
+        token:
+          type: string
+          description: admin JWT（Bearer，HS256 签名，24h 有效）
+        admin_id:
+          type: integer
+          format: int64
+          description: admins 表 ID
+        username:
+          type: string
 
     ZoneCreateRequest:
       type: object

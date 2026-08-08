@@ -19,6 +19,15 @@ func writeTempConfig(t *testing.T, content string) string {
 	return path
 }
 
+// testJWTSecret 是满足最小长度（minJWTSecretLen）的合法测试密钥。
+const testJWTSecret = "test-jwt-secret-0123456789abcdefghijklmnopqrstuv"
+
+// baseConfigYAML 返回带 auth.jwt_secret 的最小合法配置片段，供其它测试
+// 拼接：jwt_secret 为必填项且必须满足最小长度，否则 Load 会报错。
+func baseConfigYAML() string {
+	return "auth:\n  jwt_secret: \"" + testJWTSecret + "\"\n"
+}
+
 // TestDefaultAllowlist 验证内置默认白名单包含 5 个常见云镜像源域名。
 func TestDefaultAllowlist(t *testing.T) {
 	got := Default().Images.DownloadHostAllowlist
@@ -31,7 +40,7 @@ func TestDefaultAllowlist(t *testing.T) {
 // 分隔整体覆盖默认值，且条目被 trim + 小写归一。
 func TestLoadAllowlistFromEnv(t *testing.T) {
 	t.Setenv("SPARK_IMAGES_DOWNLOAD_HOST_ALLOWLIST", "  Cloud.Debian.ORG , images.example.com ")
-	cfg, err := Load(writeTempConfig(t, ""))
+	cfg, err := Load(writeTempConfig(t, baseConfigYAML()))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -42,10 +51,10 @@ func TestLoadAllowlistFromEnv(t *testing.T) {
 }
 
 // TestLoadAllowlistEnvEmptyRejectsAll 验证环境变量为空串时白名单为空
-//（拒绝所有下载），且整体覆盖默认值。
+// （拒绝所有下载），且整体覆盖默认值。
 func TestLoadAllowlistEnvEmptyRejectsAll(t *testing.T) {
 	t.Setenv("SPARK_IMAGES_DOWNLOAD_HOST_ALLOWLIST", "")
-	cfg, err := Load(writeTempConfig(t, ""))
+	cfg, err := Load(writeTempConfig(t, baseConfigYAML()))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -56,7 +65,7 @@ func TestLoadAllowlistEnvEmptyRejectsAll(t *testing.T) {
 
 // TestLoadAllowlistFromYAML 验证 YAML 配置覆盖默认值并做小写归一。
 func TestLoadAllowlistFromYAML(t *testing.T) {
-	path := writeTempConfig(t, `
+	path := writeTempConfig(t, baseConfigYAML()+`
 images:
   download_host_allowlist:
     - "Cloud.Debian.ORG"
@@ -73,9 +82,9 @@ images:
 }
 
 // TestLoadAllowlistYAMLNull 验证 download_host_allowlist: null 归一为空列表
-//（拒绝所有下载），而非保留默认值。
+// （拒绝所有下载），而非保留默认值。
 func TestLoadAllowlistYAMLNull(t *testing.T) {
-	path := writeTempConfig(t, "images:\n  download_host_allowlist: null\n")
+	path := writeTempConfig(t, baseConfigYAML()+"images:\n  download_host_allowlist: null\n")
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -101,7 +110,7 @@ func TestLoadAllowlistRejectsBadEntries(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load(writeTempConfig(t, tc.yaml))
+			_, err := Load(writeTempConfig(t, baseConfigYAML()+tc.yaml))
 			if err == nil {
 				t.Fatalf("Load: want error containing %q, got nil", tc.wantErr)
 			}
@@ -109,5 +118,62 @@ func TestLoadAllowlistRejectsBadEntries(t *testing.T) {
 				t.Fatalf("err = %q, want to contain %q", err.Error(), tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestLoadMissingJWTSecret 验证 auth.jwt_secret 缺失时 Load 报错并拒绝启动。
+func TestLoadMissingJWTSecret(t *testing.T) {
+	_, err := Load(writeTempConfig(t, "server:\n  port: 8080\n"))
+	if err == nil {
+		t.Fatal("Load: want error for missing auth.jwt_secret, got nil")
+	}
+	if !strings.Contains(err.Error(), "auth.jwt_secret") {
+		t.Fatalf("err = %q, want to contain auth.jwt_secret", err.Error())
+	}
+}
+
+// TestLoadJWTSecretTooShort 验证 jwt_secret 短于最小长度时 Load 报错并
+// 拒绝启动（G1：过短密钥可被暴力猜测）。
+func TestLoadJWTSecretTooShort(t *testing.T) {
+	_, err := Load(writeTempConfig(t, "auth:\n  jwt_secret: \"short-secret\"\n"))
+	if err == nil {
+		t.Fatal("Load: want error for short jwt_secret, got nil")
+	}
+	if !strings.Contains(err.Error(), "auth.jwt_secret") || !strings.Contains(err.Error(), "at least 32") {
+		t.Fatalf("err = %q, want to contain auth.jwt_secret and at least 32", err.Error())
+	}
+}
+
+// TestLoadJWTSecretExampleValueRejected 验证示例占位值 change-me 同样被
+// 长度校验拒绝（示例配置不能直接用于生产启动）。
+func TestLoadJWTSecretExampleValueRejected(t *testing.T) {
+	_, err := Load(writeTempConfig(t, "auth:\n  jwt_secret: \"change-me\"\n"))
+	if err == nil {
+		t.Fatal("Load: want error for example jwt_secret, got nil")
+	}
+}
+
+// TestLoadJWTSecretFromYAML 验证 YAML 中配置的 jwt_secret 被正确加载。
+func TestLoadJWTSecretFromYAML(t *testing.T) {
+	path := writeTempConfig(t, "auth:\n  jwt_secret: \"from-yaml-secret-0123456789abcdefghij\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Auth.JWTSecret != "from-yaml-secret-0123456789abcdefghij" {
+		t.Fatalf("JWTSecret = %q, want %q", cfg.Auth.JWTSecret, "from-yaml-secret-0123456789abcdefghij")
+	}
+}
+
+// TestLoadJWTSecretFromEnv 验证 SPARK_AUTH_JWT_SECRET 环境变量覆盖 YAML 值。
+func TestLoadJWTSecretFromEnv(t *testing.T) {
+	t.Setenv("SPARK_AUTH_JWT_SECRET", "env-secret-0123456789abcdefghijklmnop")
+	path := writeTempConfig(t, "auth:\n  jwt_secret: \"yaml-secret-0123456789abcdefghijklmn\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Auth.JWTSecret != "env-secret-0123456789abcdefghijklmnop" {
+		t.Fatalf("JWTSecret = %q, want %q", cfg.Auth.JWTSecret, "env-secret-0123456789abcdefghijklmnop")
 	}
 }

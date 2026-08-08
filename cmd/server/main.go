@@ -60,7 +60,9 @@ func run() error {
 	router := api.NewRouter(pool, cipher,
 		// 镜像下载源域名白名单来自配置（Default 内置常见云镜像源，
 		// 生产通过 config.yaml / 环境变量覆盖）。
-		api.WithImageDownloadHostAllowlist(cfg.Images.DownloadHostAllowlist))
+		api.WithImageDownloadHostAllowlist(cfg.Images.DownloadHostAllowlist),
+		// JWT 签发/校验密钥（config.validate 已保证非空且足够长）。
+		api.WithJWTSecret(cfg.Auth.JWTSecret))
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Server.Port),
