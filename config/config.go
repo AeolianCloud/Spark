@@ -1,5 +1,5 @@
-// Package config 从默认值、可选的 YAML 文件和环境变量加载服务配置
-// （按此优先级顺序）。
+// Package config 从默认值、可选的 YAML 文件、仓库根 .env.local 和环境变量
+// 加载服务配置（按此优先级顺序）。
 package config
 
 import (
@@ -64,8 +64,11 @@ type ImagesConfig struct {
 
 const (
 	defaultConfigPath = "config/config.yaml"
-	defaultPort       = 8080
-	defaultLogLevel   = "info"
+	// dotEnvLocalPath 是仓库根目录的本地敏感配置文件名（相对工作目录），
+	// 已在 .gitignore 中忽略；Load 固定读取该相对路径，不随 path 参数变化。
+	dotEnvLocalPath = ".env.local"
+	defaultPort     = 8080
+	defaultLogLevel = "info"
 
 	// exampleEncryptionKey 是 "0123456789abcdef0123456789abcdef" 的 base64 编码，
 	// 用于示例配置；它不是机密。
@@ -103,8 +106,11 @@ func Default() *Config {
 	}
 }
 
-// Load 通过合并默认值、可选的 YAML 文件和环境变量（SPARK_*）构建 Config。
+// Load 通过合并默认值、可选的 YAML 文件、仓库根 .env.local 和环境变量
+// （SPARK_*）构建 Config。优先级链（低 → 高）：
+// 内置默认值 < config.yaml < .env.local < 进程环境变量（applyEnv）。
 // 如果 path 为空，当 config/config.yaml 存在时使用它；文件缺失不算错误。
+// .env.local 固定在仓库根（相对工作目录），存在时自动加载。
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
@@ -121,6 +127,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 
+	// 读取 config.yaml 之后、applyEnv 之前注入 .env.local：只写入进程环境
+	// 中尚未设置的变量，随后 applyEnv 读取到的永远是显式设置的进程环境值，
+	// 由此实现「进程环境变量优先于 .env.local」。
+	if err := loadDotEnvLocal(dotEnvLocalPath); err != nil {
+		return nil, fmt.Errorf("config: load %s: %w", dotEnvLocalPath, err)
+	}
 	if err := applyEnv(cfg); err != nil {
 		return nil, err
 	}
@@ -128,6 +140,63 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// parseDotEnv 解析 .env 风格的文本为键值对：按行处理 `KEY=VALUE`，行首尾
+// 空白被 trim；空行与 `#` 开头的行视为注释忽略；不含 `=` 的行跳过（宽松
+// 处理）；值剥离一层首尾引号（单引号或双引号）；重复键后者胜。不支持变量
+// 插值、export 前缀与转义展开（见设计 D1，保持规则可控）。
+func parseDotEnv(content string) map[string]string {
+	env := make(map[string]string)
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if key = strings.TrimSpace(key); key == "" {
+			continue
+		}
+		env[key] = trimDotEnvQuotes(strings.TrimSpace(value))
+	}
+	return env
+}
+
+// trimDotEnvQuotes 剥离值首尾的一层匹配引号（单引号或双引号）。
+func trimDotEnvQuotes(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+// loadDotEnvLocal 读取 path 指向的 dotenv 文件，并把其中的变量注入进程
+// 环境：仅当该变量尚未设置（os.LookupEnv 不存在）时才执行 os.Setenv，
+// 因此进程环境变量（显式 export / set 的值）优先于 .env.local，不会被
+// 文件覆盖；之后 applyEnv 统一从进程环境读取，无需单独记录来源。文件
+// 缺失（os.ErrNotExist）时静默返回 nil；其他读取错误原样返回。重复
+// 调用是幂等的（已注入的变量不再覆盖）。
+func loadDotEnvLocal(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for key, value := range parseDotEnv(string(data)) {
+		if _, ok := os.LookupEnv(key); !ok {
+			if err := os.Setenv(key, value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // applyEnv 使用 SPARK_* 环境变量覆盖配置字段。
