@@ -2,7 +2,7 @@
 
 维护 cloud 镜像目录，记录镜像在 PVE 存储上的分布与默认登录用户名，供创建虚拟机时选择并校验镜像在目标节点的可用性。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: 镜像目录
 

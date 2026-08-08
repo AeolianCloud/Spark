@@ -2,7 +2,7 @@
 
 管理按区域划分的 IP 地址池：IP 池绑定区域并在节点上显式勾选为可用，创建虚拟机时由后端随机分配 IP，实现区域内地址的独占与回收。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: IP 池按区域划分
 

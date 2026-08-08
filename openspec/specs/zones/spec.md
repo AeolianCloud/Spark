@@ -2,7 +2,7 @@
 
 定义区域（zone）与 PVE 节点的组织方式：一个区域包含多个节点，不同区域默认网络不互通，为虚拟机部署提供隔离边界。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: 区域管理
 
