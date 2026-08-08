@@ -115,6 +115,28 @@ type TxBeginner interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
+// Identity 是已鉴权身份在服务层的表示（设计 D4/D5）：Role 为身份域
+// （admin/user），ID 为身份在对应表（admins/users）中的 ID。api 层负责从
+// gin.Context（middleware.IdentityKey）读取并转换为本类型。
+type Identity struct {
+	Role string
+	ID   int64
+}
+
+// IsAdmin 报告身份是否为管理员（分流与归属校验的入口）。fail-closed（M1）：
+// nil 身份一律按非管理员处理（最小权限语义），绝不放行为管理员；生产环境
+// 所有业务路由均经 requireAuth 注入身份，nil 只出现在测试与内部直调路径。
+func (i *Identity) IsAdmin() bool {
+	return i != nil && i.Role == RoleAdmin
+}
+
+// UserLookupRepository 是 VMService 校验可选归属用户（vms.user_id，设计
+// D3/D6）所需的最小查询接口：创建/认领时 user_id 非空须指向存在且启用的
+// 用户。repository.AuthRepository 满足该接口。
+type UserLookupRepository interface {
+	GetUserByID(ctx context.Context, id int64) (*model.User, error)
+}
+
 // VMRepository 是 VMService 依赖的 vms 数据访问层。
 type VMRepository interface {
 	CreateVMTx(ctx context.Context, tx pgx.Tx, vm model.VM) (*model.VM, error)
@@ -128,6 +150,9 @@ type VMRepository interface {
 	// ListVMs 返回本地全部 VM 行（含 IP）：列表合并需要与每节点 PVE 全量
 	// 摘要做差集（设计 D1/D3），分页在合并排序后由服务层统一执行。
 	ListVMs(ctx context.Context) ([]repository.VMWithIP, error)
+	// ListVMsByUser 返回归属于指定用户的本地 VM 行（含 IP，设计 D5）：用户
+	// 视角的列表分流（external 条目对用户天然排除）。
+	ListVMsByUser(ctx context.Context, userID int64) ([]repository.VMWithIP, error)
 	SetVMIPIDTx(ctx context.Context, tx pgx.Tx, id, ipID int64) error
 	UpdateVMPVEVMID(ctx context.Context, id, vmid, diskGB int64) error
 	SetProvisionError(ctx context.Context, id int64, message string) error
@@ -193,6 +218,9 @@ type CreateVMRequest struct {
 	StorageTypeID int64  `json:"storage_type_id"`
 	ZoneID        int64  `json:"zone_id"`
 	Password      string `json:"password"`
+	// UserID 可选归属用户（vms.user_id，设计 D3）：nil 表示无主 VM；
+	// 非 nil 时 CreateVM 校验用户存在且启用（禁用用户不得获得新资源）。
+	UserID *int64 `json:"user_id,omitempty"`
 }
 
 // validateCreateVMRequest 强制创建校验中与存在性无关的部分：名称、正数规格
@@ -224,6 +252,7 @@ type VMService struct {
 	beginner    TxBeginner
 	vmRepo      VMRepository
 	opRepo      VMOperationRepository
+	userRepo    UserLookupRepository
 	ipPoolRepo  VMIPPoolRepository
 	zoneRepo    VMZoneRepository
 	nodeRepo    VMNodeRepository
@@ -240,14 +269,17 @@ type VMService struct {
 }
 
 // NewVMService 使用给定的仓库和加密密码器创建一个 VMService（密码器用于在
-// 存储前加密 cloud-init 密码）。
+// 存储前加密 cloud-init 密码）。userRepo 用于校验创建/认领时的可选归属用户
+// （vms.user_id，设计 D3）。
 func NewVMService(beginner TxBeginner, vmRepo VMRepository, opRepo VMOperationRepository,
 	ipPoolRepo VMIPPoolRepository, zoneRepo VMZoneRepository, nodeRepo VMNodeRepository,
-	imageRepo VMImageRepository, storageRepo VMStorageTypeRepository, cipher *crypto.Cipher) *VMService {
+	imageRepo VMImageRepository, storageRepo VMStorageTypeRepository,
+	userRepo UserLookupRepository, cipher *crypto.Cipher) *VMService {
 	s := &VMService{
 		beginner:    beginner,
 		vmRepo:      vmRepo,
 		opRepo:      opRepo,
+		userRepo:    userRepo,
 		ipPoolRepo:  ipPoolRepo,
 		zoneRepo:    zoneRepo,
 		nodeRepo:    nodeRepo,
@@ -281,9 +313,12 @@ func (s *VMService) SetClientFactory(fn func(host string, port int, apiUser, api
 // migration 0002 约定），随后启动分离式供给链（D5）并返回带明文 IP 的 VM。
 // 返回的记录具有 "creating" 语义：在供给链成功之前 pve_vmid 保持为零。
 //
+// identity 用于归属约束（H1，设计 D5）：user 令牌只能把 user_id 指定为自身
+// 或留空（留空默认归属自身）；admin 可任意指定或留空（无主）。
+//
 // 供给 goroutine 不得借用调用方的 context（HTTP 处理器返回时该 context 会
 // 被取消），因此它在受 vmProvisionTimeout 限制的分离式后台 context 下运行。
-func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*repository.VMWithIP, error) {
+func (s *VMService) CreateVM(ctx context.Context, identity *Identity, req CreateVMRequest) (*repository.VMWithIP, error) {
 	// 1. 检查区域是否存在。
 	if req.ZoneID <= 0 {
 		return nil, badRequestf("zone_id must be a positive integer")
@@ -318,6 +353,16 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 	}
 	// 4. 校验密码与规格。
 	if err := validateCreateVMRequest(req); err != nil {
+		return nil, err
+	}
+	// 5. 归属用户解析与校验（设计 D3/D5 + H1）：user 令牌只能把 user_id
+	// 指定为自身或留空（留空默认归属自身）；admin 可任意指定或留空（无主）。
+	// 解析后的归属用户须存在且启用（禁用用户无法登录，也不应获得新资源）。
+	uid, err := resolveVMCreationUser(identity, req.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.validateUserForVM(ctx, uid); err != nil {
 		return nil, err
 	}
 
@@ -357,6 +402,7 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 		MemMB:             req.MemMB,
 		DiskGB:            req.DiskGB,
 		PasswordEncrypted: passwordEncrypted,
+		UserID:            uid,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create vm: insert: %w", err)
@@ -398,6 +444,109 @@ func (s *VMService) CreateVM(ctx context.Context, req CreateVMRequest) (*reposit
 	go s.provisionVM(vm, node, image, volid, storageType, pool, req.Password, claimed.IP)
 
 	return &repository.VMWithIP{VM: vm, IP: claimed.IP}, nil
+}
+
+// resolveVMCreationUser 解析创建/认领 VM 的归属用户（vms.user_id，设计
+// D3/D5 + H1）：非管理员（user 令牌或未注入身份，M1 fail-closed）只能把
+// user_id 指定为自身或留空——留空默认归属自身（user 创建/认领的 VM 必须
+// 属于自己）；admin 可任意指定或留空（留空为无主 VM）。user 令牌指定他人
+// user_id -> 403 forbidden：杜绝跨用户资源注入与 user_id 枚举（S2），后续
+// validateUserForVM 的 404/400 分支只有 admin 才可能触发。nil 身份无 ID 可
+// 归属，返回 0 交给 validateUserForVM 以 not_found 拒绝（身份缺失不得被放
+// 行为管理员创建无主 VM）。
+func resolveVMCreationUser(identity *Identity, userID *int64) (*int64, error) {
+	if identity != nil && identity.IsAdmin() {
+		return userID, nil
+	}
+	if userID != nil && (identity == nil || *userID != identity.ID) {
+		return nil, forbiddenf("user cannot create vm for user %d", *userID)
+	}
+	if identity == nil {
+		zero := int64(0)
+		return &zero, nil
+	}
+	id := identity.ID
+	return &id, nil
+}
+
+// validateUserForVM 校验可选归属用户（vms.user_id，设计 D3/D6）：nil 表示
+// 无主 VM（放行）；用户不存在 -> not_found；用户被禁用 -> bad_request
+// （禁用用户不得再获得任何资源，与 D5 的"禁用即拒登"语义一致）。
+func (s *VMService) validateUserForVM(ctx context.Context, userID *int64) error {
+	if userID == nil {
+		return nil
+	}
+	user, err := s.userRepo.GetUserByID(ctx, *userID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("user %d not found", *userID)
+		}
+		return fmt.Errorf("check user %d: %w", *userID, err)
+	}
+	if user.Status != model.UserStatusEnabled {
+		return badRequestf("user %d is disabled", *userID)
+	}
+	return nil
+}
+
+// checkVMOwnership 校验用户身份对本地 VM 行的归属（设计 D5）：无主 VM
+// （user_id 为 NULL）或归属他人的 VM 对用户一律 403 forbidden（无主 VM 在
+// 用户视角视同不存在，与列表"仅返回归属自己的"语义一致）；归属自身放行。
+// 管理员放行；nil 身份（M1 fail-closed）没有 ID 可比，一律 403 拒绝，绝不
+// fail-open。
+func checkVMOwnership(identity *Identity, vm *model.VM) error {
+	if identity.IsAdmin() {
+		return nil
+	}
+	if identity == nil {
+		return forbiddenf("identity required to access vm %d", vm.ID)
+	}
+	if vm.UserID == nil || *vm.UserID != identity.ID {
+		return forbiddenf("user cannot access vm %d", vm.ID)
+	}
+	return nil
+}
+
+// authorizeVMOperation 校验身份对生命周期目标的操作权限（设计 D5），在解析
+// 目标后、调用 PVE 前执行：管理员放行；nil 身份（M1 fail-closed）按用户
+// 语义处理（同 user，ID 为 0，目标一律拒绝）；用户要求目标 VM 归属自身——
+// 数字 id 按本地行校验（行不存在 -> 404，与 vmAndNode 语义一致）；
+// ext- 标识指向本地托管行时按该行归属校验（与 G1 的本地路由语义一致），
+// 否则（纯 external，无归属）一律 403。
+func (s *VMService) authorizeVMOperation(ctx context.Context, identity *Identity, t vmTarget) error {
+	if identity.IsAdmin() {
+		return nil
+	}
+	if t.external {
+		local, err := s.vmRepo.GetVMByNodeVMID(ctx, t.nodeID, t.vmid)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("authorize operation on external vm %d on node %d: %w", t.vmid, t.nodeID, err)
+		}
+		if local == nil {
+			return forbiddenf("user cannot operate external vm %s", externalVMID(t.nodeID, t.vmid))
+		}
+		return checkVMOwnership(identity, local)
+	}
+	vm, err := s.vmRepo.GetVM(ctx, t.localID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("vm %d not found", t.localID)
+		}
+		return fmt.Errorf("authorize operation on vm %d: %w", t.localID, err)
+	}
+	return checkVMOwnership(identity, &vm.VM)
+}
+
+// applyOperator 把身份写入操作记录的操作者字段（设计 D5/D8）：
+// operator_type 为身份域（admin/user），operator_id 为对应表 ID；
+// 身份缺失（nil，未注入身份的路径）时操作者字段保持空（旧记录形态）。
+func applyOperator(op *model.VMOperation, identity *Identity) {
+	if identity == nil {
+		return
+	}
+	op.OperatorType = identity.Role
+	id := identity.ID
+	op.OperatorID = &id
 }
 
 // selectPoolAndNode 按 id 顺序遍历区域的 IP 池（D4，镜像感知调度 5.6）。
@@ -966,13 +1115,16 @@ func mapExternalPVEOpError(err error, op string, nodeID, vmid int64) error {
 	return fmt.Errorf("%s external vm %d on node %d: %w", op, vmid, nodeID, err)
 }
 
-// recordAcceptedOperation 在 PVE 受理成功后写入审计记录（设计 D5）。写失败
-// 返回 KindOperationLogFailed：操作已被 PVE 受理，返回 500 保证审计完整性
+// recordAcceptedOperation 在 PVE 受理成功后写入审计记录（设计 D5），操作者
+// 字段取自身份（operator_type/operator_id，设计 D8）。写失败返回
+// KindOperationLogFailed：操作已被 PVE 受理，返回 500 保证审计完整性
 // 优先，前端提示可刷新确认。
-func (s *VMService) recordAcceptedOperation(ctx context.Context, action string, nodeID, vmid int64) error {
-	if _, err := s.opRepo.CreateOperation(ctx, model.VMOperation{
+func (s *VMService) recordAcceptedOperation(ctx context.Context, identity *Identity, action string, nodeID, vmid int64) error {
+	op := model.VMOperation{
 		NodeID: nodeID, PVEVmid: vmid, Action: action, Result: model.VMOpResultAccepted,
-	}); err != nil {
+	}
+	applyOperator(&op, identity)
+	if _, err := s.opRepo.CreateOperation(ctx, op); err != nil {
 		return operationLogFailedf("%s vm %d on node %d accepted by pve but operation record write failed: %v",
 			action, vmid, nodeID, err)
 	}
@@ -980,26 +1132,29 @@ func (s *VMService) recordAcceptedOperation(ctx context.Context, action string, 
 }
 
 // recordFailedOperation 在 PVE 返回错误后写入 result=failed 的审计记录
-// （spec：记录失败的操作）。该写入是尽力而为：审计记录是次要信息，写失败
-// 只记日志，绝不掩盖向调用方返回的 PVE 错误。error_message 落库前经
-// sanitizeOperationError 脱敏与截断：绝不落库内部 base URL/API 路径等内部
-// 细节，也不超出迁移 0008 的 VARCHAR(1000) 列约束。
-func (s *VMService) recordFailedOperation(ctx context.Context, action string, nodeID, vmid int64, opErr error) {
-	if _, err := s.opRepo.CreateOperation(ctx, model.VMOperation{
+// （spec：记录失败的操作），操作者字段取自身份（设计 D8）。该写入是尽力而
+// 为：审计记录是次要信息，写失败只记日志，绝不掩盖向调用方返回的 PVE 错误。
+// error_message 落库前经 sanitizeOperationError 脱敏与截断：绝不落库内部
+// base URL/API 路径等内部细节，也不超出迁移 0008 的 VARCHAR(1000) 列约束。
+func (s *VMService) recordFailedOperation(ctx context.Context, identity *Identity, action string, nodeID, vmid int64, opErr error) {
+	op := model.VMOperation{
 		NodeID: nodeID, PVEVmid: vmid, Action: action, Result: model.VMOpResultFailed,
 		ErrorMessage: sanitizeOperationError(opErr),
-	}); err != nil {
+	}
+	applyOperator(&op, identity)
+	if _, err := s.opRepo.CreateOperation(ctx, op); err != nil {
 		slog.Error("could not persist failed operation record",
 			"action", action, "node_id", nodeID, "pve_vmid", vmid, "error", err)
 	}
 }
 
 // Start 启动 VM（POST /nodes/{node}/qemu/{vmid}/status/start），支持本地
-// 行与 external 标识（设计 D4）。PVE 任务 ID 不对外暴露：调用方没有可轮询
+// 行与 external 标识（设计 D4）。identity 用于操作前归属校验与操作记录写
+// 操作者（设计 D5/D8）。PVE 任务 ID 不对外暴露：调用方没有可轮询
 // 它的对象，且 VM 的真实状态反正会通过透传读取（批次 8）。受理成功后同步
 // 写入操作记录（设计 D5）。
-func (s *VMService) Start(ctx context.Context, id string) error {
-	return s.runLifecycleOp(ctx, id, model.VMOpActionStart, "start",
+func (s *VMService) Start(ctx context.Context, id string, identity *Identity) error {
+	return s.runLifecycleOp(ctx, id, model.VMOpActionStart, "start", identity,
 		func(client *pve.Client, nodeName string, vmid int64) error {
 			_, err := client.StartVM(ctx, nodeName, vmid)
 			return err
@@ -1008,8 +1163,8 @@ func (s *VMService) Start(ctx context.Context, id string) error {
 
 // Stop 关闭 VM（POST .../status/stop）。force=false 执行干净的 ACPI 关机；
 // PVE 侧的强制停机留给运维自行操作。
-func (s *VMService) Stop(ctx context.Context, id string) error {
-	return s.runLifecycleOp(ctx, id, model.VMOpActionStop, "stop",
+func (s *VMService) Stop(ctx context.Context, id string, identity *Identity) error {
+	return s.runLifecycleOp(ctx, id, model.VMOpActionStop, "stop", identity,
 		func(client *pve.Client, nodeName string, vmid int64) error {
 			_, err := client.StopVM(ctx, nodeName, vmid, false)
 			return err
@@ -1017,8 +1172,8 @@ func (s *VMService) Stop(ctx context.Context, id string) error {
 }
 
 // Restart 重启 VM（POST .../status/reboot）。
-func (s *VMService) Restart(ctx context.Context, id string) error {
-	return s.runLifecycleOp(ctx, id, model.VMOpActionReboot, "restart",
+func (s *VMService) Restart(ctx context.Context, id string, identity *Identity) error {
+	return s.runLifecycleOp(ctx, id, model.VMOpActionReboot, "restart", identity,
 		func(client *pve.Client, nodeName string, vmid int64) error {
 			_, err := client.RebootVM(ctx, nodeName, vmid)
 			return err
@@ -1026,15 +1181,20 @@ func (s *VMService) Restart(ctx context.Context, id string) error {
 }
 
 // runLifecycleOp 是 start/stop/reboot 三个生命周期操作的统一骨架（设计
-// D4/D5）：解析标识 -> 解析目标（数字行走现有路径，ext- 标识反查节点并
-// 校验 PVE 存在；ext- 标识指向已托管 VM 时路由到本地行路径，保证错误映射
+// D4/D5）：解析标识 -> 身份归属校验（用户仅能操作归属自己的 VM，ext- 对
+// 用户一律 403，设计 D5）-> 解析目标（数字行走现有路径，ext- 标识反查节点
+// 并校验 PVE 存在；ext- 标识指向已托管 VM 时路由到本地行路径，保证错误映射
 // 与操作记录的一致性）-> 调用 PVE -> 记录操作（成功 accepted / 失败
-// failed，失败写入尽力而为）。PVE 404 的映射区分目标类型：本地行 ->
-// vm_not_ready，external -> vm_not_found_on_node（资源不存在）。
-func (s *VMService) runLifecycleOp(ctx context.Context, id, action, verb string,
+// failed，失败写入尽力而为；记录携带操作者，设计 D8）。PVE 404 的映射区分
+// 目标类型：本地行 -> vm_not_ready，external -> vm_not_found_on_node
+// （资源不存在）。
+func (s *VMService) runLifecycleOp(ctx context.Context, id, action, verb string, identity *Identity,
 	call func(client *pve.Client, node string, vmid int64) error) error {
 	t, err := parseVMRef(id)
 	if err != nil {
+		return err
+	}
+	if err := s.authorizeVMOperation(ctx, identity, t); err != nil {
 		return err
 	}
 	node, vmid, localID, err := s.resolveVMTarget(ctx, t)
@@ -1055,32 +1215,38 @@ func (s *VMService) runLifecycleOp(ctx context.Context, id, action, verb string,
 		} else {
 			mapped = mapPVEOpError(err, verb, t.localID)
 		}
-		s.recordFailedOperation(ctx, action, node.ID, vmid, mapped)
+		s.recordFailedOperation(ctx, identity, action, node.ID, vmid, mapped)
 		return mapped
 	}
-	return s.recordAcceptedOperation(ctx, action, node.ID, vmid)
+	return s.recordAcceptedOperation(ctx, identity, action, node.ID, vmid)
 }
 
 // Destroy 删除 VM：数字 id 走现有本地行流程（PVE 销毁 + 事务内释放 IP 与
 // 删除行，migration 0002 约定）；ext- 标识直接销毁 PVE VM（无本地行/IP 可
 // 清理，设计 D4），但指向已托管 VM 时（PVE 是真相源，列表以差集判定，两者
 // 可能并存）路由到本地销毁流程——否则 PVE VM 被销毁后本地行会滞留、IP 池
-// 地址会永久处于 used 状态。两种路径都在受理后同步写入操作记录（设计 D5）。
-func (s *VMService) Destroy(ctx context.Context, id string) error {
+// 地址会永久处于 used 状态。操作前先做身份归属校验（用户仅能销毁归属自己
+// 的 VM，ext- 对用户一律 403，设计 D5）。两种路径都在受理后同步写入操作
+// 记录（设计 D5，携带操作者 D8）。
+func (s *VMService) Destroy(ctx context.Context, id string, identity *Identity) error {
 	t, err := parseVMRef(id)
 	if err != nil {
 		return err
 	}
-	if t.external {
-		return s.destroyExternal(ctx, t)
+	if err := s.authorizeVMOperation(ctx, identity, t); err != nil {
+		return err
 	}
-	return s.destroyLocal(ctx, t.localID)
+	if t.external {
+		return s.destroyExternal(ctx, identity, t)
+	}
+	return s.destroyLocal(ctx, identity, t.localID)
 }
 
 // destroyExternal 销毁本地无记录的 external VM：解析目标（校验 PVE 存在，
 // 命中本地托管行时由 resolveVMTarget 的路由语义转入 destroyLocal），调用
-// PVE DestroyVM（purge=true），无本地行/IP 清理，受理后写入操作记录。
-func (s *VMService) destroyExternal(ctx context.Context, t vmTarget) error {
+// PVE DestroyVM（purge=true），无本地行/IP 清理，受理后写入操作记录
+// （携带操作者，设计 D8）。
+func (s *VMService) destroyExternal(ctx context.Context, identity *Identity, t vmTarget) error {
 	node, vmid, localID, err := s.resolveVMTarget(ctx, t)
 	if err != nil {
 		return err
@@ -1088,15 +1254,15 @@ func (s *VMService) destroyExternal(ctx context.Context, t vmTarget) error {
 	if localID > 0 {
 		// ext- 标识指向已托管 VM：路由到本地销毁流程（含 IP 释放与行删除），
 		// 绝不让 PVE 销毁后本地行/IP 滞留。
-		return s.destroyLocal(ctx, localID)
+		return s.destroyLocal(ctx, identity, localID)
 	}
 	client := s.newClient(node.Host, node.Port, node.APIUser, node.APITokenSecret)
 	if _, err := client.DestroyVM(ctx, nodeName(*node), vmid, true); err != nil {
 		mapped := mapExternalPVEOpError(err, "destroy", node.ID, vmid)
-		s.recordFailedOperation(ctx, model.VMOpActionDestroy, node.ID, vmid, mapped)
+		s.recordFailedOperation(ctx, identity, model.VMOpActionDestroy, node.ID, vmid, mapped)
 		return mapped
 	}
-	return s.recordAcceptedOperation(ctx, model.VMOpActionDestroy, node.ID, vmid)
+	return s.recordAcceptedOperation(ctx, identity, model.VMOpActionDestroy, node.ID, vmid)
 }
 
 // destroyLocal 删除本地 VM：先销毁 PVE VM（purge=true，任务在 DestroyVM
@@ -1106,8 +1272,8 @@ func (s *VMService) destroyExternal(ctx context.Context, t vmTarget) error {
 // 侧被移除，例如被运维手动删除），它被视为"已销毁"并继续本地清理。从未
 // 到达 PVE 的 VM（pve_vmid == 0）会跳过 PVE 调用，仅清理本地记录。PVE
 // 失败时写入 failed 操作记录（尽力而为），本地清理成功后写入 accepted 记录
-// （设计 D5）。
-func (s *VMService) destroyLocal(ctx context.Context, id int64) error {
+// （设计 D5，携带操作者 D8）。
+func (s *VMService) destroyLocal(ctx context.Context, identity *Identity, id int64) error {
 	vm, err := s.vmRepo.GetVM(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1127,7 +1293,7 @@ func (s *VMService) destroyLocal(ctx context.Context, id int64) error {
 				// PVE VM 已不存在（在服务之外被移除）；下面的本地清理仍会执行。
 			} else {
 				mapped := fmt.Errorf("destroy vm %d on pve: %w (vm record and ip kept)", id, err)
-				s.recordFailedOperation(ctx, model.VMOpActionDestroy, vm.VM.NodeID, vm.VM.PVEVmid, mapped)
+				s.recordFailedOperation(ctx, identity, model.VMOpActionDestroy, vm.VM.NodeID, vm.VM.PVEVmid, mapped)
 				return mapped
 			}
 		}
@@ -1148,16 +1314,21 @@ func (s *VMService) destroyLocal(ctx context.Context, id int64) error {
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("destroy vm %d: commit: %w", id, err)
 	}
-	return s.recordAcceptedOperation(ctx, model.VMOpActionDestroy, vm.VM.NodeID, vm.VM.PVEVmid)
+	return s.recordAcceptedOperation(ctx, identity, model.VMOpActionDestroy, vm.VM.NodeID, vm.VM.PVEVmid)
 }
 
 // ListOperations 返回指定 VM 的操作记录（按时间倒序分页，设计 D5）。数字
 // id 要求本地行存在（spec：查询本地不存在的 VM -> 资源不存在），取其
 // node_id/pve_vmid 查询；ext- 标识直接按 node+vmid 查询（不校验 VM 当前
-// 是否存在：记录是审计历史，PVE 侧可能已销毁该 VM）。
-func (s *VMService) ListOperations(ctx context.Context, id string, limit, offset int) ([]model.VMOperation, int, error) {
+// 是否存在：记录是审计历史，PVE 侧可能已销毁该 VM）。操作前做身份归属校验
+// （设计 D5：用户仅能查看归属自己的 VM 的操作记录，ext- 对用户一律 403，
+// 除非指向本地托管行且归属自身）。
+func (s *VMService) ListOperations(ctx context.Context, id string, identity *Identity, limit, offset int) ([]model.VMOperation, int, error) {
 	t, err := parseVMRef(id)
 	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.authorizeVMOperation(ctx, identity, t); err != nil {
 		return nil, 0, err
 	}
 	var nodeID, vmid int64
@@ -1207,10 +1378,14 @@ func validateResizeSpec(cpu *int, memMB, diskGB *int64, current model.VM) error 
 // 同步生效），更大的磁盘通过 ResizeDisk 调整。变更先应用到 PVE，之后才
 // 持久化到 vms 行。持久化步骤以开始时读取的规格作为乐观锁（UpdateSpec 在
 // WHERE 子句中重新检查它）：当期间有并发的调整先提交，调用方会得到
-// KindConflict 并可重试。返回的记录携带本次调用实际应用的规格（请求的字段
-// 取新值，其余为开始时读取的值）；它不是从数据库重新读取的新数据——需要
-// 最新持久化行或实时透传状态的调用方必须自行通过 GetVM 获取。
-func (s *VMService) Resize(ctx context.Context, id int64, cpu *int, memMB, diskGB *int64) (*repository.VMWithIP, error) {
+// KindConflict 并可重试。操作前做身份归属校验（设计 D5：用户仅能调整归属
+// 自己的 VM）。返回的记录携带本次调用实际应用的规格（请求的字段取新值，
+// 其余为开始时读取的值）；它不是从数据库重新读取的新数据——需要最新持久化
+// 行或实时透传状态的调用方必须自行通过 GetVM 获取。
+func (s *VMService) Resize(ctx context.Context, id int64, identity *Identity, cpu *int, memMB, diskGB *int64) (*repository.VMWithIP, error) {
+	if err := s.authorizeVMOperation(ctx, identity, vmTarget{localID: id}); err != nil {
+		return nil, err
+	}
 	vm, node, err := s.vmAndNode(ctx, id)
 	if err != nil {
 		return nil, err

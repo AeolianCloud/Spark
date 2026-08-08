@@ -24,6 +24,9 @@ type ImportVMRequest struct {
 	// IP 可选：从区域 IP 池按地址分配占用；不传则 ip_id 保持 NULL，虚拟机
 	// 的网络由 PVE 侧配置决定（设计 D6，spec：认领虚拟机的 IP 策略）。
 	IP string `json:"ip"`
+	// UserID 可选归属用户（vms.user_id，设计 D3）：nil 表示无主 VM；
+	// 非 nil 时 ImportVM 校验用户存在且启用（禁用用户不得获得新资源）。
+	UserID *int64 `json:"user_id,omitempty"`
 }
 
 // importDiskKeyRe 匹配 PVE VM 配置中的全部磁盘键（scsi/ide/sata/virtio +
@@ -72,7 +75,10 @@ func vmConfigSpec(cfg pve.VMConfig) (name string, cpu int, memMB, diskGB int64) 
 // INSERT vms -> 领取 IP -> 回填 ip_id）。认领即托管：pve_vmid 非零、
 // provision_error 为空，source 置为 claimed（设计 D3），现有生命周期与透传
 // 查询路径直接生效（设计 D5），不需要 provisionVM 供给 goroutine。
-func (s *VMService) ImportVM(ctx context.Context, req ImportVMRequest) (*repository.VMWithIP, error) {
+//
+// identity 用于归属约束（H1，设计 D5）：user 令牌只能把 user_id 指定为自身
+// 或留空（留空默认归属自身）；admin 可任意指定或留空（无主）。
+func (s *VMService) ImportVM(ctx context.Context, identity *Identity, req ImportVMRequest) (*repository.VMWithIP, error) {
 	// 0. 请求级总预算：ListVMs（≤30s）+ GetVMConfig（≤30s）最坏 60s+，
 	// 包一层 importVMBudget 预算（与 ListVMs 的 listVMsTimeout 相同的部分
 	// 失败语义）：预算耗尽时 PVE 调用以 context 错误失败，映射为
@@ -108,6 +114,16 @@ func (s *VMService) ImportVM(ctx context.Context, req ImportVMRequest) (*reposit
 	}
 	if !node.Enabled {
 		return nil, nodeUnavailablef("node %q is disabled", nodeName(*node))
+	}
+	// 3.1 归属用户解析与校验（设计 D3/D5 + H1）：user 令牌只能把 user_id
+	// 指定为自身或留空（留空默认归属自身）；admin 可任意指定或留空（无主）。
+	// 解析后的归属用户须存在且启用（禁用用户不得获得新资源）。
+	uid, err := resolveVMCreationUser(identity, req.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.validateUserForVM(ctx, uid); err != nil {
+		return nil, err
 	}
 	// 4. 幂等检查：该节点上的 pve_vmid 已被托管则拒绝。
 	existing, err := s.vmRepo.GetVMByNodeVMID(ctx, req.NodeID, req.PVEVmid)
@@ -188,6 +204,7 @@ func (s *VMService) ImportVM(ctx context.Context, req ImportVMRequest) (*reposit
 		PasswordEncrypted: "",
 		ProvisionError:    "",
 		Source:            model.VMSourceClaimed,
+		UserID:            uid,
 	})
 	if err != nil {
 		if errors.Is(err, repository.ErrConflict) {
