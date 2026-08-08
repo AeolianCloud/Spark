@@ -4,6 +4,51 @@
  */
 
 export interface paths {
+    "/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 用户登录
+         * @description 校验用户凭证与启用状态，成功签发 user JWT（Bearer，HS256，24h
+         *     有效，过期需重新登录）并返回身份信息。凭证无效（账号不存在、
+         *     密码错误、账号被禁用）统一返回 401 unauthorized，消息一致，
+         *     不泄露账号存在性（对外错误契约见 docs/api-errors.md）。
+         */
+        post: operations["loginUser"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/admin/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 管理员登录
+         * @description 校验管理员凭证，成功签发 admin JWT（Bearer，HS256，24h 有效）
+         *     并返回身份信息。凭证无效统一返回 401 unauthorized，消息一致，
+         *     不泄露账号存在性。
+         */
+        post: operations["loginAdmin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -15,6 +60,8 @@ export interface paths {
          * 健康检查（含数据库连通性）
          * @description 探活端点，不属于业务 API：200 正常响应不携带 x-ms-error-code 头；
          *     503 degraded 响应携带 x-ms-error-code: service_unavailable。
+         *     /healthz 不受鉴权保护（探活器/负载均衡需要匿名可达），以
+         *     security: [] 覆盖根级 security。
          */
         get: operations["healthz"];
         put?: never;
@@ -304,6 +351,92 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 用户列表（分页）
+         * @description 按 id 升序返回一页用户（limit/offset 分页，语义与其余列表端点一致），
+         *     X-Total-Count 头携带匹配总数。仅管理员令牌可访问。
+         */
+        get: operations["listUsers"];
+        put?: never;
+        /**
+         * 创建用户
+         * @description 创建前台用户（仅管理员令牌，requireAdmin）：username 必填且全局唯一
+         *     （重复返回 409 conflict）、password 必填（bcrypt 哈希落库，明文不
+         *     落库、不返回）、name 可选（缺省为空字符串）。成功返回 201 +
+         *     Location 指向新资源与用户信息（永不包含密码）。用户令牌访问本路径
+         *     返回 403 forbidden。
+         */
+        post: operations["createUser"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 用户详情
+         * @description :id 为数字本地行 id（users.id），非法值返回 400；用户不存在返回
+         *     404 not_found。仅管理员令牌可访问。
+         */
+        get: operations["getUser"];
+        /**
+         * 修改用户（name / 重置密码）
+         * @description 部分更新：name 与 password 至少提供其一（password 传新值即重置密码，
+         *     校验规则与创建一致，空串返回 400）。返回更新后的用户；用户不存在
+         *     返回 404 not_found。仅管理员令牌可访问。
+         */
+        put: operations["updateUser"];
+        post?: never;
+        /**
+         * 删除用户
+         * @description 删除指定用户；名下仍关联虚拟机等资源（vms.user_id 外键引用）时返回
+         *     409 user_has_resources（区别于一般资源冲突的 conflict），用户不存在
+         *     返回 404 not_found。删除不影响其名下已存的操作记录（vm_operations
+         *     仅存 ID 引用，无级联）。成功返回无响应体的 204。仅管理员令牌可访问。
+         */
+        delete: operations["deleteUser"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 切换用户启用/禁用状态
+         * @description 切换用户的启用状态（enabled/disabled）：非法取值返回 400
+         *     bad_request；用户不存在返回 404 not_found。禁用后该用户的登录与
+         *     已签发令牌的操作由登录服务与鉴权中间件按 status 即时拒绝。
+         *     仅管理员令牌可访问。
+         */
+        put: operations["setUserStatus"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vms": {
         parameters: {
             query?: never;
@@ -525,7 +658,7 @@ export interface components {
              * @description 稳定的机器可读错误码（客户端只可依赖 code）
              * @enum {string}
              */
-            code: "bad_request" | "not_found" | "method_not_allowed" | "conflict" | "unprocessable_entity" | "internal_error" | "service_unavailable" | "dependency_failed" | "node_unavailable" | "ip_exhausted" | "vm_not_ready" | "disk_shrink_not_allowed" | "image_not_available_in_zone" | "vm_already_managed" | "vm_not_found_on_node" | "invalid_vm_id" | "operation_log_failed";
+            code: "bad_request" | "unauthorized" | "forbidden" | "not_found" | "method_not_allowed" | "conflict" | "unprocessable_entity" | "internal_error" | "service_unavailable" | "dependency_failed" | "node_unavailable" | "ip_exhausted" | "vm_not_ready" | "disk_shrink_not_allowed" | "image_not_available_in_zone" | "vm_already_managed" | "vm_not_found_on_node" | "invalid_vm_id" | "operation_log_failed" | "user_has_resources";
             /** @description 仅供人阅读，不可被程序解析 */
             message: string;
         };
@@ -543,6 +676,83 @@ export interface components {
              * @enum {string}
              */
             database: "up" | "down";
+        };
+        LoginRequest: {
+            /**
+             * @description 登录账号（user 身份域对应 users.username，admin 身份域对应 admins.username）
+             * @example alice
+             */
+            username: string;
+            /**
+             * @description 明文密码（仅请求体传输；服务端以 bcrypt 哈希比对，密码本身不落库、不进日志）
+             * @example s3cret
+             */
+            password: string;
+        };
+        UserLoginResponse: {
+            /** @description user JWT（Bearer，HS256 签名，24h 有效） */
+            token: string;
+            /**
+             * Format: int64
+             * @description users 表 ID
+             */
+            user_id: number;
+            username: string;
+            /** @description 用户显示名 */
+            name?: string;
+        };
+        AdminLoginResponse: {
+            /** @description admin JWT（Bearer，HS256 签名，24h 有效） */
+            token: string;
+            /**
+             * Format: int64
+             * @description admins 表 ID
+             */
+            admin_id: number;
+            username: string;
+        };
+        /** @description 公开的用户负载（password 永不包含在响应中） */
+        User: {
+            /**
+             * Format: int64
+             * @description users 表 ID
+             */
+            id: number;
+            /** @description 登录账号（全局唯一） */
+            username: string;
+            /** @description 显示名（缺省为空字符串） */
+            name: string;
+            /**
+             * @description 启用状态；disabled 用户登录与已签发令牌的操作均被拒绝
+             * @enum {string}
+             */
+            status: "enabled" | "disabled";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        CreateUserRequest: {
+            /** @description 登录账号（必填，全局唯一，重复返回 409 conflict） */
+            username: string;
+            /** @description 初始密码（必填；bcrypt 哈希落库，明文不落库、不返回、不进日志） */
+            password: string;
+            /** @description 显示名（可选，缺省为空字符串） */
+            name?: string;
+        };
+        /** @description name 与 password 至少提供其一（两者都缺省返回 400 bad_request） */
+        UpdateUserRequest: {
+            /** @description 修改显示名 */
+            name?: string;
+            /** @description 重置密码（非空；校验规则与创建一致） */
+            password?: string;
+        };
+        UpdateUserStatusRequest: {
+            /**
+             * @description 目标状态；非法取值返回 400 bad_request
+             * @enum {string}
+             */
+            status: "enabled" | "disabled";
         };
         ZoneCreateRequest: {
             /**
@@ -878,6 +1088,14 @@ export interface components {
             zone_id: number;
             /** @description cloud-init 注入密码（仅创建时使用，不随响应返回） */
             password: string;
+            /**
+             * Format: int64
+             * @description 归属用户（vms.user_id，可选）：仅管理员可指定（可为任意存在的
+             *     用户）；用户令牌只能指定为自身或留空（留空默认归属自身），
+             *     指定他人返回 403 forbidden。nil 表示无主 VM。响应中不暴露
+             *     user_id（VM 负载无归属字段）。
+             */
+            user_id?: number | null;
         };
         ImportVMRequest: {
             /**
@@ -904,6 +1122,13 @@ export interface components {
             ip?: string;
             /** @description 认领后的 VM 名称，可选；空则取 PVE 配置名。名称须匹配 ^[A-Za-z0-9_][A-Za-z0-9_.\-]*$；PVE 配置名超长时截断到 128 字符而非拒绝 */
             name?: string;
+            /**
+             * Format: int64
+             * @description 归属用户（vms.user_id，可选）：仅管理员可指定；用户令牌只能
+             *     指定为自身或留空（留空默认归属自身），指定他人返回 403
+             *     forbidden。nil 表示无主 VM。响应中不暴露 user_id。
+             */
+            user_id?: number | null;
         };
         VMResponse: {
             /** Format: int64 */
@@ -1079,6 +1304,19 @@ export interface components {
             /** @description 失败原因（已脱敏）；受理成功时省略 */
             error_message?: string;
             /**
+             * @description 操作者身份域（admin/user，设计 D5/D8）；两者为空表示旧记录
+             *     （无操作者信息）
+             * @enum {string}
+             */
+            operator_type?: "admin" | "user";
+            /**
+             * Format: int64
+             * @description 操作者 ID（对应 admins / users 表 ID）。user 令牌视角脱敏
+             *     （L2）：一律置空省略、仅保留 operator_type；admin 可见完整
+             *     操作者信息。两者为空表示旧记录
+             */
+            operator_id?: number | null;
+            /**
              * Format: date-time
              * @description 操作发生时间
              */
@@ -1108,6 +1346,42 @@ export interface components {
                 "application/json": components["schemas"]["ErrorBody"];
             };
         };
+        /** @description 凭证无效或身份不可信（unauthorized：登录失败、令牌缺失/非法/过期、账号被禁用） */
+        Unauthorized: {
+            headers: {
+                "x-ms-error-code": components["headers"]["XMSErrorCode"];
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "unauthorized",
+                 *         "message": "invalid credentials"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorBody"];
+            };
+        };
+        /** @description 身份有效但无权访问目标资源（forbidden：用户令牌访问管理员接口） */
+        Forbidden: {
+            headers: {
+                "x-ms-error-code": components["headers"]["XMSErrorCode"];
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "forbidden",
+                 *         "message": "admin access required"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorBody"];
+            };
+        };
         /** @description 资源不存在（not_found / vm_not_found_on_node），或路径未匹配任何路由的全局 404 兜底（not_found） */
         NotFound: {
             headers: {
@@ -1126,7 +1400,7 @@ export interface components {
                 "application/json": components["schemas"]["ErrorBody"];
             };
         };
-        /** @description 与现有状态冲突（conflict / ip_exhausted / vm_not_ready / vm_already_managed） */
+        /** @description 与现有状态冲突（conflict / ip_exhausted / vm_not_ready / vm_already_managed / user_has_resources） */
         Conflict: {
             headers: {
                 "x-ms-error-code": components["headers"]["XMSErrorCode"];
@@ -1260,6 +1534,58 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    loginUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description 登录成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserLoginResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    loginAdmin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description 登录成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminLoginResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
     healthz: {
         parameters: {
             query?: never;
@@ -1871,6 +2197,179 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listUsers: {
+        parameters: {
+            query?: {
+                /** @description 每页条数；默认 25，上限 100，超出会被服务端截断，负数/非数字返回 400 */
+                limit?: components["parameters"]["QueryLimit"];
+                /** @description 跳过条数；默认 0，负数/非数字返回 400 */
+                offset?: components["parameters"]["QueryOffset"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 分页后的用户列表（不含密码） */
+            200: {
+                headers: {
+                    "X-Total-Count": components["headers"]["XTotalCount"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    createUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateUserRequest"];
+            };
+        };
+        responses: {
+            /** @description 创建成功 */
+            201: {
+                headers: {
+                    Location: components["headers"]["Location"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    getUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 用户信息（不含密码） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    updateUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateUserRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的用户信息（不含密码） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    deleteUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 删除成功（无响应体） */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    setUserStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID（正整数） */
+                id: components["parameters"]["PathID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateUserStatusRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的用户信息（不含密码） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
         };
     };
