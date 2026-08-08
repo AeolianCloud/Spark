@@ -278,7 +278,7 @@ func TestVMServiceListVMs(t *testing.T) {
 			pve.WithBaseURL(clients[host].URL), pve.WithHTTPClient(clients[host].Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	items, warnings, total, err := svc.ListVMs(context.Background(), 25, 0)
+	items, warnings, total, err := svc.ListVMs(context.Background(), adminIdentity(), 25, 0)
 	if err != nil {
 		t.Fatalf("ListVMs: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestVMServiceListVMsUsesPveName(t *testing.T) {
 			pve.WithBaseURL(alive.URL), pve.WithHTTPClient(alive.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	items, warnings, total, err := svc.ListVMs(context.Background(), 25, 0)
+	items, warnings, total, err := svc.ListVMs(context.Background(), adminIdentity(), 25, 0)
 	if err != nil {
 		t.Fatalf("ListVMs: %v", err)
 	}
@@ -358,19 +358,19 @@ func TestVMServiceListVMsRepoErrors(t *testing.T) {
 		&fakeVMZoneRepository{}, &fakeVMNodeRepository{}, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 
 	svc.zoneRepo = &fakeVMZoneRepository{err: errors.New("zone db down")}
-	if _, _, _, err := svc.ListVMs(context.Background(), 25, 0); err == nil {
+	if _, _, _, err := svc.ListVMs(context.Background(), adminIdentity(), 25, 0); err == nil {
 		t.Fatal("ListVMs with a failing zone repo: want an error")
 	}
 
 	svc.zoneRepo = &fakeVMZoneRepository{zones: []model.Zone{{ID: 1, Name: "z1"}}}
 	svc.nodeRepo = &fakeVMNodeRepository{err: errors.New("node db down")}
-	if _, _, _, err := svc.ListVMs(context.Background(), 25, 0); err == nil {
+	if _, _, _, err := svc.ListVMs(context.Background(), adminIdentity(), 25, 0); err == nil {
 		t.Fatal("ListVMs with a failing node repo: want an error")
 	}
 
 	svc.nodeRepo = &fakeVMNodeRepository{}
 	svc.vmRepo = &fakeVMRepository{listErr: errors.New("vm db down")}
-	if _, _, _, err := svc.ListVMs(context.Background(), 25, 0); err == nil {
+	if _, _, _, err := svc.ListVMs(context.Background(), adminIdentity(), 25, 0); err == nil {
 		t.Fatal("ListVMs with a failing vm repo: want an error")
 	}
 }
@@ -413,7 +413,7 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 	// 合并后的完整序列（按 node_id, pve_vmid）：(1,0) vm-creating、
 	// (1,100) vm1、(1,200) vm3、(1,300) ext-orphan。total = 4。
 	// 第 1 页（limit 2）：前两条本地条目。
-	items, warnings, total, err := svc.ListVMs(context.Background(), 2, 0)
+	items, warnings, total, err := svc.ListVMs(context.Background(), adminIdentity(), 2, 0)
 	if err != nil {
 		t.Fatalf("ListVMs: %v", err)
 	}
@@ -428,7 +428,7 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 	}
 
 	// 第 2 页（offset 2）：vm3 与 external 条目 ext-1-300 混排。
-	items, _, total, err = svc.ListVMs(context.Background(), 2, 2)
+	items, _, total, err = svc.ListVMs(context.Background(), adminIdentity(), 2, 2)
 	if err != nil {
 		t.Fatalf("ListVMs page 2: %v", err)
 	}
@@ -447,7 +447,7 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 	}
 
 	// offset 越界：空页，total 不变。
-	items, _, total, err = svc.ListVMs(context.Background(), 2, 10)
+	items, _, total, err = svc.ListVMs(context.Background(), adminIdentity(), 2, 10)
 	if err != nil {
 		t.Fatalf("ListVMs past the end: %v", err)
 	}
@@ -456,11 +456,11 @@ func TestVMServiceListVMsPagination(t *testing.T) {
 	}
 
 	// 翻页稳定性：两页拼接恰好是完整序列（无重复/无遗漏）。
-	page1, _, _, err := svc.ListVMs(context.Background(), 2, 0)
+	page1, _, _, err := svc.ListVMs(context.Background(), adminIdentity(), 2, 0)
 	if err != nil {
 		t.Fatalf("ListVMs page 1 again: %v", err)
 	}
-	page2, _, _, err := svc.ListVMs(context.Background(), 2, 2)
+	page2, _, _, err := svc.ListVMs(context.Background(), adminIdentity(), 2, 2)
 	if err != nil {
 		t.Fatalf("ListVMs page 2 again: %v", err)
 	}
@@ -488,7 +488,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	if _, err := svc.GetVM(context.Background(), "404"); !isKind(err, KindNotFound) {
+	if _, err := svc.GetVM(context.Background(), "404", adminIdentity()); !isKind(err, KindNotFound) {
 		t.Fatalf("missing vm err = %v, want KindNotFound", err)
 	}
 
@@ -499,7 +499,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	item, err := svc2.GetVM(context.Background(), "1")
+	item, err := svc2.GetVM(context.Background(), "1", adminIdentity())
 	if err != nil {
 		t.Fatalf("GetVM (creating): %v", err)
 	}
@@ -514,7 +514,7 @@ func TestGetVMDetailStatuses(t *testing.T) {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	item, err = svc3.GetVM(context.Background(), "1")
+	item, err = svc3.GetVM(context.Background(), "1", adminIdentity())
 	if err != nil {
 		t.Fatalf("GetVM (failed): %v", err)
 	}
@@ -557,7 +557,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{get: vm}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = newClient(ok)
-	item, err := svc.GetVM(context.Background(), "1")
+	item, err := svc.GetVM(context.Background(), "1", adminIdentity())
 	if err != nil {
 		t.Fatalf("GetVM: %v", err)
 	}
@@ -573,7 +573,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 	svc2 := newVMService(t, &fakeVMRepository{get: gone}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc2.newClient = newClient(ok)
-	item, err = svc2.GetVM(context.Background(), "1")
+	item, err = svc2.GetVM(context.Background(), "1", adminIdentity())
 	if err != nil {
 		t.Fatalf("GetVM (absent): %v", err)
 	}
@@ -586,7 +586,7 @@ func TestGetVMDetailMergesLive(t *testing.T) {
 	svc3 := newVMService(t, &fakeVMRepository{get: vm2}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc3.newClient = newClient(down)
-	_, err = svc3.GetVM(context.Background(), "1")
+	_, err = svc3.GetVM(context.Background(), "1", adminIdentity())
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
@@ -612,7 +612,7 @@ func TestGetVMDetailGetNodeFails(t *testing.T) {
 	svc := newVMService(t, &fakeVMRepository{get: vm}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc.newClient = newClient
-	_, err := svc.GetVM(context.Background(), "1")
+	_, err := svc.GetVM(context.Background(), "1", adminIdentity())
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable for a missing node row", err)
 	}
@@ -623,7 +623,7 @@ func TestGetVMDetailGetNodeFails(t *testing.T) {
 	svc2 := newVMService(t, &fakeVMRepository{get: vm2}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo2, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc2.newClient = newClient
-	_, err = svc2.GetVM(context.Background(), "1")
+	_, err = svc2.GetVM(context.Background(), "1", adminIdentity())
 	if err == nil || isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want a plain error, not node_unavailable", err)
 	}
@@ -650,7 +650,7 @@ func TestGetExternalVMDetail(t *testing.T) {
 			pve.WithBaseURL(ok.URL), pve.WithHTTPClient(ok.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	item, err := svc.GetVM(context.Background(), "ext-1-300")
+	item, err := svc.GetVM(context.Background(), "ext-1-300", adminIdentity())
 	if err != nil {
 		t.Fatalf("GetVM ext-1-300: %v", err)
 	}
@@ -688,7 +688,7 @@ func TestGetExternalVMNodeMissing(t *testing.T) {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	_, err := svc.GetVM(context.Background(), "ext-99-300")
+	_, err := svc.GetVM(context.Background(), "ext-99-300", adminIdentity())
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable for a missing node row", err)
 	}
@@ -711,7 +711,7 @@ func TestGetExternalVMNodeUnreachable(t *testing.T) {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(down.URL), pve.WithHTTPClient(down.Client()), pve.WithTimeout(5*time.Second))
 	}
-	_, err := svc.GetVM(context.Background(), "ext-1-300")
+	_, err := svc.GetVM(context.Background(), "ext-1-300", adminIdentity())
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable", err)
 	}
@@ -742,7 +742,7 @@ func TestGetExternalVMRemoved(t *testing.T) {
 	svc.newClient = newClient(ok)
 
 	// VM 已从 PVE 移除（vmid 不在列表中）。
-	_, err := svc.GetVM(context.Background(), "ext-1-999")
+	_, err := svc.GetVM(context.Background(), "ext-1-999", adminIdentity())
 	if !isKind(err, KindVMNotFoundOnNode) {
 		t.Fatalf("err = %v, want KindVMNotFoundOnNode for a removed vm", err)
 	}
@@ -755,7 +755,7 @@ func TestGetExternalVMRemoved(t *testing.T) {
 	svc2 := newVMService(t, &fakeVMRepository{}, &fakeVMIPPoolRepository{}, &fakeVMZoneRepository{},
 		nodeRepo, &fakeVMImageRepository{}, &fakeVMStorageTypeRepository{})
 	svc2.newClient = newClient(tpl)
-	_, err = svc2.GetVM(context.Background(), "ext-1-400")
+	_, err = svc2.GetVM(context.Background(), "ext-1-400", adminIdentity())
 	if !isKind(err, KindVMNotFoundOnNode) {
 		t.Fatalf("err = %v, want KindVMNotFoundOnNode for a pve template", err)
 	}
@@ -788,7 +788,7 @@ func TestGetExternalVMManagedRoutesLocal(t *testing.T) {
 			pve.WithBaseURL(ok.URL), pve.WithHTTPClient(ok.Client()), pve.WithTimeout(5*time.Second))
 	}
 
-	item, err := svc.GetVM(context.Background(), "ext-1-300")
+	item, err := svc.GetVM(context.Background(), "ext-1-300", adminIdentity())
 	if err != nil {
 		t.Fatalf("GetVM ext-1-300 (managed): %v", err)
 	}
@@ -824,7 +824,7 @@ func TestGetExternalVMNodeDisabled(t *testing.T) {
 		return pve.NewClient("x", apiUser, apiTokenSecret,
 			pve.WithBaseURL(ts.URL), pve.WithHTTPClient(ts.Client()), pve.WithTimeout(5*time.Second))
 	}
-	_, err := svc.GetVM(context.Background(), "ext-1-300")
+	_, err := svc.GetVM(context.Background(), "ext-1-300", adminIdentity())
 	if !isKind(err, KindNodeUnavailable) {
 		t.Fatalf("err = %v, want KindNodeUnavailable for a disabled node", err)
 	}
@@ -863,7 +863,7 @@ func TestGetVMInvalidRefs(t *testing.T) {
 		"abc",                          // 非数字非 ext-
 	}
 	for _, id := range cases {
-		_, err := svc.GetVM(context.Background(), id)
+		_, err := svc.GetVM(context.Background(), id, adminIdentity())
 		if !isKind(err, KindInvalidVMRef) {
 			t.Fatalf("GetVM(%q) err = %v, want KindInvalidVMRef", id, err)
 		}

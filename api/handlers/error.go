@@ -22,6 +22,12 @@ const (
 	CodeInternal         = "internal_error"
 	CodeServiceDown      = "service_unavailable"
 	CodeDependencyFailed = "dependency_failed"
+	// CodeUnauthorized：凭证无效或身份不可信（登录失败、令牌缺失/非法/
+	// 过期、账号被禁用），统一 401。
+	CodeUnauthorized = "unauthorized"
+	// CodeForbidden：身份有效但无权访问目标资源（如用户令牌访问管理员
+	// 接口），统一 403。
+	CodeForbidden = "forbidden"
 )
 
 // APIError 是统一的错误负载：{"error": {"code", "message"}}。

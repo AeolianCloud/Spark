@@ -10,6 +10,13 @@ crypto:
   # Generate one with: openssl rand -base64 32
   encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
+auth:
+  # JWT 签名密钥（HMAC-SHA256），必填且至少 32 字符；缺失或过短时服务
+  # 启动报错。下面的 "change-me" 只是占位示例，长度不满足要求，直接用它
+  # 启动会失败——生产环境必须用随机密钥替换，建议：
+  #   openssl rand -base64 32
+  jwt_secret: "change-me"
+
 log:
   level: "info"
 

@@ -7,7 +7,7 @@
 - 项目零认证：无 user 概念、无 auth 中间件、`vms` 表无归属字段，所有 API 裸奔
 - `go.mod` 无 JWT / bcrypt 依赖；已有 `crypto` 包（AES-256-GCM），用于 VM 密码等**需要解密回用**的敏感字段
 - 参照智简魔方模型：后端管理用户表，前台用户（CLIENT_JWT）+ 后台管理员（ADMIN_JWT）双身份域
-- `vm_operations` 表（操作记录）在 `all-pve-vms-visible` 提案的迁移 0008 中创建，本提案在其后落地（迁移 0009）
+- `vm_operations` 表（操作记录）在 `all-pve-vms-visible` 提案的迁移 0008 中创建，本提案在其后落地（迁移 0010）
 
 ## Goals / Non-Goals
 
@@ -35,7 +35,7 @@ VM 密码用 AES 可逆加密（注入 cloudinit 需解密）；登录密码只�
 - 有效期 24h，无刷新机制（过期重新登录）
 - e2e/测试通过注入式 jwt 生成器或直接生成测试令牌
 
-### D3: 表结构（迁移 0009）
+### D3: 表结构（迁移 0010）
 
 ```
 admins:  id BIGSERIAL PK, username TEXT NOT NULL UNIQUE,
@@ -84,8 +84,8 @@ PUT    /users/{id}/status  启用/禁用
 
 ### D8: 与 all-pve-vms-visible 的衔接
 
-- 迁移顺序：0008（外部 VM 可见性 + vm_operations）→ 0009（本提案）
-- `vm_operations` 的操作者字段：若 all-pve-vms-visible 已落地的表无操作者列，本提案迁移 0009 一并补 `operator_type`/`operator_id`
+- 迁移顺序：0008（外部 VM 可见性 + vm_operations）→ 0010（本提案）
+- `vm_operations` 的操作者字段：若 all-pve-vms-visible 已落地的表无操作者列，本提案迁移 0010 一并补 `operator_type`/`operator_id`
 - 两个提案 tasks 存在依赖，apply 时按顺序串行
 
 ## Risks / Trade-offs
@@ -98,7 +98,7 @@ PUT    /users/{id}/status  启用/禁用
 
 ## Migration Plan
 
-1. 迁移 0009：`admins` / `users` 表 + `vms.user_id` 列 + （如需要）vm_operations 操作者列
+1. 迁移 0010：`admins` / `users` 表 + `vms.user_id` 列 + （如需要）vm_operations 操作者列
 2. 依赖引入：`golang-jwt/jwt/v5`、`golang.org/x/crypto`（仅构建依赖，不安装系统软件）
 3. 后端：auth 服务/登录 handler/中间件 → 用户 CRUD → VM 分流与归属校验 → CLI → 操作记录操作者
 4. 契约：openapi 双副本 + api-errors 同步，lint 通过
