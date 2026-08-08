@@ -1,4 +1,5 @@
 import type { components } from './generated/schema'
+import { getToken, clearAuth } from '../utils/auth'
 
 /** 契约错误码：与 docs/openapi.yaml ErrorDetail.code 枚举一致（由生成类型强约束） */
 export type ErrorCode = components['schemas']['ErrorDetail']['code']
@@ -78,7 +79,7 @@ async function parseError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, code, message)
 }
 
-/** 统一请求入口：拼接 baseURL、序列化查询参数与请求体、解析响应头与 JSON 响应体 */
+/** 统一请求入口：拼接 baseURL、序列化查询参数与请求体、注入 Bearer 令牌、解析响应头与 JSON 响应体 */
 async function request<T>(path: string, options: RequestOptions = {}): Promise<ApiResponse<T>> {
   const { method = 'GET', query, body, okStatuses, signal } = options
 
@@ -93,6 +94,12 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<A
   }
 
   const headers: Record<string, string> = {}
+  // 登录路径与健康检查不注入令牌（后端安全规则：/auth/*、/healthz 匿名可达）
+  const authExempt = path.startsWith('/auth/') || path === '/healthz'
+  if (!authExempt) {
+    const token = getToken()
+    if (token) headers['Authorization'] = `Bearer ${token}`
+  }
   let payload: string | undefined
   if (body !== undefined) {
     headers['Content-Type'] = 'application/json'
@@ -110,7 +117,16 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<A
   }
 
   // 契约外的成功状态码（如 healthz 503 degraded）按数据响应处理
-  if (!res.ok && !okStatuses?.includes(res.status)) throw await parseError(res)
+  if (!res.ok && !okStatuses?.includes(res.status)) {
+    const err = await parseError(res)
+    // 令牌缺失/过期/被拒：清除本地登录态并全量跳转登录页（SPA 下保证状态干净）；
+    // 登录请求自身的 401 豁免（由登录页直接展示认证失败，避免跳转死循环）
+    if (res.status === 401 && !authExempt) {
+      clearAuth()
+      window.location.assign('/login')
+    }
+    throw err
+  }
 
   const result: ApiResponse<T> = { data: undefined as T }
 

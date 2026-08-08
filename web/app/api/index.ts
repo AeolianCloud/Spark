@@ -4,6 +4,7 @@
  */
 export * from './client'
 export * from './types'
+export * from './auth'
 export * from './healthz'
 export * from './zones'
 export * from './nodes'
