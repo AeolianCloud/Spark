@@ -18,7 +18,7 @@
     "api:check": "npm run api:gen && git diff --exit-code -- app/api/generated/schema.d.ts && ! git status --porcelain --ignored -- app/api/generated/schema.d.ts | grep -vE '^[A-Z]  ' | grep -q . || (echo '契约一致性校验失败：app/api/generated/schema.d.ts 与 docs/openapi.yaml 不一致（含未跟踪/被忽略的生成物），请先运行 npm run api:gen 并将生成物提交入库'; exit 1)"
   },
   "dependencies": {
-    "@iconify-json/lucide": "1.2.121",
+    "@iconify-json/lucide": "1.2.124",
     "@nuxt/ui": "4.10.0",
     "nuxt": "4.5.2",
     "tailwindcss": "4.3.3",
